@@ -2637,7 +2637,7 @@ fn build_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
     let icon =
         tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
 
-    TrayIconBuilder::new()
+    TrayIconBuilder::with_id("dictflow")
         .icon(icon)
         .menu(&menu)
         .tooltip("DictFlow — offline voice dictation")

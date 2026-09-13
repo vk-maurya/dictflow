@@ -1,9 +1,13 @@
 # DictFlow (local-only voice dictation for Windows)
 
-![DictFlow logo](assets/logo-512.png)
+![DictFlow](assets/screenshot.png)
 
 Fast, private, offline voice-to-text for Windows 10/11. Hold a key, speak,
 release — text lands in whatever app has focus. Nothing ever leaves your PC.
+
+**Download v0.2.0:**
+[Portable exe for Windows x64](https://github.com/vk-maurya/dictflow/releases/download/v0.2.0/DictFlow-0.2.0-windows-x64-portable.exe)
+(double-click, no installer) · [All releases](https://github.com/vk-maurya/dictflow/releases)
 
 - **100% offline** — Parakeet (in-process) or Whisper (sidecar), zero network
   after model download. No accounts, no telemetry.
@@ -42,8 +46,8 @@ src-tauri/           # Rust backend (Tauri v2)
   src/main.rs        # state, commands, hotkeys, tray
   src/models.rs      # model catalog (both engines)
   src/text.rs        # offline text pipeline (dictionary, cleanup, punctuation)
-assets/              # logo source art (logo-512.png)
-scripts/             # build-windows.ps1, clean-dev.ps1
+assets/              # screenshot, logo source (logo-512.png)
+scripts/             # build-windows.ps1, package-portable.ps1, clean-dev.ps1
 docs/                # build / release / architecture notes
 ```
 
