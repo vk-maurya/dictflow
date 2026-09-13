@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+  rust:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      # tauri::generate_context! requires frontendDist ("../dist") to exist.
+      # dist/ is gitignored and the frontend job's output is not shared, so
+      # cargo check/clippy/test need a stub here. Release builds still run
+      # `npm run build` via beforeBuildCommand.
+      - name: Stub frontend dist
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Set-Content -Path dist/index.html -Value "<!doctype html><html><body></body></html>"
+      - name: Check
+        run: cargo check --locked
+        working-directory: src-tauri
+      - name: Clippy
+        run: cargo clippy --locked -- -D warnings
+        working-directory: src-tauri
+      - name: Tests
+        run: cargo test --locked
+        working-directory: src-tauri

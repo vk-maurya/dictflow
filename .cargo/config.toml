@@ -1,0 +1,8 @@
+# Match sherpa-onnx's prebuilt Windows libs, which are `static-MT-Release`.
+# Without this, rustc links the dynamic CRT (MD) against sherpa's static CRT
+# (MT) and LINK emits LNK4098 — two CRT heaps in one process, which corrupts
+# on malloc-in-one/free-in-the-other. Applies to Windows MSVC targets only;
+# kept at the repo root so it applies no matter which directory cargo runs
+# from (project root, src-tauri, CI). CI picks it up automatically.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
