@@ -15,9 +15,8 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-Push CI runs the frontend build on Linux ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
-The Windows rust job (check / clippy / test) is **manual** — Actions → ci →
-Run workflow — so private-repo minutes are not spent on every push.
+CI: [`.github/workflows/ci.yml`](.github/workflows/ci.yml). Frontend runs on
+push. Rust check / clippy / test: Actions → ci → Run workflow.
 
 ## Ground rules
 

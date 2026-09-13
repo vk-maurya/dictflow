@@ -5,14 +5,11 @@ on:
   pull_request:
   workflow_dispatch:
 
-# One run per branch/PR. A new push cancels the previous run so minutes
-# are not burned on already-superseded commits.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # npm build is portable — Linux minutes are cheaper than Windows.
   frontend:
     runs-on: ubuntu-latest
     steps:
@@ -24,9 +21,6 @@ jobs:
       - run: npm ci
       - run: npm run build
 
-  # DictFlow links user32/advapi32/WebView2 — this job is Windows-only.
-  # Manual only: every automatic Windows compile burns ~10–20 minutes of
-  # the private-repo quota. Run from Actions → ci → Run workflow.
   rust:
     if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
