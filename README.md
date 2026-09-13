@@ -1,8 +1,10 @@
 # DictFlow
 
 Offline voice dictation for Windows 10/11. Hold a key, speak, release —
-text lands in whatever app has focus. Nothing leaves your PC unless you
-turn on an optional online model.
+text lands in whatever app has focus.
+
+Your voice stays on your machine. Your words go wherever you type.
+Nothing leaves your PC unless you turn on an optional online model.
 
 ![DictFlow](assets/screenshot.png)
 
@@ -18,10 +20,10 @@ turn on an optional online model.
 [All releases](https://github.com/vk-maurya/dictflow/releases)
 
 The builds are unsigned, so Windows SmartScreen may warn. Choose
-**More info → Run anyway**. WebView2 is required (already on Windows 10/11).
+**More info → Run anyway**.
 
 Portable is not a USB-only copy: settings, models, and history still live in
-`%APPDATA%\dictflow`.
+`%APPDATA%\com.dictflow.app\dictflow`.
 
 ## First run
 

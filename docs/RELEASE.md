@@ -20,7 +20,7 @@ The app displays `env!("CARGO_PKG_VERSION")` (Settings → About). Use SemVer
 | `DictFlow_<ver>_x64_en-US.msi` | Optional enterprise/IT install. |
 
 The portable build is **not** a USB sidecar: settings, models, and history
-still live in `%APPDATA%\dictflow`. WebView2 is required (already on Win 10/11).
+still live in `%APPDATA%\com.dictflow.app\dictflow`.
 Both artifacts are unsigned, so SmartScreen may warn.
 
 ## How to publish (recommended)

@@ -40,7 +40,7 @@ plus a first-run onboarding shell. Second window `overlay.html` / `src/overlay.t
 is the always-on-top pill. Tauri `invoke` + event listeners, toasts. No state
 library — module-level caches refreshed from commands.
 
-## On-disk layout (`%APPDATA%/dictflow/`)
+## On-disk layout (`%APPDATA%/com.dictflow.app/dictflow/`)
 
 ```
 models/<id>/…      # ggml-*.bin (Whisper) or encoder/decoder/joiner/tokens (Parakeet)
