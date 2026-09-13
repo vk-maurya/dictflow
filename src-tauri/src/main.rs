@@ -6,8 +6,8 @@
 // stays a console binary so backend logs still show in the terminal.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 //
-// Pipeline (mirrors SpeakType): hotkey → mic capture → STT engine →
-// spoken commands / backtrack / lists → dictionary → auto-edit → paste.
+// Pipeline: hotkey → mic capture → STT engine → spoken commands /
+// backtrack / lists → dictionary → auto-edit → paste.
 
 mod devices;
 mod focus;
@@ -78,8 +78,8 @@ enum TalkEdge {
     Pressed,
     Released,
     /// Another key went down while the talk key was held (e.g. Ctrl+C on a
-    /// Left-Ctrl talk key) — discard, don't transcribe. Mirrors SpeakType's
-    /// modifier-combo cancel. Only applies to hotkey-owned takes.
+    /// Left-Ctrl talk key) — discard, don't transcribe. Only applies to
+    /// hotkey-owned takes.
     Cancel,
     /// Esc while any recording is live — dedicated discard (P1).
     Escape,
@@ -1138,7 +1138,7 @@ fn stop_and_save_wav(state: &mut AppState) -> anyhow::Result<(PathBuf, f64)> {
         );
     }
     // Each recording gets its own file so History items can play back their
-    // audio (SpeakType keeps audioFileURL per item; files die with the item).
+    // audio. The file is deleted with the history item.
     let dir = state.data_dir.join("recordings");
     std::fs::create_dir_all(&dir).context("create recordings dir")?;
     let stamp = std::time::SystemTime::now()
@@ -1525,15 +1525,15 @@ fn paste_target_for(app: &tauri::AppHandle, last_saved: Option<focus::Hwnd>) -> 
 }
 
 fn paste_text(text: &str, target: Option<focus::Hwnd>) -> anyhow::Result<()> {
-    // SpeakType re-activates the previous app before Cmd+V so the caret
-    // never follows the overlay click.
+    // Re-activate the previous app before Ctrl+V so the caret never
+    // follows the overlay click.
     if focus::restore_hwnd(target) {
         std::thread::sleep(Duration::from_millis(180));
     }
 
     let mut cb = arboard::Clipboard::new().context("open clipboard")?;
     // Snapshot the current *text* clipboard so it can be restored after
-    // auto-paste (SpeakType `restoreClipboardAfterAutoPaste`, default on).
+    // auto-paste (default on).
     // Limitation: non-text clipboard content (images, files) cannot be
     // snapshotted through arboard and is not preserved.
     let previous = cb.get_text().ok();
@@ -1696,7 +1696,7 @@ fn select_model(state: State<'_, Mutex<AppState>>, id: String) -> Result<String,
     s.settings.audio_backend = "local".to_owned();
     s.save_settings();
     // Warm up Parakeet in the background so the first dictation doesn't pay
-    // the model-load cost (mirrors SpeakType's warmUp).
+    // the model-load cost.
     if entry.engine == EngineKind::Parakeet && entry.is_downloaded(&s.data_dir) {
         s.transcriber.preload(&id);
     }
@@ -1821,8 +1821,8 @@ fn cancel_download(state: State<'_, Mutex<AppState>>, id: String) -> Result<Stri
     Ok(format!("cancelling {id}"))
 }
 
-/// Best-effort removal of a history item's audio file (SpeakType deletes the
-/// backing audio on item delete / clear-all so recordings don't leak on disk).
+/// Best-effort removal of a history item's audio file so recordings do not
+/// leak on disk after item delete / clear-all.
 fn remove_audio_file(audio_path: &Option<String>) {
     if let Some(p) = audio_path {
         let path = Path::new(p);
@@ -2299,7 +2299,7 @@ fn set_settings(
 }
 
 /// Discard the live recording without transcribing, filing, or pasting
-/// (SpeakType's cancel path: modifier-combo pressed mid-take).
+/// (modifier-combo pressed mid-take, or Esc).
 fn cancel_recording(state: &mut AppState) -> anyhow::Result<()> {
     state.hotkey_owned = false;
     let (wav, _) = stop_and_save_wav(state)?;
@@ -2512,8 +2512,8 @@ async fn stop_transcribe(
 }
 
 /// Transcribe an audio file on disk (WAV for now — the loader reads PCM WAV;
-/// mp3/video need a decoder and are a v0.3 item). Saves to history like a
-/// dictation. Mirrors SpeakType's TranscribeAudioView minus drag-drop.
+/// mp3/video need a decoder and are a later item). Saves to history like a
+/// dictation.
 #[tauri::command]
 async fn transcribe_file(
     app: tauri::AppHandle,

@@ -1,10 +1,8 @@
 //! Offline text post-processing + audio helpers.
 //!
-//! Ports of SpeakType's pure-logic passes so behavior matches macOS:
-//!
-//! - `DictionaryService` (trigger → replacement snippet/vocab rules)
-//! - `WhisperService` filler-word "Auto Edit"
-//! - `SmartTrailingPunctuation` (don't punctuate emails/URLs/numbers)
+//! - Dictionary (trigger → replacement snippet/vocab rules)
+//! - Filler-word cleanup
+//! - Smart trailing punctuation (don't punctuate emails/URLs/numbers)
 //!
 //! Plus WAV loading and linear resampling to the 16 kHz mono both engines need.
 
@@ -128,17 +126,16 @@ pub fn apply_dictionary(text: &str, entries: &mut [DictionaryEntry]) -> (String,
 }
 
 // ---------------------------------------------------------------------------
-// Auto Edit (filler-word removal, SpeakType `applyAutoEdit`)
+// Filler-word removal
 // ---------------------------------------------------------------------------
 
 /// Drop filler words ("um", "uh", …). Token-based so no look-around is needed
 /// (the `regex` crate doesn't support it); lone punctuation tokens survive for
 /// the tidy pass.
 pub fn remove_fillers(text: &str) -> String {
-    // The `regex` crate has no look-around, so instead of SpeakType's single
-    // lookahead pattern we filter whitespace-separated tokens: a token whose
-    // punctuation-stripped core is a filler word is dropped ("Um," → dropped,
-    // "hum" and "uh-huh" survive, exactly like the original pattern).
+    // The `regex` crate has no look-around, so we filter whitespace-separated
+    // tokens: a token whose punctuation-stripped core is a filler word is
+    // dropped ("Um," → dropped; "hum" and "uh-huh" survive).
     let filler = Regex::new(r"(?i)^(uh+|um+|umm+|uhm+|erm+|hmm+)$")
         .expect("filler pattern compiles");
     text.split_whitespace()
@@ -162,7 +159,7 @@ pub fn tidy_punctuation(text: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Smart trailing punctuation (SpeakType `SmartTrailingPunctuation`)
+// Smart trailing punctuation
 // ---------------------------------------------------------------------------
 
 fn matches(text: &str, pattern: &str) -> bool {

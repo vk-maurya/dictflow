@@ -1,8 +1,8 @@
 //! Model catalog: every downloadable STT model DictFlow ships, for both engines.
 //!
-//! Mirrors SpeakType's `AIModel.availableModels` (names, speed/accuracy scores,
-//! RAM guidance) but targets Windows runtimes: whisper.cpp `ggml` binaries and
-//! sherpa-onnx int8 Parakeet transducer bundles.
+//! Names, speed/accuracy scores, and RAM guidance target Windows runtimes:
+//! whisper.cpp `ggml` binaries and sherpa-onnx int8 Parakeet transducer
+//! bundles.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -42,7 +42,7 @@ pub struct ModelEntry {
     /// e.g. "English-only" or "25 languages".
     pub languages: String,
     pub size_label: String,
-    /// 0–10, higher is faster (mirrors SpeakType scoring).
+    /// 0–10, higher is faster.
     pub speed: f64,
     /// 0–10, higher is more accurate.
     pub accuracy: f64,
