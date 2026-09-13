@@ -79,24 +79,29 @@ pub fn apply_dictionary(text: &str, entries: &[DictionaryEntry]) -> String {
 // Auto Edit (filler-word removal, SpeakType `applyAutoEdit`)
 // ---------------------------------------------------------------------------
 
-pub fn auto_edit(text: &str) -> String {
+/// Drop filler words ("um", "uh", …). Token-based so no look-around is needed
+/// (the `regex` crate doesn't support it); lone punctuation tokens survive for
+/// the tidy pass.
+pub fn remove_fillers(text: &str) -> String {
     // The `regex` crate has no look-around, so instead of SpeakType's single
     // lookahead pattern we filter whitespace-separated tokens: a token whose
     // punctuation-stripped core is a filler word is dropped ("Um," → dropped,
     // "hum" and "uh-huh" survive, exactly like the original pattern).
     let filler = Regex::new(r"(?i)^(uh+|um+|umm+|uhm+|erm+|hmm+)$")
         .expect("filler pattern compiles");
-    let kept: Vec<&str> = text
-        .split_whitespace()
+    text.split_whitespace()
         .filter(|tok| {
             let core = tok.trim_matches(|c: char| c.is_ascii_punctuation());
             core.is_empty() || !filler.is_match(core)
         })
-        .collect();
-    let joined = kept.join(" ");
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
+/// Attach stray spaces before punctuation and collapse whitespace runs.
+pub fn tidy_punctuation(text: &str) -> String {
     let tidy = Regex::new(r"\s+([,.;:!?])").expect("tidy pattern compiles");
-    let tidy = tidy.replace_all(&joined, "$1");
+    let tidy = tidy.replace_all(text, "$1");
     let spaces = Regex::new(r"\s+").expect("spaces pattern compiles");
     spaces.replace_all(&tidy, " ").trim().to_owned()
 }
@@ -240,9 +245,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_edit_removes_fillers() {
-        assert_eq!(auto_edit("Um, let's go"), "let's go");
-        assert_eq!(auto_edit("well uh yeah"), "well yeah");
+    fn fillers_removed_tidy_kept_separate() {
+        assert_eq!(remove_fillers("Um, let's go"), "let's go");
+        assert_eq!(remove_fillers("well uh yeah"), "well yeah");
+        assert_eq!(remove_fillers("the hum of uh-huh"), "the hum of uh-huh");
+        assert_eq!(tidy_punctuation("hello , world !"), "hello, world!");
     }
 
     #[test]

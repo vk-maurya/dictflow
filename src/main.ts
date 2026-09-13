@@ -1,7 +1,10 @@
 import "./style.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import logoUrl from "../assets/logo-512.png";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { attachConsole, error as logError } from "@tauri-apps/plugin-log";
+import { enable as autostartEnable, disable as autostartDisable, isEnabled as autostartIsEnabled } from "@tauri-apps/plugin-autostart";
 
 // ---------------------------------------------------------------------------
 // Types (mirror src-tauri)
@@ -48,7 +51,8 @@ interface Settings {
   model_id: string;
   language: string;
   auto_paste: boolean;
-  auto_edit: boolean;
+  cleanup: string;
+  translate: boolean;
   hotkey_key: string;
   recording_mode: string;
 }
@@ -61,12 +65,20 @@ interface Status {
   whisper_binary: string | null;
   data_dir: string;
   audio_device: string | null;
+  version: string;
 }
 interface DlProgress {
   model_id: string;
   file: string;
   received: number;
   total: number | null;
+}
+interface UpdateInfo {
+  current: string;
+  latest: string | null;
+  url: string | null;
+  available: boolean;
+  configured: boolean;
 }
 interface AudioDeviceInfo {
   name: string;
@@ -125,6 +137,12 @@ const LANGUAGES: [string, string][] = [
   ["hi", "Hindi"],
 ];
 
+const CLEANUPS: [string, string][] = [
+  ["full", "Full — fillers + tidy"],
+  ["light", "Light — fillers only"],
+  ["off", "Off — raw transcript"],
+];
+
 const HOTKEYS: [string, string][] = [
   ["RightCtrl", "Right Ctrl (hold)"],
   ["LeftCtrl", "Left Ctrl ⚠ (cancels on Ctrl+key)"],
@@ -172,6 +190,7 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T |
   try {
     return await invoke<T>(cmd, args);
   } catch (e) {
+    logError(`invoke ${cmd} failed: ${e}`);
     toast(`${e}`, "error");
     return null;
   }
@@ -600,6 +619,13 @@ function viewDictionary(): string {
         <button id="dict-add">Add</button>
       </div>
     </div>
+    <div class="card"><h3>Shortcuts</h3>
+      <div class="row">
+        <button class="ghost small" id="dict-symbols">Add common symbols (@, .com, #…)</button>
+        <button class="ghost small" id="dict-export">Export JSON</button>
+        <button class="ghost small" id="dict-import">Import JSON</button>
+      </div>
+    </div>
     ${rows}`;
 }
 
@@ -637,6 +663,9 @@ function viewSettings(): string {
   const langOpts = LANGUAGES.map(
     ([v, l]) => `<option value="${v}" ${settings!.language === v ? "selected" : ""}>${l}</option>`
   ).join("");
+  const cleanupOpts = CLEANUPS.map(
+    ([v, l]) => `<option value="${v}" ${settings!.cleanup === v ? "selected" : ""}>${l}</option>`
+  ).join("");
   const hotkeyOpts = HOTKEYS.map(
     ([v, l]) => `<option value="${v}" ${settings!.hotkey_key === v ? "selected" : ""}>${l}</option>`
   ).join("");
@@ -653,8 +682,10 @@ function viewSettings(): string {
         <select id="set-lang">${langOpts}</select></div>
       <div class="set-row"><div><b>Auto-paste</b><div class="desc">Type the result into the focused app via Ctrl+V right after transcribing.</div></div>
         <input type="checkbox" id="set-paste" ${settings.auto_paste ? "checked" : ""}></div>
-      <div class="set-row"><div><b>Auto-edit</b><div class="desc">Remove filler words (“um”, “uh”) and tidy punctuation, like SpeakType.</div></div>
-        <input type="checkbox" id="set-edit" ${settings.auto_edit ? "checked" : ""}></div>
+      <div class="set-row"><div><b>Cleanup</b><div class="desc">How much the transcript is polished. Wispr Flow calls this Auto Cleanup.</div></div>
+        <select id="set-cleanup">${cleanupOpts}</select></div>
+      <div class="set-row"><div><b>Translate to English</b><div class="desc">Whisper only, needs a non-Auto language. Parakeet v3 hears 25 languages as-is.</div></div>
+        <input type="checkbox" id="set-translate" ${settings.translate ? "checked" : ""}></div>
     </div>
     <div class="card"><h3>Talk key</h3>
       <div class="set-row"><div><b>Key</b><div class="desc">Single-key hold feels like the Mac Fn key. Right Ctrl is the safest default; Scroll Lock / F9 never type anything. Left Ctrl works but every Ctrl+C/S/V briefly opens then discards the mic — the combo needs no polling.</div></div>
@@ -667,13 +698,19 @@ function viewSettings(): string {
       <div class="set-row"><div><b>Whisper binary</b><div class="desc">${
         status?.whisper_binary ? `<code>${esc(status.whisper_binary)}</code>` : "Not found — Parakeet works without it."
       }</div></div></div>
+    </div>
+    <div class="card"><h3>About</h3>
+      <div class="set-row"><div><b>Version</b><div class="desc">DictFlow ${esc(status?.version ?? "")} — MIT open source, 100% offline.</div></div>
+        <button class="small ghost" id="check-updates">Check for updates</button></div>
+      <div class="set-row"><div><b>Start with Windows</b><div class="desc">Launch minimized to the tray at login.</div></div>
+        <input type="checkbox" id="set-autostart"></div>
     </div>`;
 }
 
 function render(): void {
   document.getElementById("app")!.innerHTML = `
     <aside class="sidebar">
-      <div class="brand"><div class="brand-mark">D</div>
+      <div class="brand"><div class="brand-mark"><img src="${logoUrl}" alt="DictFlow logo"></div>
         <div><div class="brand-name">DictFlow</div><div class="brand-sub">offline dictation</div></div></div>
       <nav class="nav">${NAV.map((n) => `<button data-nav="${n.id}" class="${view === n.id ? "active" : ""}"><span class="ico">${n.ico}</span>${n.label}</button>`).join("")}</nav>
       <div class="side-footer"><span id="side-dot" class="status-dot dot-gray"></span><span id="side-model">…</span></div>
@@ -804,6 +841,36 @@ function bindView(): void {
       toast("Rule added", "success");
     }
   });
+  (document.getElementById("dict-symbols") as HTMLButtonElement | null)?.addEventListener("click", async () => {
+    const res = await call<DictionaryEntry[]>("add_symbol_presets");
+    if (res) {
+      dict = res;
+      renderView();
+      toast("Symbol presets added", "success");
+    }
+  });
+  (document.getElementById("dict-export") as HTMLButtonElement | null)?.addEventListener("click", async () => {
+    const path = await save({
+      defaultPath: "dictflow-dictionary.json",
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    }).catch(() => null);
+    if (typeof path !== "string" || !path) return;
+    const msg = await call<string>("export_dictionary", { path });
+    if (msg !== null) toast(msg, "success");
+  });
+  (document.getElementById("dict-import") as HTMLButtonElement | null)?.addEventListener("click", async () => {
+    const path = await open({
+      multiple: false,
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    }).catch(() => null);
+    if (typeof path !== "string" || !path) return;
+    const res = await call<DictionaryEntry[]>("import_dictionary", { path });
+    if (res) {
+      dict = res;
+      renderView();
+      toast(`Imported ${res.length} rules`, "success");
+    }
+  });
   document.querySelectorAll("[data-dict-toggle]").forEach((c) =>
     ((c as HTMLInputElement).onchange = async () => {
       await call("set_dictionary_enabled", { id: (c as HTMLInputElement).dataset.dictToggle, enabled: (c as HTMLInputElement).checked });
@@ -820,16 +887,18 @@ function bindView(): void {
   const sm = document.getElementById("set-model") as HTMLSelectElement | null;
   const sl = document.getElementById("set-lang") as HTMLSelectElement | null;
   const sp = document.getElementById("set-paste") as HTMLInputElement | null;
-  const se = document.getElementById("set-edit") as HTMLInputElement | null;
+  const sc = document.getElementById("set-cleanup") as HTMLSelectElement | null;
+  const st = document.getElementById("set-translate") as HTMLInputElement | null;
   const sk = document.getElementById("set-hotkey") as HTMLSelectElement | null;
   const smo = document.getElementById("set-mode") as HTMLSelectElement | null;
   const saveSettings = async () => {
-    if (!settings || !sm || !sl || !sp || !se || !sk || !smo) return;
+    if (!settings || !sm || !sl || !sp || !sc || !st || !sk || !smo) return;
     const next: Settings = {
       model_id: sm.value,
       language: sl.value,
       auto_paste: sp.checked,
-      auto_edit: se.checked,
+      cleanup: sc.value,
+      translate: st.checked,
       hotkey_key: sk.value,
       recording_mode: smo.value,
     };
@@ -844,9 +913,35 @@ function bindView(): void {
   sm?.addEventListener("change", saveSettings);
   sl?.addEventListener("change", saveSettings);
   sp?.addEventListener("change", saveSettings);
-  se?.addEventListener("change", saveSettings);
+  sc?.addEventListener("change", saveSettings);
+  st?.addEventListener("change", saveSettings);
   sk?.addEventListener("change", saveSettings);
   smo?.addEventListener("change", saveSettings);
+  const sa = document.getElementById("set-autostart") as HTMLInputElement | null;
+  if (sa) {
+    autostartIsEnabled()
+      .then((v) => {
+        sa.checked = v;
+      })
+      .catch(() => undefined);
+    sa.addEventListener("change", async () => {
+      try {
+        if (sa.checked) await autostartEnable();
+        else await autostartDisable();
+        toast(sa.checked ? "DictFlow will start with Windows" : "Auto-start off", "success");
+      } catch (e) {
+        toast(`${e}`, "error");
+        sa.checked = !sa.checked;
+      }
+    });
+  }
+  (document.getElementById("check-updates") as HTMLButtonElement | null)?.addEventListener("click", async () => {
+    const u = await call<UpdateInfo>("check_for_updates");
+    if (!u) return;
+    if (!u.configured) toast("Update check isn't wired to a repo yet (see docs/RELEASE.md)", "info");
+    else if (u.available) toast(`Update available: ${u.latest} — ${u.url}`, "success");
+    else toast(`You're on the latest version (${u.current})`, "success");
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -854,6 +949,7 @@ function bindView(): void {
 // ---------------------------------------------------------------------------
 
 async function boot(): Promise<void> {
+  attachConsole().catch(() => undefined);
   render();
   await Promise.all([refreshStatus(), refreshModels(), refreshHistory(), refreshDict(), refreshSettings()]);
   renderView();

@@ -149,7 +149,7 @@ fn apply_hotkey_registration(app: &tauri::AppHandle) {
     let _ = gs.unregister(shortcut);
     if combo {
         if let Err(e) = gs.register(shortcut) {
-            eprintln!("global shortcut registration failed ({HOTKEY}): {e}");
+            log::warn!("global shortcut registration failed ({HOTKEY}): {e}");
         }
     }
 }
@@ -165,11 +165,21 @@ struct Settings {
     /// multilingual without a language flag.
     language: String,
     auto_paste: bool,
-    auto_edit: bool,
-    /// Talk key: "RightCtrl" (default) | "ScrollLock" | "F9" | "CtrlAltSpace".
+    /// Cleanup level (Wispr Flow "Auto Cleanup" lite): "off" | "light"
+    /// (filler words only) | "full" (fillers + punctuation tidy).
+    #[serde(default = "default_cleanup")]
+    cleanup: String,
+    /// Whisper-only: translate to English (needs a non-"auto" language).
+    #[serde(default)]
+    translate: bool,
+    /// Talk key: "RightCtrl" (default) | "LeftCtrl" | "ScrollLock" | "F9" | "CtrlAltSpace".
     hotkey_key: String,
     /// "hold" (default, macOS-like: down starts, up stops) | "toggle".
     recording_mode: String,
+}
+
+fn default_cleanup() -> String {
+    "full".to_owned()
 }
 
 impl Default for Settings {
@@ -178,7 +188,8 @@ impl Default for Settings {
             model_id: models::default_model_id(),
             language: "auto".to_owned(),
             auto_paste: true,
-            auto_edit: true,
+            cleanup: default_cleanup(),
+            translate: false,
             hotkey_key: "RightCtrl".to_owned(),
             recording_mode: "hold".to_owned(),
         }
@@ -208,6 +219,8 @@ struct Status {
     data_dir: String,
     /// Name of the OS default input device we capture from (None = none).
     audio_device: Option<String>,
+    /// App version (Cargo package version, single source of truth).
+    version: String,
 }
 
 /// OS default capture endpoint name. Best-effort: never fails status.
@@ -470,8 +483,8 @@ fn transcriber_loop(rx: mpsc::Receiver<EngineJob>, data_dir: PathBuf) {
         match job {
             EngineJob::Preload { model_id } => {
                 match ensure_parakeet(&mut loaded, &data_dir, &model_id) {
-                    Ok(_) => println!("parakeet warmed up: {model_id}"),
-                    Err(e) => eprintln!("parakeet preload failed ({model_id}): {e}"),
+                    Ok(_) => log::info!("parakeet warmed up: {model_id}"),
+                    Err(e) => log::warn!("parakeet preload failed ({model_id}): {e}"),
                 }
             }
             EngineJob::Transcribe {
@@ -517,7 +530,7 @@ fn run_capture(
                     move |data: &[f32], _| {
                         writer.lock().unwrap().extend_from_slice(data);
                     },
-                    |err| eprintln!("audio stream error: {err}"),
+                    |err| log::warn!("audio stream error: {err}"),
                     None,
                 )?
             }
@@ -529,7 +542,7 @@ fn run_capture(
                         let mut lock = writer.lock().unwrap();
                         lock.extend(data.iter().map(|s| *s as f32 / i16::MAX as f32));
                     },
-                    |err| eprintln!("audio stream error: {err}"),
+                    |err| log::warn!("audio stream error: {err}"),
                     None,
                 )?
             }
@@ -544,7 +557,7 @@ fn run_capture(
                                 .map(|s| (*s as f32 / u16::MAX as f32) * 2.0 - 1.0),
                         );
                     },
-                    |err| eprintln!("audio stream error: {err}"),
+                    |err| log::warn!("audio stream error: {err}"),
                     None,
                 )?
             }
@@ -760,7 +773,8 @@ struct TranscribeInput {
     wav_path: PathBuf,
     model_id: String,
     language: String,
-    auto_edit: bool,
+    cleanup: String,
+    translate: bool,
     data_dir: PathBuf,
     dictionary: Vec<text::DictionaryEntry>,
 }
@@ -769,6 +783,7 @@ fn transcribe_whisper(
     data_dir: &Path,
     model_id: &str,
     language: &str,
+    translate: bool,
     wav_16k_path: &Path,
 ) -> anyhow::Result<String> {
     let entry = models::find(model_id).context("unknown model")?;
@@ -801,6 +816,11 @@ fn transcribe_whisper(
     if language != "auto" && !language.is_empty() {
         cmd.arg("-l").arg(language);
     }
+    // whisper.cpp `--translate` renders English from a foreign-language clip.
+    // It needs an explicit source language, so it only applies off-"auto".
+    if translate && language != "auto" && !language.is_empty() {
+        cmd.arg("--translate");
+    }
     let status = cmd
         .status()
         .with_context(|| format!("run {}", binary.display()))?;
@@ -828,17 +848,25 @@ fn run_transcription(
         EngineKind::Whisper => {
             let tmp = input.data_dir.join("last_16k.wav");
             text::write_wav_mono_16k(&tmp, &samples, 16_000)?;
-            transcribe_whisper(&input.data_dir, &input.model_id, &input.language, &tmp)?
+            transcribe_whisper(
+                &input.data_dir,
+                &input.model_id,
+                &input.language,
+                input.translate,
+                &tmp,
+            )?
         }
         EngineKind::Parakeet => parakeet
             .transcribe(&input.model_id, samples)
             .map_err(anyhow::Error::msg)?,
     };
 
-    // SpeakType pipeline order: dictionary → auto-edit → smart punctuation.
+    // SpeakType pipeline order: dictionary → cleanup → smart punctuation.
     let mut out = text::apply_dictionary(&raw, &input.dictionary);
-    if input.auto_edit {
-        out = text::auto_edit(&out);
+    match input.cleanup.as_str() {
+        "light" => out = text::remove_fillers(&out),
+        "full" => out = text::tidy_punctuation(&text::remove_fillers(&out)),
+        _ => {}
     }
     out = text::smart_trailing_punctuation(&out);
     let out = out.trim().to_owned();
@@ -914,6 +942,7 @@ fn get_status(state: State<'_, Mutex<AppState>>) -> Status {
         whisper_binary: resolve_binary(&s.data_dir).map(|p| p.display().to_string()),
         data_dir: s.data_dir.display().to_string(),
         audio_device: default_input_name(),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
     }
 }
 
@@ -1107,6 +1136,17 @@ fn get_dictionary(state: State<'_, Mutex<AppState>>) -> Vec<text::DictionaryEntr
     text::load_dictionary(&s.data_dir)
 }
 
+/// Monotonic-ish unique id for dictionary entries (nanos since epoch).
+fn new_id(prefix: &str) -> String {
+    format!(
+        "{prefix}{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    )
+}
+
 #[tauri::command]
 fn add_dictionary_entry(
     state: State<'_, Mutex<AppState>>,
@@ -1120,13 +1160,7 @@ fn add_dictionary_entry(
     }
     let s = state.lock().unwrap();
     let mut entries = text::load_dictionary(&s.data_dir);
-    let id = format!(
-        "d{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
+    let id = new_id("d");
     entries.insert(
         0,
         text::DictionaryEntry {
@@ -1169,6 +1203,131 @@ fn delete_dictionary_entry(state: State<'_, Mutex<AppState>>, id: String) -> Res
     }
     text::save_dictionary(&s.data_dir, &entries).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// One-click symbol presets (Superwhisper-style): voice models mangle symbols,
+/// so "at sign" said aloud becomes "@". Skips triggers the user already has.
+#[tauri::command]
+fn add_symbol_presets(
+    state: State<'_, Mutex<AppState>>,
+) -> Result<Vec<text::DictionaryEntry>, String> {
+    const PRESETS: &[(&str, &str)] = &[
+        ("at sign", "@"),
+        ("dot com", ".com"),
+        ("dot net", ".net"),
+        ("dot org", ".org"),
+        ("dot io", ".io"),
+        ("hashtag", "#"),
+        ("slash", "/"),
+        ("underscore", "_"),
+        ("dash", "-"),
+    ];
+    let s = state.lock().unwrap();
+    let mut entries = text::load_dictionary(&s.data_dir);
+    for (trigger, replacement) in PRESETS {
+        if entries
+            .iter()
+            .any(|e| e.trigger.eq_ignore_ascii_case(trigger))
+        {
+            continue;
+        }
+        entries.insert(
+            0,
+            text::DictionaryEntry {
+                id: new_id("d"),
+                trigger: trigger.to_string(),
+                replacement: replacement.to_string(),
+                enabled: true,
+                whole_word: true,
+            },
+        );
+    }
+    text::save_dictionary(&s.data_dir, &entries).map_err(|e| e.to_string())?;
+    Ok(entries)
+}
+
+#[tauri::command]
+fn export_dictionary(state: State<'_, Mutex<AppState>>, path: String) -> Result<String, String> {
+    let s = state.lock().unwrap();
+    let entries = text::load_dictionary(&s.data_dir);
+    let bytes = serde_json::to_vec_pretty(&entries).map_err(|e| e.to_string())?;
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    Ok(format!("exported {} rules → {path}", entries.len()))
+}
+
+#[tauri::command]
+fn import_dictionary(
+    state: State<'_, Mutex<AppState>>,
+    path: String,
+) -> Result<Vec<text::DictionaryEntry>, String> {
+    let bytes = std::fs::read(&path).map_err(|e| format!("read file: {e}"))?;
+    let mut entries: Vec<text::DictionaryEntry> =
+        serde_json::from_slice(&bytes).map_err(|_| "not a DictFlow dictionary file".to_owned())?;
+    if entries.len() > 1000 {
+        return Err("dictionary file has more than 1000 rules".to_owned());
+    }
+    for e in &mut entries {
+        e.trigger = e.trigger.trim().to_owned();
+        if e.trigger.is_empty() {
+            return Err("dictionary file contains an empty trigger".to_owned());
+        }
+        e.id = new_id("d");
+    }
+    let s = state.lock().unwrap();
+    text::save_dictionary(&s.data_dir, &entries).map_err(|e| e.to_string())?;
+    Ok(entries)
+}
+
+/// Set to `"owner/repo"` once the project is pushed to GitHub to enable the
+/// in-app update check (see docs/RELEASE.md).
+const UPDATE_CHECK_REPO: Option<&str> = None;
+
+#[derive(Debug, Clone, Serialize)]
+struct UpdateInfo {
+    current: String,
+    latest: Option<String>,
+    url: Option<String>,
+    available: bool,
+    configured: bool,
+}
+
+#[tauri::command]
+async fn check_for_updates() -> Result<UpdateInfo, String> {
+    let current = env!("CARGO_PKG_VERSION").to_owned();
+    let Some(repo) = UPDATE_CHECK_REPO else {
+        return Ok(UpdateInfo {
+            current,
+            latest: None,
+            url: None,
+            available: false,
+            configured: false,
+        });
+    };
+    #[derive(Deserialize)]
+    struct GhRelease {
+        tag_name: String,
+        html_url: String,
+    }
+    let release: GhRelease = reqwest::Client::new()
+        .get(format!("https://api.github.com/repos/{repo}/releases/latest"))
+        .header("User-Agent", "dictflow")
+        .header("Accept", "application/vnd.github.v3+json")
+        .send()
+        .await
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+    let latest = release.tag_name.trim_start_matches('v').to_owned();
+    Ok(UpdateInfo {
+        available: latest != current,
+        url: Some(release.html_url),
+        latest: Some(release.tag_name),
+        current,
+        configured: true,
+    })
 }
 
 #[tauri::command]
@@ -1250,7 +1409,8 @@ async fn stop_transcribe(
             wav_path: wav,
             model_id: model_id.clone(),
             language: s.settings.language.clone(),
-            auto_edit: s.settings.auto_edit,
+            cleanup: s.settings.cleanup.clone(),
+            translate: s.settings.translate,
             data_dir: s.data_dir.clone(),
             dictionary: text::load_dictionary(&s.data_dir),
         };
@@ -1318,7 +1478,8 @@ async fn transcribe_file(
             wav_path: owned.clone(),
             model_id: s.settings.model_id.clone(),
             language: s.settings.language.clone(),
-            auto_edit: s.settings.auto_edit,
+            cleanup: s.settings.cleanup.clone(),
+            translate: s.settings.translate,
             data_dir: s.data_dir.clone(),
             dictionary: text::load_dictionary(&s.data_dir),
         };
@@ -1407,6 +1568,18 @@ fn build_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
 
 pub fn run() {
     let builder = tauri::Builder::default()
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("dictflow".into()),
+                    }),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Webview),
+                ])
+                .build(),
+        )
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -1430,8 +1603,8 @@ pub fn run() {
                         tauri::async_runtime::spawn(async move {
                             let state: State<'_, Mutex<AppState>> = app.state();
                             match toggle_recording(app.clone(), state).await {
-                                Ok(msg) => println!("dictation: {msg}"),
-                                Err(e) => eprintln!("dictation error: {e}"),
+                                Ok(msg) => log::info!("dictation: {msg}"),
+                                Err(e) => log::error!("dictation error: {e}"),
                             }
                         });
                     }
@@ -1491,8 +1664,8 @@ pub fn run() {
                                 if mode == "toggle" {
                                     let st: State<'_, Mutex<AppState>> = hk_app.state();
                                     match stop_transcribe(&hk_app, st).await {
-                                        Ok(msg) => println!("dictation: {msg}"),
-                                        Err(e) => eprintln!("dictation error: {e}"),
+                                        Ok(msg) => log::info!("dictation: {msg}"),
+                                        Err(e) => log::error!("dictation error: {e}"),
                                     }
                                 }
                             } else {
@@ -1504,7 +1677,7 @@ pub fn run() {
                                         drop(guard);
                                         let _ = hk_app.emit("dictflow://recording", true);
                                     }
-                                    Err(e) => eprintln!("hotkey record failed: {e:#}"),
+                                    Err(e) => log::error!("hotkey record failed: {e:#}"),
                                 }
                             }
                         }
@@ -1521,8 +1694,8 @@ pub fn run() {
                             if mode == "hold" && recording && owned {
                                 let st: State<'_, Mutex<AppState>> = hk_app.state();
                                 match stop_transcribe(&hk_app, st).await {
-                                    Ok(msg) => println!("dictation: {msg}"),
-                                    Err(e) => eprintln!("dictation error: {e}"),
+                                    Ok(msg) => log::info!("dictation: {msg}"),
+                                    Err(e) => log::error!("dictation error: {e}"),
                                 }
                             }
                         }
@@ -1539,9 +1712,9 @@ pub fn run() {
                                     Ok(()) => {
                                         drop(guard);
                                         let _ = hk_app.emit("dictflow://recording", false);
-                                        println!("dictation cancelled (other key pressed)");
+                                        log::info!("dictation cancelled (other key pressed)");
                                     }
-                                    Err(e) => eprintln!("dictation cancel failed: {e:#}"),
+                                    Err(e) => log::error!("dictation cancel failed: {e:#}"),
                                 }
                             }
                         }
@@ -1562,6 +1735,10 @@ pub fn run() {
             add_dictionary_entry,
             set_dictionary_enabled,
             delete_dictionary_entry,
+            add_symbol_presets,
+            export_dictionary,
+            import_dictionary,
+            check_for_updates,
             get_settings,
             set_settings,
             toggle_recording,
