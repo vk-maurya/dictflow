@@ -1212,14 +1212,15 @@ function weekChart(days: number): string {
     .map((k, i) => {
       const label = new Date(k + "T12:00:00").toLocaleDateString(undefined, { weekday: "short" });
       const h = Math.round((vals[i] / max) * 100);
-      return `<div class="bar-col">
-        <div class="bar-count">${words[i] ? words[i] : ""}</div>
-        <div class="bar-track"><div class="bar-fill" style="height:${Math.max(h, vals[i] > 0 ? 8 : 5)}%"></div></div>
+      const tip = `${label}: ${fmtConsumed(vals[i])}, ${words[i].toLocaleString()} words`;
+      return `<div class="bar-col" title="${esc(tip)}">
+        <div class="bar-count">${words[i] ? words[i].toLocaleString() : ""}</div>
+        <div class="bar-track"><div class="bar-fill" style="height:${vals[i] > 0 ? Math.max(h, 8) : 0}%"></div></div>
         <div class="bar-day">${days > 7 ? k.slice(8) : label}</div>
       </div>`;
     })
     .join("");
-  return `<div class="chart">${cols}</div>`;
+  return `<div class="chart${days > 7 ? " chart-wide" : ""}">${cols}</div>`;
 }
 
 function heatmapHtml(): string {
