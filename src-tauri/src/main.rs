@@ -60,10 +60,20 @@ fn hotkey_vk(key: &str) -> Option<i32> {
         "RightCtrl" => Some(0xA3),
         "LeftAlt" => Some(0xA4),
         "RightAlt" => Some(0xA5),
+        "LeftWin" => Some(0x5B),
+        "RightWin" => Some(0x5C),
         "ScrollLock" => Some(0x91),
         "F9" => Some(0x78),
-        _ => None, // "CtrlAltSpace" and anything unknown → plugin shortcut
+        _ => None, // "CtrlWin" / "CtrlAltSpace" and anything unknown → combo or plugin shortcut
     }
+}
+
+/// VK list for a talk key: singles → 1 element, `CtrlWin` → LeftCtrl+LeftWin both required.
+fn hotkey_vks(key: &str) -> Option<Vec<i32>> {
+    if key == "CtrlWin" {
+        return Some(vec![0xA2, 0x5B]);
+    }
+    hotkey_vk(key).map(|vk| vec![vk])
 }
 
 #[link(name = "user32")]
@@ -112,10 +122,10 @@ fn spawn_hotkey_thread(
             loop {
                 std::thread::sleep(Duration::from_millis(10));
                 remember_paste_target(&app);
-                let (vk, recording) = app
+                let (vks, recording) = app
                     .state::<Mutex<AppState>>()
                     .lock()
-                    .map(|s| (hotkey_vk(&s.settings.hotkey_key), s.recording))
+                    .map(|s| (hotkey_vks(&s.settings.hotkey_key), s.recording))
                     .unwrap_or((None, false));
                 // Esc is polled only while a take is live so we never steal it
                 // from other apps when idle.
@@ -131,14 +141,15 @@ fn spawn_hotkey_thread(
                 } else {
                     was_esc = false;
                 }
-                let Some(vk) = vk else {
+                let Some(vks) = vks else {
                     was_down = false;
                     prev_keys = snapshot_keys();
                     continue;
                 };
                 // SAFETY: GetAsyncKeyState is a pure read of async key state;
                 // always safe to call, any thread, any VK code.
-                let down = unsafe { GetAsyncKeyState(vk) } < 0; // high bit = down
+                // Combo (CtrlWin) requires ALL listed VKs down; singles require the one.
+                let down = vks.iter().all(|vk| unsafe { GetAsyncKeyState(*vk) } < 0); // high bit = down
                 if down != was_down && last_change.elapsed() > Duration::from_millis(30) {
                     was_down = down;
                     last_change = std::time::Instant::now();
@@ -153,7 +164,7 @@ fn spawn_hotkey_thread(
                 if was_down {
                     let cur = snapshot_keys();
                     let intruded = cur.iter().enumerate().any(|(i, &b)| {
-                        i != vk as usize
+                        !vks.contains(&(i as i32))
                             && !(1..=6).contains(&i)
                             && b & 0x80 != 0
                             && prev_keys[i] & 0x80 == 0
@@ -321,7 +332,7 @@ struct Settings {
     /// Whisper-only: translate to English (needs a non-"auto" language).
     #[serde(default)]
     translate: bool,
-    /// Talk key: "RightCtrl" (default) | "LeftCtrl" | "LeftAlt" | "RightAlt" | "ScrollLock" | "F9" | "CtrlAltSpace".
+    /// Talk key: "RightCtrl" (default) | "LeftCtrl" | "LeftAlt" | "RightAlt" | "LeftWin" | "RightWin" | "CtrlWin" | "ScrollLock" | "F9" | "CtrlAltSpace".
     hotkey_key: String,
     /// "hold" (default, macOS-like: down starts, up stops) | "toggle".
     recording_mode: String,
@@ -2242,7 +2253,7 @@ fn set_settings(
     if models::find(&settings.model_id).is_none() {
         return Err(format!("unknown model: {}", settings.model_id));
     }
-    if hotkey_vk(&settings.hotkey_key).is_none() && settings.hotkey_key != "CtrlAltSpace" {
+    if hotkey_vks(&settings.hotkey_key).is_none() && settings.hotkey_key != "CtrlAltSpace" {
         return Err(format!("unknown talk key: {}", settings.hotkey_key));
     }
     if settings.recording_mode != "hold" && settings.recording_mode != "toggle" {
