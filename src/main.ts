@@ -333,6 +333,8 @@ const CLEANUPS: [string, string][] = [
 const HOTKEYS: [string, string][] = [
   ["RightCtrl", "Right Ctrl (hold)"],
   ["LeftCtrl", "Left Ctrl (cancels on Ctrl+key)"],
+  ["LeftAlt", "Left Alt (hold)"],
+  ["RightAlt", "Right Alt (hold)"],
   ["ScrollLock", "Scroll Lock"],
   ["F9", "F9"],
   ["CtrlAltSpace", "Ctrl + Alt + Space"],
@@ -675,11 +677,15 @@ function talkKey(): string {
     ? "Right Ctrl"
     : k === "LeftCtrl"
       ? "Left Ctrl"
-      : k === "ScrollLock"
-        ? "Scroll Lock"
-        : k === "F9"
-          ? "F9"
-          : "Ctrl + Alt + Space";
+      : k === "LeftAlt"
+        ? "Left Alt"
+        : k === "RightAlt"
+          ? "Right Alt"
+          : k === "ScrollLock"
+            ? "Scroll Lock"
+            : k === "F9"
+              ? "F9"
+              : "Ctrl + Alt + Space";
 }
 
 /** True when the talk key is a hold-to-talk single key (macOS Fn feel). */

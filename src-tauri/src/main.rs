@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 // DictFlow — offline voice dictation for Windows (Wispr Flow-style, 100% local).
 // Stack: Tauri v2 (WebView2) + Rust backend + whisper.cpp sidecar (Whisper)
 //        + in-process sherpa-onnx (Parakeet) + cpal (WASAPI) + SendInput paste.
@@ -56,6 +58,8 @@ fn hotkey_vk(key: &str) -> Option<i32> {
     match key {
         "LeftCtrl" => Some(0xA2),
         "RightCtrl" => Some(0xA3),
+        "LeftAlt" => Some(0xA4),
+        "RightAlt" => Some(0xA5),
         "ScrollLock" => Some(0x91),
         "F9" => Some(0x78),
         _ => None, // "CtrlAltSpace" and anything unknown → plugin shortcut
@@ -317,7 +321,7 @@ struct Settings {
     /// Whisper-only: translate to English (needs a non-"auto" language).
     #[serde(default)]
     translate: bool,
-    /// Talk key: "RightCtrl" (default) | "LeftCtrl" | "ScrollLock" | "F9" | "CtrlAltSpace".
+    /// Talk key: "RightCtrl" (default) | "LeftCtrl" | "LeftAlt" | "RightAlt" | "ScrollLock" | "F9" | "CtrlAltSpace".
     hotkey_key: String,
     /// "hold" (default, macOS-like: down starts, up stops) | "toggle".
     recording_mode: String,
