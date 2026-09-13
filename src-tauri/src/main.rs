@@ -6,6 +6,7 @@
 // dictionary snippets → auto-edit → smart punctuation → paste anywhere.
 
 mod models;
+mod stats;
 mod text;
 
 use std::collections::HashSet;
@@ -24,6 +25,7 @@ use tauri::{Emitter, Manager, State};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 use models::{EngineKind, ModelEntry};
+use stats::UsageStats;
 
 const HOTKEY: &str = "Ctrl+Alt+Space";
 const HISTORY_LIMIT: usize = 100;
@@ -206,6 +208,16 @@ struct HistoryItem {
     /// pre-audio history files loadable.
     #[serde(default)]
     audio_path: Option<String>,
+    /// Transcript before dictionary + cleanup. Empty on pre-P0 rows.
+    #[serde(default)]
+    raw_text: String,
+    /// Cached polished word count. 0 means "compute from text" for old rows.
+    #[serde(default)]
+    words_out: u32,
+    #[serde(default)]
+    dict_hits: u32,
+    #[serde(default)]
+    cleanup: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -261,6 +273,8 @@ struct AppState {
     active: Option<ActiveRecording>,
     settings: Settings,
     history: Vec<HistoryItem>,
+    /// Lifetime usage; never cleared with history.
+    stats: UsageStats,
     downloading: HashSet<String>,
     data_dir: PathBuf,
     transcriber: Transcriber,
@@ -312,6 +326,10 @@ impl AppState {
                     duration_secs: 0.0,
                     model: String::new(),
                     audio_path: None,
+                    raw_text: String::new(),
+                    words_out: 0,
+                    dict_hits: 0,
+                    cleanup: String::new(),
                 })
                 .collect();
             self.save_history();
@@ -325,25 +343,37 @@ impl AppState {
         }
     }
 
-    fn push_history(
-        &mut self,
-        text: String,
-        duration_secs: f64,
-        model: String,
-        audio_path: Option<String>,
-    ) {
+    fn push_history(&mut self, item: NewHistory) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let words_out = text::word_count(&item.text);
+        let raw_words = if item.raw_text.is_empty() {
+            words_out
+        } else {
+            text::word_count(&item.raw_text)
+        };
+        self.stats.record(
+            now,
+            words_out as u64,
+            item.duration_secs,
+            raw_words as u64,
+            item.dict_hits as u64,
+        );
+        self.stats.save(&self.data_dir);
         self.history.insert(
             0,
             HistoryItem {
-                text,
+                text: item.text,
                 date_unix: now,
-                duration_secs,
-                model,
-                audio_path,
+                duration_secs: item.duration_secs,
+                model: item.model,
+                audio_path: item.audio_path,
+                raw_text: item.raw_text,
+                words_out,
+                dict_hits: item.dict_hits,
+                cleanup: item.cleanup,
             },
         );
         if self.history.len() > HISTORY_LIMIT {
@@ -351,6 +381,39 @@ impl AppState {
         }
         self.save_history();
     }
+
+    /// First launch after upgrade: fill the ledger from whatever history is
+    /// still on disk. Later clear-all leaves stats.json alone.
+    fn seed_stats_from_history(&mut self) {
+        if !self.stats.is_empty() || self.history.is_empty() {
+            return;
+        }
+        for h in &self.history {
+            let words = if h.words_out > 0 {
+                h.words_out as u64
+            } else {
+                text::word_count(&h.text) as u64
+            };
+            let raw = if h.raw_text.is_empty() {
+                words
+            } else {
+                text::word_count(&h.raw_text) as u64
+            };
+            self.stats
+                .record(h.date_unix, words, h.duration_secs, raw, h.dict_hits as u64);
+        }
+        self.stats.save(&self.data_dir);
+    }
+}
+
+struct NewHistory {
+    text: String,
+    raw_text: String,
+    duration_secs: f64,
+    model: String,
+    audio_path: Option<String>,
+    dict_hits: u32,
+    cleanup: String,
 }
 
 fn resolve_binary(data_dir: &Path) -> Option<PathBuf> {
@@ -833,11 +896,18 @@ fn transcribe_whisper(
     Ok(text)
 }
 
+struct TranscriptResult {
+    text: String,
+    raw_text: String,
+    duration_secs: f64,
+    dict_hits: u32,
+}
+
 /// Heavy work: runs inside `spawn_blocking` so the async runtime stays free.
 fn run_transcription(
     input: &TranscribeInput,
     parakeet: &Transcriber,
-) -> anyhow::Result<(String, f64)> {
+) -> anyhow::Result<TranscriptResult> {
     let samples = text::load_wav_mono_16k(&input.wav_path)?;
     let duration_secs = samples.len() as f64 / 16_000.0;
     if samples.iter().all(|s| s.abs() < 0.002) {
@@ -860,9 +930,10 @@ fn run_transcription(
             .transcribe(&input.model_id, samples)
             .map_err(anyhow::Error::msg)?,
     };
+    let raw_text = raw.trim().to_owned();
 
     // SpeakType pipeline order: dictionary → cleanup → smart punctuation.
-    let mut out = text::apply_dictionary(&raw, &input.dictionary);
+    let (mut out, dict_hits) = text::apply_dictionary(&raw_text, &input.dictionary);
     match input.cleanup.as_str() {
         "light" => out = text::remove_fillers(&out),
         "full" => out = text::tidy_punctuation(&text::remove_fillers(&out)),
@@ -873,7 +944,12 @@ fn run_transcription(
     if out.is_empty() {
         anyhow::bail!("transcription was empty");
     }
-    Ok((out, duration_secs))
+    Ok(TranscriptResult {
+        text: out,
+        raw_text,
+        duration_secs,
+        dict_hits,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1091,6 +1167,11 @@ fn remove_audio_file(audio_path: &Option<String>) {
 #[tauri::command]
 fn get_history(state: State<'_, Mutex<AppState>>) -> Vec<HistoryItem> {
     state.lock().unwrap().history.clone()
+}
+
+#[tauri::command]
+fn get_stats(state: State<'_, Mutex<AppState>>) -> UsageStats {
+    state.lock().unwrap().stats.clone()
 }
 
 #[tauri::command]
@@ -1399,36 +1480,46 @@ async fn stop_transcribe(
 ) -> Result<String, String> {
 
     // Snapshot everything the heavy work needs, then release the lock.
-    let (input, parakeet, duration_secs, model_id, audio) = {
+    let (input, parakeet, duration_secs, model_id, audio, cleanup) = {
         let mut s = state.lock().unwrap();
         s.hotkey_owned = false;
         let (wav, duration_secs) = stop_and_save_wav(&mut s).map_err(|e| e.to_string())?;
         let model_id = s.settings.model_id.clone();
+        let cleanup = s.settings.cleanup.clone();
         let audio = wav.display().to_string();
         let input = TranscribeInput {
             wav_path: wav,
             model_id: model_id.clone(),
             language: s.settings.language.clone(),
-            cleanup: s.settings.cleanup.clone(),
+            cleanup: cleanup.clone(),
             translate: s.settings.translate,
             data_dir: s.data_dir.clone(),
             dictionary: text::load_dictionary(&s.data_dir),
         };
-        (input, s.transcriber.clone(), duration_secs, model_id, audio)
+        (input, s.transcriber.clone(), duration_secs, model_id, audio, cleanup)
     };
     let _ = app.emit("dictflow://recording", false);
     let _ = app.emit("dictflow://transcribing", true);
 
     // STT + post-processing can take seconds (model load, inference) — keep it
     // off the async runtime.
-    let (text, _) = tokio::task::spawn_blocking(move || run_transcription(&input, &parakeet))
+    let result = tokio::task::spawn_blocking(move || run_transcription(&input, &parakeet))
         .await
         .map_err(|e| format!("transcription task failed: {e}"))?
         .map_err(|e| format!("{e:#}"))?;
+    let text = result.text.clone();
 
     let auto_paste = {
         let mut s = state.lock().unwrap();
-        s.push_history(text.clone(), duration_secs, model_id, Some(audio));
+        s.push_history(NewHistory {
+            text: result.text,
+            raw_text: result.raw_text,
+            duration_secs,
+            model: model_id,
+            audio_path: Some(audio),
+            dict_hits: result.dict_hits,
+            cleanup,
+        });
         s.settings.auto_paste
     };
     let _ = app.emit("dictflow://transcribing", false);
@@ -1491,19 +1582,23 @@ async fn transcribe_file(
         .map_err(|e| format!("transcription task failed: {e}"))?
         .map_err(|e| format!("{e:#}"));
     let _ = app.emit("dictflow://transcribing", false);
-    let (text, duration_secs) = result?;
+    let result = result?;
     {
         let mut s = state.lock().unwrap();
         let model = s.settings.model_id.clone();
-        s.push_history(
-            text.clone(),
-            duration_secs,
+        let cleanup = s.settings.cleanup.clone();
+        s.push_history(NewHistory {
+            text: result.text.clone(),
+            raw_text: result.raw_text,
+            duration_secs: result.duration_secs,
             model,
-            Some(owned.display().to_string()),
-        );
+            audio_path: Some(owned.display().to_string()),
+            dict_hits: result.dict_hits,
+            cleanup,
+        });
     }
     let _ = app.emit("dictflow://history-updated", ());
-    Ok(text)
+    Ok(result.text)
 }
 
 #[tauri::command]
@@ -1627,12 +1722,15 @@ pub fn run() {
                 active: None,
                 settings: Settings::default(),
                 history: Vec::new(),
+                stats: UsageStats::default(),
                 downloading: HashSet::new(),
                 data_dir,
                 transcriber,
             };
             st.load_settings();
             st.load_history();
+            st.stats = UsageStats::load(&st.data_dir);
+            st.seed_stats_from_history();
             // Warm up the selected Parakeet model in the background so the
             // first dictation doesn't pay the model-load cost.
             if let Some(entry) = models::find(&st.settings.model_id) {
@@ -1729,6 +1827,7 @@ pub fn run() {
             select_model,
             download_model,
             get_history,
+            get_stats,
             delete_history_item,
             clear_history,
             get_dictionary,
@@ -1764,13 +1863,21 @@ mod tests {
     use super::*;
 
     fn test_state() -> AppState {
-        let dir = std::env::temp_dir().join(format!("dictflow-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "dictflow-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         AppState {
             recording: false,
             hotkey_owned: false,
             active: None,
             settings: Settings::default(),
             history: Vec::new(),
+            stats: UsageStats::default(),
             downloading: HashSet::new(),
             data_dir: dir,
             transcriber: Transcriber::spawn(std::env::temp_dir()),
@@ -1821,10 +1928,66 @@ mod tests {
         // best-effort and harmless there).
         let mut s = test_state();
         for i in 0..(HISTORY_LIMIT + 10) {
-            s.push_history(format!("item {i}"), 1.0, "test".to_owned(), None);
+            s.push_history(NewHistory {
+                text: format!("item {i}"),
+                raw_text: format!("raw {i}"),
+                duration_secs: 1.0,
+                model: "test".to_owned(),
+                audio_path: None,
+                dict_hits: 0,
+                cleanup: "full".to_owned(),
+            });
         }
         assert_eq!(s.history.len(), HISTORY_LIMIT);
         assert_eq!(s.history.first().unwrap().text, format!("item {}", HISTORY_LIMIT + 9));
-        let _ = std::fs::remove_dir_all(s.data_dir.join("history.json"));
+        // Ledger is independent of the 100-row cap.
+        assert_eq!(s.stats.lifetime_dictations, (HISTORY_LIMIT + 10) as u64);
+        let _ = std::fs::remove_dir_all(&s.data_dir);
+    }
+
+    #[test]
+    fn clear_history_keeps_stats() {
+        let mut s = test_state();
+        s.push_history(NewHistory {
+            text: "hello world".into(),
+            raw_text: "hello um world".into(),
+            duration_secs: 2.0,
+            model: "test".into(),
+            audio_path: None,
+            dict_hits: 1,
+            cleanup: "full".into(),
+        });
+        assert_eq!(s.stats.lifetime_dictations, 1);
+        assert_eq!(s.stats.lifetime_words, 2);
+        s.history.clear();
+        s.save_history();
+        assert!(s.history.is_empty());
+        assert_eq!(s.stats.lifetime_dictations, 1);
+        assert_eq!(s.stats.lifetime_words, 2);
+        let reloaded = UsageStats::load(&s.data_dir);
+        assert_eq!(reloaded.lifetime_dictations, 1);
+        let _ = std::fs::remove_dir_all(&s.data_dir);
+    }
+
+    #[test]
+    fn seed_stats_from_existing_history_once() {
+        let mut s = test_state();
+        s.history.push(HistoryItem {
+            text: "one two three".into(),
+            date_unix: 1_700_000_000,
+            duration_secs: 3.0,
+            model: "test".into(),
+            audio_path: None,
+            raw_text: "one two three".into(),
+            words_out: 3,
+            dict_hits: 0,
+            cleanup: "full".into(),
+        });
+        s.seed_stats_from_history();
+        assert_eq!(s.stats.lifetime_dictations, 1);
+        assert_eq!(s.stats.lifetime_words, 3);
+        s.seed_stats_from_history();
+        assert_eq!(s.stats.lifetime_dictations, 1, "must not double-count");
+        let _ = std::fs::remove_dir_all(&s.data_dir);
     }
 }

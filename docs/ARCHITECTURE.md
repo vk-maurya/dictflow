@@ -25,11 +25,12 @@ state (`Arc<Mutex<…>>`, `Arc<AtomicBool>`, `mpsc::Sender`).
 | `main.rs` | App state, all Tauri commands, hotkeys, tray, downloads, audio capture, paste |
 | `models.rs` | Model catalog (both engines): ids, URLs, sizes, scores |
 | `text.rs` | Pure offline text passes: dictionary, fillers, tidy, smart punctuation, WAV I/O + resampling |
+| `stats.rs` | Lifetime usage ledger (`stats.json`); survives History clear-all |
 
 ## Frontend (`src/`)
 
 Framework-free TypeScript + Vite: a tiny view router (`renderView`) over
-`Dictate / Models / Setup / History / Dictionary / Statistics / Settings`,
+`Dashboard / Dictate / Models / Setup / History / Dictionary / Insights / Settings`,
 Tauri `invoke` + event listeners, toasts. No state library — module-level
 caches refreshed from commands.
 
@@ -41,6 +42,7 @@ recordings/…       # per-dictation WAVs (deleted with their history item)
 bin/               # optional whisper-cli.exe sidecar
 settings.json      # Settings (unknown fields ignored → forward compatible)
 history.json       # HistoryItem[] (migrates v0.1 plain-text format)
+stats.json         # Usage ledger (lifetime + by_day); not wiped by Clear all
 dictionary.json    # DictionaryEntry[]
 logs/              # tauri-plugin-log file target
 ```

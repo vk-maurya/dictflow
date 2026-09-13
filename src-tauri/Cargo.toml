@@ -27,6 +27,7 @@ reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"] }
 sherpa-onnx = "1.13"
 regex = "1"
 futures-util = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 [features]
 default = ["custom-protocol"]

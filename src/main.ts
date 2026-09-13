@@ -11,7 +11,24 @@ import { enable as autostartEnable, disable as autostartDisable, isEnabled as au
 // ---------------------------------------------------------------------------
 
 type Engine = "whisper" | "parakeet";
-type View = "dictate" | "models" | "setup" | "history" | "dictionary" | "stats" | "settings";
+type View = "home" | "dictate" | "models" | "setup" | "history" | "dictionary" | "stats" | "settings";
+type StatsPeriod = "today" | "7d" | "30d" | "all";
+
+interface DayBucket {
+  dictations: number;
+  words: number;
+  audio_secs: number;
+  raw_words: number;
+  dict_hits: number;
+}
+interface UsageStats {
+  lifetime_dictations: number;
+  lifetime_words: number;
+  lifetime_audio_secs: number;
+  lifetime_raw_words: number;
+  lifetime_dict_hits: number;
+  by_day: Record<string, DayBucket>;
+}
 
 interface ModelFile {
   name: string;
@@ -39,6 +56,10 @@ interface HistoryItem {
   duration_secs: number;
   model: string;
   audio_path: string | null;
+  raw_text?: string;
+  words_out?: number;
+  dict_hits?: number;
+  cleanup?: string;
 }
 interface DictionaryEntry {
   id: string;
@@ -100,30 +121,70 @@ interface MicTest {
 // State
 // ---------------------------------------------------------------------------
 
-let view: View = "dictate";
+let view: View = "home";
 let status: Status | null = null;
 let models: ModelStatus[] = [];
 let history: HistoryItem[] = [];
+let usage: UsageStats | null = null;
 let dict: DictionaryEntry[] = [];
 let settings: Settings | null = null;
+let statsPeriod: StatsPeriod = "today";
+let recordStartedAt: number | null = null;
+let recordTick: number | null = null;
 let transcribing = false;
 let lastResult: string | null = null;
 let modelFilter: "all" | Engine = "all";
 let historyQuery = "";
+let homeQuery = "";
 let dlBars: Record<string, { file: string; pct: number | null }> = {};
 let audioDevices: AudioDeviceInfo[] | null = null;
 let micTest: MicTest | null = null;
 let micTesting = false;
 
-const NAV: { id: View; label: string; ico: string }[] = [
-  { id: "dictate", label: "Dictate", ico: "🎙" },
-  { id: "models", label: "AI Models", ico: "🧠" },
-  { id: "setup", label: "Setup", ico: "✅" },
-  { id: "history", label: "History", ico: "🕘" },
-  { id: "dictionary", label: "Dictionary", ico: "📖" },
-  { id: "stats", label: "Statistics", ico: "📊" },
-  { id: "settings", label: "Settings", ico: "⚙" },
+type NavItem = { id: View; label: string; ico: string };
+
+const NAV_MAIN: NavItem[] = [
+  { id: "home", label: "Dashboard", ico: "home" },
+  { id: "dictate", label: "Dictate", ico: "mic" },
+  { id: "history", label: "History", ico: "clock" },
+  { id: "dictionary", label: "Dictionary", ico: "book" },
+  { id: "stats", label: "Insights", ico: "chart" },
+  { id: "models", label: "AI Models", ico: "cpu" },
 ];
+const NAV_FOOT: NavItem[] = [
+  { id: "setup", label: "Setup", ico: "check" },
+  { id: "settings", label: "Settings", ico: "gear" },
+];
+
+const ICO: Record<string, string> = {
+  home: `<path d="M4 10.5 12 3l8 7.5V21H4z"/><path d="M9 21v-7h6v7"/>`,
+  mic: `<path d="M12 3a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V6a3 3 0 0 1 3-3z"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/>`,
+  cpu: `<rect x="5" y="5" width="14" height="14" rx="2"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/><rect x="9" y="9" width="6" height="6" rx="1"/>`,
+  check: `<circle cx="12" cy="12" r="9"/><path d="m8 12 2.5 2.5L16 9"/>`,
+  clock: `<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>`,
+  book: `<path d="M4 5a2 2 0 0 1 2-2h13v16H6a2 2 0 0 0-2 2z"/><path d="M6 3v16"/>`,
+  chart: `<path d="M4 19V5M4 19h16M8 16v-5M12 16V8M16 16v-3"/>`,
+  gear: `<circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/>`,
+  search: `<circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/>`,
+  copy: `<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M4 16V6a2 2 0 0 1 2-2h10"/>`,
+  trash: `<path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13"/>`,
+  play: `<path d="m8 5 11 7-11 7V5z"/>`,
+  pause: `<path d="M8 5h3v14H8zM13 5h3v14h-3z"/>`,
+  file: `<path d="M7 3h8l5 5v13H7z"/><path d="M15 3v5h5"/>`,
+  warn: `<path d="M12 3 22 20H2z"/><path d="M12 9v5M12 17h.01"/>`,
+  download: `<path d="M12 4v12m-5-5 5 5 5-5M5 20h14"/>`,
+  x: `<path d="M6 6l12 12M18 6 6 18"/>`,
+};
+
+function ico(name: string): string {
+  return `<svg class="ico-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICO[name] ?? ""}</svg>`;
+}
+
+function navBtn(n: NavItem): string {
+  return `<button data-nav="${n.id}" class="${view === n.id ? "active" : ""}">${ico(n.ico)}<span>${n.label}</span></button>`;
+}
+
+const EMPTY_DAY: DayBucket = { dictations: 0, words: 0, audio_secs: 0, raw_words: 0, dict_hits: 0 };
 
 const LANGUAGES: [string, string][] = [
   ["auto", "Auto-detect"],
@@ -145,7 +206,7 @@ const CLEANUPS: [string, string][] = [
 
 const HOTKEYS: [string, string][] = [
   ["RightCtrl", "Right Ctrl (hold)"],
-  ["LeftCtrl", "Left Ctrl ⚠ (cancels on Ctrl+key)"],
+  ["LeftCtrl", "Left Ctrl (cancels on Ctrl+key)"],
   ["ScrollLock", "Scroll Lock"],
   ["F9", "F9"],
   ["CtrlAltSpace", "Ctrl + Alt + Space"],
@@ -175,6 +236,187 @@ function fmtDur(sec: number): string {
 
 function wordCount(t: string): number {
   return t.split(/\s+/).filter(Boolean).length;
+}
+
+function ymd(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function noon(d: Date): Date {
+  const x = new Date(d);
+  x.setHours(12, 0, 0, 0);
+  return x;
+}
+
+function shiftDays(d: Date, n: number): Date {
+  const x = noon(d);
+  x.setDate(x.getDate() + n);
+  return x;
+}
+
+function dayKeys(count: number): string[] {
+  const keys: string[] = [];
+  let d = noon(new Date());
+  for (let i = 0; i < count; i++) {
+    keys.push(ymd(d));
+    d = shiftDays(d, -1);
+  }
+  return keys;
+}
+
+function fmtClock(sec: number): string {
+  const s = Math.max(0, Math.floor(sec));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${r.toString().padStart(2, "0")}`;
+}
+
+function fmtCompact(n: number): string {
+  if (n >= 1_000_000) {
+    const v = n / 1_000_000;
+    return `${v >= 10 ? Math.round(v) : v.toFixed(1).replace(/\.0$/, "")}M`;
+  }
+  if (n >= 1000) {
+    const v = n / 1000;
+    return `${v >= 10 ? Math.round(v) : v.toFixed(1).replace(/\.0$/, "")}K`;
+  }
+  return n.toLocaleString();
+}
+
+function fmtClockTime(ts: number): string {
+  if (!ts) return "";
+  return new Date(ts * 1000).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }).toLowerCase();
+}
+
+function dayHeading(ts: number): string {
+  if (!ts) return "IMPORTED";
+  const d = noon(new Date(ts * 1000));
+  const today = noon(new Date());
+  if (ymd(d) === ymd(today)) return "TODAY";
+  if (ymd(d) === ymd(shiftDays(today, -1))) return "YESTERDAY";
+  return d.toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" }).toUpperCase();
+}
+
+function fmtConsumed(secs: number): string {
+  if (!secs) return "0 min";
+  if (secs < 60) return `${Math.round(secs)}s`;
+  if (secs < 3600) {
+    const m = secs / 60;
+    return m >= 10 ? `${Math.round(m)} min` : `${m.toFixed(1)} min`;
+  }
+  const h = Math.floor(secs / 3600);
+  const min = Math.round((secs % 3600) / 60);
+  return min ? `${h}h ${min}m` : `${h}h`;
+}
+
+function fmtTimeSaved(words: number): string {
+  const min = words / 40;
+  if (!words) return "0 min";
+  if (min < 1) return `${Math.round(min * 60)}s`;
+  if (min < 60) return min < 10 ? `${min.toFixed(1)} min` : `${Math.round(min)} min`;
+  const h = Math.floor(min / 60);
+  const m = Math.round(min % 60);
+  return m ? `${h}h ${m}m` : `${h}h`;
+}
+
+function calcWpm(words: number, secs: number): number {
+  if (secs < 1 || words <= 0) return 0;
+  return Math.round(words / (secs / 60));
+}
+
+function greeting(): string {
+  return "Welcome back";
+}
+
+function periodTotals(period: StatsPeriod): DayBucket {
+  if (!usage) return { ...EMPTY_DAY };
+  if (period === "all") {
+    return {
+      dictations: usage.lifetime_dictations,
+      words: usage.lifetime_words,
+      audio_secs: usage.lifetime_audio_secs,
+      raw_words: usage.lifetime_raw_words,
+      dict_hits: usage.lifetime_dict_hits,
+    };
+  }
+  const n = period === "today" ? 1 : period === "7d" ? 7 : 30;
+  const tot: DayBucket = { ...EMPTY_DAY };
+  for (const k of dayKeys(n)) {
+    const b = usage.by_day[k];
+    if (!b) continue;
+    tot.dictations += b.dictations;
+    tot.words += b.words;
+    tot.audio_secs += b.audio_secs;
+    tot.raw_words += b.raw_words;
+    tot.dict_hits += b.dict_hits;
+  }
+  return tot;
+}
+
+function streakInfo(): { current: number; longest: number } {
+  if (!usage) return { current: 0, longest: 0 };
+  const keys = Object.keys(usage.by_day).sort();
+  let longest = 0;
+  let run = 0;
+  let prev: string | null = null;
+  for (const k of keys) {
+    if ((usage.by_day[k]?.words ?? 0) <= 0) continue;
+    if (prev) {
+      const [y, m, d] = prev.split("-").map(Number);
+      const next = shiftDays(new Date(y, m - 1, d), 1);
+      run = ymd(next) === k ? run + 1 : 1;
+    } else {
+      run = 1;
+    }
+    prev = k;
+    if (run > longest) longest = run;
+  }
+  let current = 0;
+  let cursor = noon(new Date());
+  while ((usage.by_day[ymd(cursor)]?.words ?? 0) > 0) {
+    current += 1;
+    cursor = shiftDays(cursor, -1);
+  }
+  return { current, longest };
+}
+
+function heatLevel(words: number): number {
+  if (words <= 0) return 0;
+  if (words < 250) return 1;
+  if (words < 500) return 2;
+  if (words < 750) return 3;
+  return 4;
+}
+
+function startTimer(): void {
+  if (recordTick != null) return;
+  if (recordStartedAt == null) recordStartedAt = Date.now();
+  recordTick = window.setInterval(paintRecTimer, 250);
+  paintRecTimer();
+}
+
+function stopTimer(): void {
+  if (recordTick != null) {
+    window.clearInterval(recordTick);
+    recordTick = null;
+  }
+  recordStartedAt = null;
+  paintRecTimer();
+}
+
+function paintRecTimer(): void {
+  const el = document.getElementById("rec-timer");
+  if (!el) return;
+  if (!recordStartedAt) {
+    el.textContent = "";
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  el.textContent = fmtClock((Date.now() - recordStartedAt) / 1000);
 }
 
 function toast(msg: string, kind: "info" | "success" | "error" = "info"): void {
@@ -222,8 +464,15 @@ async function refreshHistory(): Promise<void> {
   if (h) {
     history = h;
     if (view === "history") renderHistoryList();
-    if (view === "stats") renderView();
-    if (view === "dictate") renderView();
+    if (view === "stats" || view === "home" || view === "dictate") renderView();
+  }
+}
+
+async function refreshStats(): Promise<void> {
+  const s = await call<UsageStats>("get_stats");
+  if (s) {
+    usage = s;
+    if (view === "stats" || view === "home") renderView();
   }
 }
 
@@ -291,13 +540,15 @@ function paintStatusBits(): void {
   if (ms) {
     const key = talkKey();
     ms.textContent = status.recording
-      ? `● Recording… ${talkHold() ? `release ${key}` : `press ${key} again`} to finish`
+      ? `Recording — ${talkHold() ? `release ${key}` : `press ${key} again`} to finish`
       : transcribing
-        ? "… Transcribing"
-        : `○ Idle — ${talkHold() ? `hold ${key}` : `press ${key}`} to talk`;
+        ? "Transcribing"
+        : `Idle — ${talkHold() ? `hold ${key}` : `press ${key}`} to talk`;
   }
   const mb = document.getElementById("mic-btn") as HTMLButtonElement | null;
   if (mb) mb.classList.toggle("recording", status.recording);
+  if (status.recording) startTimer();
+  else stopTimer();
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +611,7 @@ function refreshPlayLabels(): void {
   document.querySelectorAll("[data-play]").forEach((b) => {
     const p = (b as HTMLButtonElement).dataset.play!;
     const n = p.split(/[\\/]/).pop() ?? p;
-    (b as HTMLButtonElement).textContent = playingName === n ? "⏸ Playing" : "▶ Play";
+    (b as HTMLButtonElement).innerHTML = playingName === n ? `${ico("pause")} Playing` : `${ico("play")} Play`;
   });
 }
 
@@ -426,13 +677,13 @@ function viewDictate(): string {
     : "";
   const warn =
     status && !status.model_loaded
-      ? `<div class="card warn-card"><h3>⚠ No model ready</h3>
+      ? `<div class="card warn-card"><h3>No model ready</h3>
          <p class="muted">Download <b>${esc(m?.name ?? status.model_id)}</b> from AI Models first — everything runs offline after that.</p>
          <button class="small" id="goto-models">Open AI Models</button></div>`
       : "";
   const whisperWarn =
     status && status.engine === "whisper" && status.model_loaded && !status.whisper_binary
-      ? `<div class="card warn-card"><h3>⚠ Whisper engine needs its binary</h3>
+      ? `<div class="card warn-card"><h3>Whisper engine needs its binary</h3>
          <p class="muted">Place <code>whisper-cli.exe</code> (whisper.cpp build) in <code>${esc(status.data_dir)}\\bin</code> or on PATH. Parakeet models need no binary.</p></div>`
       : "";
   return `
@@ -441,13 +692,14 @@ function viewDictate(): string {
     ${warn}${whisperWarn}
     <div class="card">
       <div class="mic-wrap">
-        <button class="mic-btn${status?.recording ? " recording" : ""}" id="mic-btn">🎙</button>
+        <button class="mic-btn${status?.recording ? " recording" : ""}" id="mic-btn">${ico("mic")}</button>
         <div class="mic-state" id="mic-state"></div>
+        <div class="rec-timer" id="rec-timer" hidden></div>
       </div>
       <p class="hotkey-hint muted">Talk key <code>${talkHold() ? `hold ${talkKey()}` : talkKey()}</code> works from any app
       ${m ? ` • Using <b>${esc(m.name)}</b> (${esc(m.languages)})` : ""}</p>
       <div class="row" style="justify-content:center;margin-top:12px">
-        <button class="ghost small" id="file-btn">📄 Transcribe audio file (WAV)</button>
+        <button class="ghost small" id="file-btn">${ico("file")} Transcribe audio file (WAV)</button>
       </div>
     </div>
     ${last}`;
@@ -468,7 +720,7 @@ function viewModels(): string {
       const dl = dlBars[m.id] ?? (m.downloading ? { file: "queued…", pct: null } : null);
       const action =
         m.active && m.downloaded
-          ? `<button class="ghost small" disabled>✓ In use</button>`
+          ? `<button class="ghost small" disabled>In use</button>`
           : dl
             ? `<button class="small" disabled>Downloading…</button>`
             : !m.downloaded
@@ -486,11 +738,11 @@ function viewModels(): string {
           <div class="muted" style="font-size:12px">${esc(m.languages)} • ${esc(m.size_label)}</div></div>
           <span class="badge ${m.engine}">${m.engine === "parakeet" ? "Parakeet" : "Whisper"}</span>
         </div>
-        <div class="essence">✦ ${esc(m.essence)}</div>
+        <div class="essence">${esc(m.essence)}</div>
         ${meter("Speed", m.speed)}${meter("Accuracy", m.accuracy)}
         ${progress}
         <div class="row">${action}
-          ${m.downloaded ? `<span class="muted" style="font-size:12px">✓ on disk</span><button class="icon-btn" data-del-model="${m.id}" title="Delete model files">🗑</button>` : ""}
+          ${m.downloaded ? `<span class="muted" style="font-size:12px">on disk</span><button class="icon-btn" data-del-model="${m.id}" title="Delete model files">${ico("trash")}</button>` : ""}
         </div>
       </div>`;
     })
@@ -524,10 +776,10 @@ function viewSetup(): string {
   const verdict = !micTest
     ? ""
     : !micTest.callbacks
-      ? `<p style="color:var(--amber)">⚠ Stream opened on <b>${esc(micTest.device)}</b> but zero audio frames arrived. Likely: another app holds the mic exclusively (quit voice apps, retest), or the default endpoint is dead — pick a working mic in Windows Sound settings.</p>`
+      ? `<p style="color:var(--amber)">Stream opened on <b>${esc(micTest.device)}</b> but zero audio frames arrived. Likely: another app holds the mic exclusively (quit voice apps, retest), or the default endpoint is dead — pick a working mic in Windows Sound settings.</p>`
       : micTest.peak > 0.02
-        ? `<p style="color:var(--green)">✓ Microphone working — <b>${esc(micTest.device)}</b> at ${(micTest.sample_rate / 1000).toFixed(1)} kHz, peak ${(micTest.peak * 100).toFixed(0)}% over ${micTest.duration_secs.toFixed(1)}s.</p>`
-        : `<p style="color:var(--amber)">⚠ Frames arrive from <b>${esc(micTest.device)}</b> but only silence (peak ${(micTest.peak * 100).toFixed(1)}%) — unmute the mic and raise its input level in Windows Sound settings.</p>`;
+        ? `<p style="color:var(--green)">Microphone working — <b>${esc(micTest.device)}</b> at ${(micTest.sample_rate / 1000).toFixed(1)} kHz, peak ${(micTest.peak * 100).toFixed(0)}% over ${micTest.duration_secs.toFixed(1)}s.</p>`
+        : `<p style="color:var(--amber)">Frames arrive from <b>${esc(micTest.device)}</b> but only silence (peak ${(micTest.peak * 100).toFixed(1)}%) — unmute the mic and raise its input level in Windows Sound settings.</p>`;
   const m = models.find((x) => x.id === status?.model_id);
   const modelOk = status?.model_loaded;
   return `
@@ -540,7 +792,7 @@ function viewSetup(): string {
       <div class="row" style="margin-bottom:12px">
         <button class="small" id="mic-refresh">Refresh devices</button>
         <button class="small" id="mic-open-settings">Open microphone settings</button>
-        <button class="small" id="mic-test" ${micTesting ? "disabled" : ""}>${micTesting ? "Testing… speak now" : "🎙 Test microphone (1.5s)"}</button>
+        <button class="small" id="mic-test" ${micTesting ? "disabled" : ""}>${micTesting ? "Testing… speak now" : `${ico("mic")} Test microphone (1.5s)`}</button>
       </div>
       ${verdict}
       ${devRows}
@@ -550,7 +802,7 @@ function viewSetup(): string {
       Toggle it in Settings → Auto-paste.</p>
     </div>
     <div class="card"><h3>3 · Speech model</h3>
-      <p>${modelOk ? `✓ <b>${esc(m?.name ?? "")}</b> ready.` : "⚠ No model ready yet."}</p>
+      <p>${modelOk ? `<b>${esc(m?.name ?? "")}</b> ready.` : "No model ready yet."}</p>
       <button class="small ghost" id="setup-models">Open AI Models</button>
     </div>`;
 }
@@ -583,10 +835,10 @@ function renderHistoryList(): void {
         <div class="hist-meta">
           <span>${fmtDate(h.date_unix)}</span>
           ${h.model ? `<span class="badge ${m?.engine ?? ""}">${esc(m?.name ?? h.model)}</span>` : ""}
-          ${h.duration_secs ? `<span>🎙 ${fmtDur(h.duration_secs)}</span>` : ""}
+          ${h.duration_secs ? `<span>${fmtDur(h.duration_secs)}</span>` : ""}
           <span>${wordCount(h.text)} words</span>
           <span class="spacer"></span>
-          ${h.audio_path ? `<button class="icon-btn" data-play="${esc(h.audio_path)}">▶ Play</button>` : ""}
+          ${h.audio_path ? `<button class="icon-btn" data-play="${esc(h.audio_path)}">${ico("play")} Play</button>` : ""}
           <button class="icon-btn" data-copy-hist="${idx}">Copy</button>
           <button class="icon-btn" data-del-hist="${idx}">Delete</button>
         </div>
@@ -629,9 +881,134 @@ function viewDictionary(): string {
     ${rows}`;
 }
 
+function heroTiles(t: DayBucket): string {
+  const cleaned = Math.max(0, t.raw_words - t.words);
+  const extra =
+    t.dict_hits > 0 || cleaned > 0
+      ? `<div class="stat"><div class="num">${t.dict_hits.toLocaleString()}</div><div class="cap">Dictionary hits</div></div>
+         ${cleaned > 0 ? `<div class="stat"><div class="num">${cleaned.toLocaleString()}</div><div class="cap">Words cleaned</div></div>` : ""}`
+      : "";
+  return `
+    <div class="stat-grid">
+      <div class="stat"><div class="num">${fmtConsumed(t.audio_secs)}</div><div class="cap">Minutes consumed</div></div>
+      <div class="stat"><div class="num">${t.words.toLocaleString()}</div><div class="cap">Words dictated</div></div>
+      <div class="stat"><div class="num">${fmtTimeSaved(t.words)}</div><div class="cap">Time saved @ 40 WPM</div></div>
+      <div class="stat"><div class="num">${calcWpm(t.words, t.audio_secs) || "—"}</div><div class="cap">Your pace (WPM)</div></div>
+      <div class="stat"><div class="num">${t.dictations.toLocaleString()}</div><div class="cap">Dictations</div></div>
+      ${extra}
+    </div>`;
+}
+
+function weekChart(days: number): string {
+  const keys = dayKeys(days).reverse();
+  const vals = keys.map((k) => usage?.by_day[k]?.audio_secs ?? 0);
+  const words = keys.map((k) => usage?.by_day[k]?.words ?? 0);
+  const max = Math.max(1, ...vals);
+  const cols = keys
+    .map((k, i) => {
+      const label = new Date(k + "T12:00:00").toLocaleDateString(undefined, { weekday: "short" });
+      const h = Math.round((vals[i] / max) * 100);
+      return `<div class="bar-col">
+        <div class="bar-count">${words[i] ? words[i] : ""}</div>
+        <div class="bar-track"><div class="bar-fill" style="height:${Math.max(h, vals[i] > 0 ? 8 : 5)}%"></div></div>
+        <div class="bar-day">${days > 7 ? k.slice(8) : label}</div>
+      </div>`;
+    })
+    .join("");
+  return `<div class="chart">${cols}</div>`;
+}
+
+function heatmapHtml(): string {
+  const weeks = 16;
+  const today = noon(new Date());
+  const start = shiftDays(today, -(today.getDay() + (weeks - 1) * 7));
+  const cells: string[] = [];
+  const { current } = streakInfo();
+  const streakDays = new Set(dayKeys(current));
+  for (let i = 0; i < weeks * 7; i++) {
+    const d = shiftDays(start, i);
+    const key = ymd(d);
+    const future = d > today;
+    const words = future ? 0 : usage?.by_day[key]?.words ?? 0;
+    const lvl = future ? -1 : heatLevel(words);
+    const glow = !future && current > 1 && streakDays.has(key);
+    const title = future ? "" : `${key}: ${words} words`;
+    cells.push(
+      `<span class="heat-cell${lvl >= 0 ? ` b${lvl}` : " future"}${glow ? " streak" : ""}" title="${esc(title)}"></span>`
+    );
+  }
+  return `<div class="heat" style="grid-template-rows:repeat(7,12px)">${cells.join("")}</div>
+    <div class="heat-legend">
+      <span>Less</span>
+      <span class="heat-cell b0"></span><span class="heat-cell b1"></span>
+      <span class="heat-cell b2"></span><span class="heat-cell b3"></span>
+      <span class="heat-cell b4"></span>
+      <span>More</span>
+    </div>`;
+}
+
+function viewHome(): string {
+  const all = periodTotals("all");
+  const { current } = streakInfo();
+  const wpm = calcWpm(all.words, all.audio_secs);
+  const q = homeQuery.trim().toLowerCase();
+  const items = (q ? history.filter((h) => h.text.toLowerCase().includes(q)) : history).slice(0, 60);
+  const ready = Boolean(status?.model_loaded);
+  const m = models.find((x) => x.id === status?.model_id);
+  const groups: { head: string; items: { h: HistoryItem; idx: number }[] }[] = [];
+  for (const h of items) {
+    const head = dayHeading(h.date_unix);
+    const last = groups[groups.length - 1];
+    if (!last || last.head !== head) groups.push({ head, items: [] });
+    groups[groups.length - 1].items.push({ h, idx: history.indexOf(h) });
+  }
+  const search = `<div class="timeline-search">${ico("search")}<input type="text" id="home-q" placeholder="Search" value="${esc(homeQuery)}"></div>`;
+  const feed = groups.length
+    ? groups
+        .map(
+          (g, gi) => `<div class="timeline-head"><span>${g.head}</span>${gi === 0 ? search : ""}</div>${g.items
+            .map(
+              ({ h, idx }) => `<div class="tl-row">
+            <div class="tl-time">${fmtClockTime(h.date_unix)}</div>
+            <div class="tl-text">${esc(h.text)}</div>
+            <div class="tl-actions"><button class="icon-only" data-copy-hist="${idx}" title="Copy">${ico("copy")}</button></div>
+          </div>`
+            )
+            .join("")}`
+        )
+        .join("")
+    : `<div class="timeline-head"><span>TODAY</span>${search}</div>
+       <div class="empty">${q ? "No matches." : `Nothing yet — hold ${esc(talkKey())} and speak.`}</div>`;
+  return `
+    <div class="home">
+      <div class="home-feed">
+        <div class="greeting">${greeting()}</div>
+        <div class="hero-banner">
+          <h2>${ready ? "Dictate anywhere on Windows" : "Set up DictFlow in a minute"}</h2>
+          <p>${
+            ready
+              ? `Hold ${esc(talkKey())} and speak. Text lands in the focused app. Everything stays on this PC.`
+              : "Download a speech model first. After that, dictation is fully offline."
+          }</p>
+          <div><button class="light" id="${ready ? "hero-dictate" : "goto-models"}">${ready ? "Start now" : "Open AI Models"}</button></div>
+        </div>
+        ${feed}
+      </div>
+      <aside class="home-rail">
+        <div class="rail-stat"><div class="n">${fmtCompact(all.words)}</div><div class="c">total words</div></div>
+        <div class="rail-stat"><div class="n">${wpm || "—"}</div><div class="c">wpm</div></div>
+        <div class="rail-stat"><div class="n">${current || 0}</div><div class="c">day streak</div></div>
+        <div class="rail-card">
+          <h4>${ready ? esc(m?.name ?? "Model ready") : "No model yet"}</h4>
+          <p>${ready ? "Hold the talk key in any app. Text never leaves this PC." : "Download a model from AI Models to start dictating offline."}</p>
+          <button class="accent small" id="goto-history">View history</button>
+        </div>
+      </aside>
+    </div>`;
+}
+
 function viewStats(): string {
-  const words = history.reduce((a, h) => a + wordCount(h.text), 0);
-  const secs = history.reduce((a, h) => a + (h.duration_secs || 0), 0);
+  const t = periodTotals(statsPeriod);
   const perModel = new Map<string, number>();
   history.forEach((h) => {
     const key = h.model || "unknown";
@@ -643,16 +1020,35 @@ function viewStats(): string {
       return `<div class="dict-row"><div class="dict-rule">${esc(m?.name ?? (id || "unknown"))}</div><b>${n}</b></div>`;
     })
     .join("");
+  const { current, longest } = streakInfo();
+  const chips: [StatsPeriod, string][] = [
+    ["today", "Today"],
+    ["7d", "7 days"],
+    ["30d", "30 days"],
+    ["all", "All time"],
+  ];
+  const chartDays = statsPeriod === "30d" || statsPeriod === "all" ? 30 : 7;
   return `
-    <h1>Statistics</h1>
-    <p class="page-sub">Local-only counts. Clearing history resets these.</p>
-    <div class="stat-grid">
-      <div class="stat"><div class="num">${history.length}</div><div class="cap">Dictations</div></div>
-      <div class="stat"><div class="num">${words.toLocaleString()}</div><div class="cap">Words dictated</div></div>
-      <div class="stat"><div class="num">${fmtDur(secs)}</div><div class="cap">Audio recorded</div></div>
-      <div class="stat"><div class="num">${dict.length}</div><div class="cap">Dictionary rules</div></div>
+    <h1>Insights</h1>
+    <p class="page-sub">Minutes, pace, and time saved. Lifetime numbers survive Clear all.</p>
+    <div class="filter-tabs" id="stats-period">
+      ${chips.map(([id, l]) => `<button class="${statsPeriod === id ? "active" : ""}" data-period="${id}">${l}</button>`).join("")}
     </div>
-    <div class="card"><h3>Dictations per model</h3>${rows || `<div class="empty">No data yet.</div>`}</div>`;
+    ${heroTiles(t)}
+    <div class="card">
+      <h3>${chartDays === 30 ? "Last 30 days" : "Last 7 days"}</h3>
+      <p class="week-sub">Bar height is minutes spoken; numbers on top are words.</p>
+      ${weekChart(chartDays)}
+    </div>
+    <div class="card">
+      <h3>Activity</h3>
+      <p class="week-sub">Current streak ${current} day${current === 1 ? "" : "s"} · longest ${longest}.</p>
+      ${heatmapHtml()}
+    </div>
+    <div class="card"><h3>Dictations per model</h3>
+      <p class="week-sub">From History (last ${history.length} saved takes), not the lifetime ledger.</p>
+      ${rows || `<div class="empty">No data yet.</div>`}
+    </div>`;
 }
 
 function viewSettings(): string {
@@ -710,9 +1106,13 @@ function viewSettings(): string {
 function render(): void {
   document.getElementById("app")!.innerHTML = `
     <aside class="sidebar">
-      <div class="brand"><div class="brand-mark"><img src="${logoUrl}" alt="DictFlow logo"></div>
-        <div><div class="brand-name">DictFlow</div><div class="brand-sub">offline dictation</div></div></div>
-      <nav class="nav">${NAV.map((n) => `<button data-nav="${n.id}" class="${view === n.id ? "active" : ""}"><span class="ico">${n.ico}</span>${n.label}</button>`).join("")}</nav>
+      <div class="brand">
+        <div class="brand-mark"><img src="${logoUrl}" alt="DictFlow logo"></div>
+        <div class="brand-name">DictFlow</div>
+        <span class="brand-pill">Offline</span>
+      </div>
+      <nav class="nav">${NAV_MAIN.map(navBtn).join("")}</nav>
+      <nav class="nav nav-foot">${NAV_FOOT.map(navBtn).join("")}</nav>
       <div class="side-footer"><span id="side-dot" class="status-dot dot-gray"></span><span id="side-model">…</span></div>
     </aside>
     <main class="main" id="view"></main>
@@ -731,7 +1131,8 @@ function render(): void {
 function renderView(): void {
   const box = document.getElementById("view");
   if (!box) return;
-  if (view === "dictate") box.innerHTML = viewDictate();
+  if (view === "home") box.innerHTML = viewHome();
+  else if (view === "dictate") box.innerHTML = viewDictate();
   else if (view === "models") box.innerHTML = viewModels();
   else if (view === "setup") box.innerHTML = viewSetup();
   else if (view === "history") {
@@ -756,6 +1157,33 @@ function bindView(): void {
     render();
   });
   (document.getElementById("file-btn") as HTMLButtonElement | null)?.addEventListener("click", transcribeFile);
+  (document.getElementById("goto-history") as HTMLElement | null)?.addEventListener("click", (e) => {
+    e.preventDefault();
+    view = "history";
+    render();
+  });
+  (document.getElementById("hero-dictate") as HTMLButtonElement | null)?.addEventListener("click", () => {
+    view = "dictate";
+    render();
+  });
+  const hq = document.getElementById("home-q") as HTMLInputElement | null;
+  hq?.addEventListener("input", () => {
+    homeQuery = hq.value;
+    const pos = hq.selectionStart;
+    renderView();
+    const next = document.getElementById("home-q") as HTMLInputElement | null;
+    if (next) {
+      next.focus();
+      const caret = pos ?? homeQuery.length;
+      next.setSelectionRange(caret, caret);
+    }
+  });
+  document.querySelectorAll("[data-period]").forEach((b) =>
+    (b as HTMLButtonElement).onclick = () => {
+      statsPeriod = (b as HTMLButtonElement).dataset.period as StatsPeriod;
+      renderView();
+    }
+  );
   // Models
   document.querySelectorAll("[data-dl]").forEach((b) =>
     (b as HTMLButtonElement).onclick = () => downloadModel((b as HTMLButtonElement).dataset.dl!)
@@ -812,7 +1240,7 @@ function bindView(): void {
   (document.getElementById("hist-clear") as HTMLButtonElement | null)?.addEventListener("click", async () => {
     await call("clear_history");
     await refreshHistory();
-    toast("History cleared", "success");
+    toast("History cleared — Insights totals kept", "success");
   });
   document.querySelectorAll("[data-copy-hist]").forEach((b) =>
     (b as HTMLButtonElement).onclick = () => {
@@ -951,10 +1379,14 @@ function bindView(): void {
 async function boot(): Promise<void> {
   attachConsole().catch(() => undefined);
   render();
-  await Promise.all([refreshStatus(), refreshModels(), refreshHistory(), refreshDict(), refreshSettings()]);
+  await Promise.all([refreshStatus(), refreshModels(), refreshHistory(), refreshStats(), refreshDict(), refreshSettings()]);
   renderView();
 
-  await listen<boolean>("dictflow://recording", () => refreshStatus());
+  await listen<boolean>("dictflow://recording", (e) => {
+    if (e.payload) startTimer();
+    else stopTimer();
+    refreshStatus();
+  });
   await listen<boolean>("dictflow://transcribing", (e) => {
     transcribing = e.payload;
     paintStatusBits();
@@ -975,7 +1407,10 @@ async function boot(): Promise<void> {
     if (lbl) lbl.textContent = `${p.file}${pct !== null ? ` — ${pct}%` : ""}`;
     if (view === "models" && !bar) renderView();
   });
-  await listen("dictflow://history-updated", () => refreshHistory());
+  await listen("dictflow://history-updated", () => {
+    refreshHistory();
+    refreshStats();
+  });
 
   setInterval(refreshStatus, 2000);
 }

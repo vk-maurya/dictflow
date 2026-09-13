@@ -43,10 +43,17 @@ pub fn save_dictionary(data_dir: &Path, entries: &[DictionaryEntry]) -> Result<(
     Ok(())
 }
 
+/// Whitespace-separated word count (matches the frontend `wordCount`).
+pub fn word_count(text: &str) -> u32 {
+    text.split_whitespace().filter(|t| !t.is_empty()).count() as u32
+}
+
 /// Apply every enabled rule. Word-boundary-aware, case-insensitive; spaces in
 /// the trigger match any whitespace run (mirrors `DictionaryService.replace`).
-pub fn apply_dictionary(text: &str, entries: &[DictionaryEntry]) -> String {
+/// Returns the rewritten text and how many replacements fired.
+pub fn apply_dictionary(text: &str, entries: &[DictionaryEntry]) -> (String, u32) {
     let mut result = text.to_owned();
+    let mut hits: u32 = 0;
     for entry in entries.iter().filter(|e| e.enabled) {
         let trigger = entry.trigger.trim();
         if trigger.is_empty() {
@@ -69,10 +76,11 @@ pub fn apply_dictionary(text: &str, entries: &[DictionaryEntry]) -> String {
                 .replacement
                 .replace('\\', r"\\")
                 .replace('$', "$$");
+            hits += re.find_iter(&result).count() as u32;
             result = re.replace_all(&result, template).into_owned();
         }
     }
-    result
+    (result, hits)
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +229,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn word_count_splits_on_whitespace() {
+        assert_eq!(word_count("one two  three"), 3);
+        assert_eq!(word_count("  "), 0);
+    }
+
+    #[test]
     fn dictionary_replaces_whole_words_case_insensitively() {
         let entries = vec![DictionaryEntry {
             id: "1".into(),
@@ -230,7 +244,7 @@ mod tests {
             whole_word: true,
         }];
         assert_eq!(
-            apply_dictionary("contact MY EMAIL please", &entries),
+            apply_dictionary("contact MY EMAIL please", &entries).0,
             "contact a@b.com please"
         );
         // Whole-word: no match inside longer words.
@@ -241,7 +255,19 @@ mod tests {
             enabled: true,
             whole_word: true,
         }];
-        assert_eq!(apply_dictionary("a figment", &entries), "a figment");
+        assert_eq!(apply_dictionary("a figment", &entries).0, "a figment");
+        let (out, hits) = apply_dictionary(
+            "contact MY EMAIL please",
+            &[DictionaryEntry {
+                id: "1".into(),
+                trigger: "my email".into(),
+                replacement: "a@b.com".into(),
+                enabled: true,
+                whole_word: true,
+            }],
+        );
+        assert_eq!(out, "contact a@b.com please");
+        assert_eq!(hits, 1);
     }
 
     #[test]
