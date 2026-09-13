@@ -1,9 +1,13 @@
 # DictFlow (local-only voice dictation for Windows)
 
-![DictFlow logo](assets/logo-512.png)
+![DictFlow](assets/screenshot.png)
 
 Fast, private, offline voice-to-text for Windows 10/11. Hold a key, speak,
 release — text lands in whatever app has focus. Nothing ever leaves your PC.
+
+**Download v0.2.0:**
+[Portable exe for Windows x64](https://github.com/vk-maurya/dictflow/releases/download/v0.2.0/DictFlow-0.2.0-windows-x64-portable.exe)
+(double-click, no installer) · [All releases](https://github.com/vk-maurya/dictflow/releases)
 
 - **100% offline** — Parakeet (in-process) or Whisper (sidecar), zero network
   after model download. No accounts, no telemetry.
@@ -13,7 +17,7 @@ release — text lands in whatever app has focus. Nothing ever leaves your PC.
 - **Mac-style talk key** — hold Right Ctrl (default), Scroll Lock, F9, Left
   Ctrl, or the Ctrl+Alt+Space combo; hold-to-talk or toggle.
 - **Post-processing pipeline** — dictionary snippets, symbol presets, 3-level
-  cleanup (Wispr-style), smart trailing punctuation, Whisper→English translate.
+  cleanup, smart trailing punctuation, Whisper→English translate.
 - **Full app** — dashboard views (Dictate, Models, Setup, History, Dictionary,
   Statistics, Settings), per-dictation audio playback, WAV file transcription,
   model manager with progress, mic diagnostics, auto-start, update check.
@@ -33,8 +37,6 @@ No model + no sidecar needed beyond that: Parakeet runs in-process.
 - [docs/BUILD.md](docs/BUILD.md) — dev environment, builds, troubleshooting
 - [docs/RELEASE.md](docs/RELEASE.md) — versioning, installers, GitHub releases
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — pipeline, threads, storage
-- [docs/SPEAKTYPE_ANALYSIS.md](docs/SPEAKTYPE_ANALYSIS.md) — what was ported
-  from SpeakType (macOS) and the parity checklist
 
 ## Project layout
 
@@ -44,8 +46,8 @@ src-tauri/           # Rust backend (Tauri v2)
   src/main.rs        # state, commands, hotkeys, tray
   src/models.rs      # model catalog (both engines)
   src/text.rs        # offline text pipeline (dictionary, cleanup, punctuation)
-assets/              # logo source art (logo-512.png)
-scripts/             # build-windows.ps1, clean-dev.ps1
+assets/              # screenshot, logo source (logo-512.png)
+scripts/             # build-windows.ps1, package-portable.ps1, clean-dev.ps1
 docs/                # build / release / architecture notes
 ```
 

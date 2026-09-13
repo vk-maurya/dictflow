@@ -30,7 +30,7 @@ npm run build          # typecheck + production frontend bundle (dist/)
 cargo check --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
-npm run tauri build    # NSIS + MSI installers (src-tauri/target/release/bundle/)
+npm run tauri build    # NSIS + MSI + portable exe (src-tauri/target/release/bundle/)
 ```
 
 Or run everything via [`scripts/build-windows.ps1`](../scripts/build-windows.ps1).
@@ -44,9 +44,16 @@ Or run everything via [`scripts/build-windows.ps1`](../scripts/build-windows.ps1
   Windows file locks on `.dll`s during linking crash Vite with `EBUSY`.
 - **Icons**: edit `assets/logo-512.png` (or regenerate with
   `python <temp>/gen_logo.py`), then `npx tauri icon assets/logo-512.png`.
-- **Logs**: backend logs go to stdout in dev and to the app log dir in
+- **Logs**: backend logs go to stdout in `tauri dev` and to the app log dir in
   production (`tauri-plugin-log`); the webview forwards console via the same
-  pipeline. Open the log dir from `%APPDATA%\dictflow\logs`.
+  pipeline. Release builds are a GUI app (no extra CMD window). Open the log
+  dir from `%APPDATA%\dictflow\logs`.
+- **Portable exe**: `scripts/build-windows.ps1` (via
+  `scripts/package-portable.ps1`) writes
+  `src-tauri/target/release/bundle/portable/DictFlow.exe` and a versioned
+  `DictFlow-<ver>-windows-x64-portable.exe`. Double-click — no installer.
+  WebView2 (preinstalled on Windows 10/11) is still required. Data still
+  lives in `%APPDATA%\dictflow`. See [RELEASE.md](RELEASE.md) to publish.
 
 ## Troubleshooting
 

@@ -16,9 +16,10 @@ Step "Rust lints + tests"
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
 
-Step "Installer"
+Step "Installer + portable exe"
 npx tauri build
+& "$PSScriptRoot\package-portable.ps1" | Out-Null
 
 Write-Host "`nArtifacts:" -ForegroundColor Green
-Get-ChildItem src-tauri\target\release\bundle\nsis\*.exe, src-tauri\target\release\bundle\msi\*.msi -ErrorAction SilentlyContinue |
+Get-ChildItem src-tauri\target\release\bundle\nsis\*.exe, src-tauri\target\release\bundle\msi\*.msi, src-tauri\target\release\bundle\portable\*.exe -ErrorAction SilentlyContinue |
   Select-Object FullName, @{n = "MB"; e = { [math]::Round($_.Length / 1MB, 1) } }
