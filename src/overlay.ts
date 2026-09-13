@@ -156,6 +156,7 @@ async function snapAfterDrag(): Promise<void> {
 
 async function boot(): Promise<void> {
   await win.setIgnoreCursorEvents(false).catch(() => undefined);
+  document.addEventListener("contextmenu", (e) => e.preventDefault());
   setPhase("idle");
   document.addEventListener("pointerdown", (e) => {
     if (e.button !== 0) return;

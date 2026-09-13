@@ -8,6 +8,8 @@ html, body {
   align-items: center;
   justify-content: center;
   user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
   cursor: pointer;
 }
 html:active, body:active { cursor: grabbing; }

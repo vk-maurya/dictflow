@@ -23,7 +23,7 @@ cpal = "0.15"
 hound = "3.5"
 arboard = "3"
 enigo = { version = "0.2", features = ["serde"] }
-reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"] }
+reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json", "blocking", "multipart"] }
 sherpa-onnx = "1.13"
 regex = "1"
 futures-util = "0.3"

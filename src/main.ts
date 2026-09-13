@@ -68,6 +68,9 @@ interface DictionaryEntry {
   replacement: string;
   enabled: boolean;
   whole_word: boolean;
+  kind?: string;
+  starred?: boolean;
+  usage?: number;
 }
 interface Settings {
   model_id: string;
@@ -85,6 +88,61 @@ interface Settings {
   copy_last_key: string;
   onboarded: boolean;
   session_cap: boolean;
+  audio_backend: string;
+  audio_api_base: string;
+  audio_api_model: string;
+  llm_backend: string;
+  llm_api_base: string;
+  llm_api_model: string;
+  llm_temperature: number;
+  llm_timeout_ms: number;
+  llm_preset: string;
+  llm_custom_prompt: string;
+  llm_enabled: boolean;
+}
+interface ProviderStatus {
+  audio_key_masked: string;
+  llm_key_masked: string;
+  has_audio_key: boolean;
+  has_llm_key: boolean;
+  default_prompt: string;
+  prompt_presets: Record<string, string>;
+}
+
+const DEFAULT_PROCESS_PROMPT =
+  "You are a transcript editor. Clean and lightly rewrite speech-to-text: fix spelling, ASR errors, grammar, and punctuation. Return only the cleaned text.";
+
+const AUDIO_HOSTS: { id: string; label: string; base: string; model: string }[] = [
+  { id: "openai", label: "OpenAI", base: "https://api.openai.com/v1", model: "whisper-1" },
+  { id: "groq", label: "Groq", base: "https://api.groq.com/openai/v1", model: "whisper-large-v3-turbo" },
+  { id: "custom", label: "Custom", base: "", model: "" },
+];
+
+function audioHostId(base: string): string {
+  const b = (base || "").trim().replace(/\/+$/, "");
+  if (b.includes("api.groq.com")) return "groq";
+  if (!b || b.includes("api.openai.com")) return "openai";
+  return "custom";
+}
+
+function processPromptFor(preset: string, custom: string): string {
+  if (preset === "custom" && custom.trim()) return custom;
+  return provider?.prompt_presets?.[preset] || provider?.default_prompt || DEFAULT_PROCESS_PROMPT;
+}
+
+function resolveSavedPrompt(preset: string, text: string): { preset: string; custom: string } {
+  const trimmed = text.trim();
+  const defaults = provider?.prompt_presets ?? {};
+  if (preset !== "custom" && (!trimmed || trimmed === (defaults[preset] ?? "").trim())) {
+    return { preset, custom: "" };
+  }
+  if (trimmed === (defaults.clean ?? DEFAULT_PROCESS_PROMPT).trim()) {
+    return { preset: "clean", custom: "" };
+  }
+  for (const [id, body] of Object.entries(defaults)) {
+    if (trimmed === body.trim()) return { preset: id, custom: "" };
+  }
+  return { preset: "custom", custom: trimmed };
 }
 interface Status {
   recording: boolean;
@@ -154,6 +212,10 @@ let micTest: MicTest | null = null;
 let micTesting = false;
 let onboardStep: OnboardStep = "welcome";
 let livePeak = 0;
+let dictTab: "vocab" | "snippet" = "vocab";
+let correctingIdx: number | null = null;
+let modelsPane: "audio" | "llm" = "audio";
+let provider: ProviderStatus | null = null;
 
 type NavItem = { id: View; label: string; ico: string };
 
@@ -213,9 +275,9 @@ const LANGUAGES: [string, string][] = [
 ];
 
 const CLEANUPS: [string, string][] = [
-  ["full", "Full — fillers + tidy"],
+  ["off", "None — raw transcript"],
   ["light", "Light — fillers only"],
-  ["off", "Off — raw transcript"],
+  ["full", "Full — fillers + tidy"],
 ];
 
 const HOTKEYS: [string, string][] = [
@@ -522,6 +584,11 @@ async function refreshSettings(): Promise<void> {
   }
 }
 
+async function refreshProvider(): Promise<void> {
+  const p = await call<ProviderStatus>("get_provider_status");
+  if (p) provider = p;
+}
+
 async function refreshAudioDevices(): Promise<void> {
   const d = await call<AudioDeviceInfo[]>("get_audio_devices");
   if (d) {
@@ -802,9 +869,104 @@ function viewModels(): string {
       </div>`;
     })
     .join("");
+  const pane = `
+    <div class="filter-tabs">
+      <button class="${modelsPane === "audio" ? "active" : ""}" id="pane-audio">Audio</button>
+      <button class="${modelsPane === "llm" ? "active" : ""}" id="pane-llm">LLM</button>
+    </div>`;
+  if (modelsPane === "llm") {
+    const s = settings;
+    const be = s?.llm_backend ?? "off";
+    const bases = [
+      ["off", "Off — rules only"],
+      ["local", "Local (Ollama / LM Studio / llama.cpp)"],
+      ["openai_compat", "OpenAI-compatible API"],
+      ["anthropic", "Anthropic-compatible API"],
+    ];
+    const presets: [string, string][] = [
+      ["clean", "Clean"],
+      ["professional", "Professional"],
+      ["casual", "Casual"],
+      ["message", "Message"],
+      ["bullets", "Bullets"],
+      ["custom", "Custom"],
+    ];
+    const showConn = be !== "off";
+    return `
+      <h1>AI Models</h1>
+      <p class="page-sub">Optional rewrite after local rules. Default is off — nothing leaves this PC. If the API errors, the rules text is pasted instead.</p>
+      ${pane}
+      <div class="card provider-card"><h3>LLM backend</h3>
+        <p class="provider-note">Keys are stored in Windows Credential Manager (Generic Credentials: <code>DictFlow/…</code>), never in a settings export or a file on disk. A localhost server can use an empty key.</p>
+        <div class="radio-list">
+          ${bases.map(([v, l]) => `<label class="check"><input type="radio" name="llm-be" value="${v}" ${be === v ? "checked" : ""}> ${l}</label>`).join("")}
+        </div>
+        ${
+          showConn
+            ? `<div class="provider-grid">
+          <label class="field">Base URL<input type="text" id="llm-base" value="${esc(s?.llm_api_base ?? "")}" placeholder="http://127.0.0.1:11434/v1"></label>
+          <label class="field">Model<input type="text" id="llm-model" value="${esc(s?.llm_api_model ?? "")}" placeholder="gpt-4o-mini"></label>
+          <label class="field">API key<input type="password" id="llm-key" autocomplete="off" placeholder="${esc(provider?.llm_key_masked || "optional on localhost")}"></label>
+        </div>`
+            : ""
+        }
+        <div class="provider-grid">
+          <label class="field">Preset<select id="llm-preset">${presets.map(([v, l]) => `<option value="${v}" ${s?.llm_preset === v ? "selected" : ""}>${l}</option>`).join("")}</select></label>
+          <label class="field span-all"><span class="field-head">Process prompt
+            <button type="button" class="ghost small" id="llm-prompt-reset">Reset to default</button></span>
+            <textarea id="llm-custom" rows="4" placeholder="${esc(DEFAULT_PROCESS_PROMPT)}">${esc(processPromptFor(s?.llm_preset ?? "clean", s?.llm_custom_prompt ?? ""))}</textarea>
+            <span class="field-hint">The model cleans and rewrites the transcript (spelling, ASR slips, punctuation). Reset restores the Clean preset from the app.</span>
+          </label>
+        </div>
+        ${
+          showConn
+            ? `<div class="set-row">
+          <div><b>Polish after every dictation</b><div class="desc">Runs this prompt after local cleanup. Leave off to call the LLM only when cleanup is Medium or High.</div></div>
+          <input type="checkbox" id="llm-on" ${s?.llm_enabled ? "checked" : ""}>
+        </div>
+        <div class="row">
+          <button class="small" id="llm-save">Save LLM</button>
+          <button class="ghost small" id="llm-test">Test connection</button>
+        </div>`
+            : `<div class="row">
+          <button class="small" id="llm-save">Save LLM</button>
+        </div>`
+        }
+      </div>`;
+  }
+  const s = settings;
+  const audioBe = s?.audio_backend ?? "local";
+  const audioApi = audioBe === "openai_compat";
+  const micName = settings?.audio_device || status?.audio_device || "the Windows default microphone";
   return `
     <h1>AI Models</h1>
-    <p class="page-sub">Parakeet runs in-process (no extra binary). Whisper needs <code>whisper-cli.exe</code> — see Settings. Models live under <code>${esc(status?.data_dir ?? "")}\\models</code>.</p>
+    <p class="page-sub">Local catalog stays the default. An OpenAI-compatible speech API is opt-in and sends the recording to that host.</p>
+    ${pane}
+    <div class="card provider-card"><h3>Speech source</h3>
+      <div class="radio-list">
+        <label class="check"><input type="radio" name="audio-be" value="local" ${audioBe === "local" ? "checked" : ""}> Local (Parakeet / Whisper on this PC)</label>
+        <label class="check"><input type="radio" name="audio-be" value="openai_compat" ${audioBe === "openai_compat" ? "checked" : ""}> OpenAI-compatible API (<code>/v1/audio/transcriptions</code>)</label>
+      </div>
+      ${
+        audioApi
+          ? `<p class="provider-note">The API key is stored in Windows Credential Manager. Use the <code>/v1</code> root (Groq: <code>https://api.groq.com/openai/v1</code>), not the full <code>/audio/transcriptions</code> path. Test records 1.5 seconds from <b>${esc(micName)}</b> and POSTs only if the clip has speech.</p>
+      <div class="provider-grid">
+        <label class="field">Host<select id="audio-host">${AUDIO_HOSTS.map((h) => `<option value="${h.id}" ${audioHostId(s?.audio_api_base ?? "") === h.id ? "selected" : ""}>${h.label}</option>`).join("")}</select></label>
+        <label class="field">Base URL<input type="text" id="audio-base" value="${esc(s?.audio_api_base ?? "")}" placeholder="https://api.groq.com/openai/v1"></label>
+        <label class="field">Model<input type="text" id="audio-model" value="${esc(s?.audio_api_model ?? "")}" placeholder="whisper-large-v3-turbo"></label>
+        <label class="field span-all">API key<input type="password" id="audio-key" autocomplete="off" placeholder="${esc(provider?.audio_key_masked || "required for cloud")}"></label>
+      </div>
+      <div class="row">
+        <button class="small" id="audio-save">Save audio API</button>
+        <button class="ghost small" id="audio-test">Test — speak 1.5s</button>
+      </div>`
+          : `<p class="provider-note">Dictation uses the downloaded model on this PC. Switch to the API option to send a spoken clip to a remote <code>/v1/audio/transcriptions</code> host.</p>
+      <div class="row">
+        <button class="small" id="audio-save">Save audio source</button>
+      </div>`
+      }
+    </div>
+    <div class="catalog-label">Local models</div>
     <div class="filter-tabs">${tabs}</div>
     <div class="model-grid">${cards || `<div class="empty">No models for this filter.</div>`}</div>`;
 }
@@ -897,8 +1059,14 @@ function renderHistoryList(): void {
           <span class="spacer"></span>
           ${h.audio_path ? `<button class="icon-btn" data-play="${esc(h.audio_path)}">${ico("play")} Play</button>` : ""}
           <button class="icon-btn" data-copy-hist="${idx}">Copy</button>
+          <button class="icon-btn" data-correct-hist="${idx}">Correct</button>
           <button class="icon-btn" data-del-hist="${idx}">Delete</button>
         </div>
+        ${correctingIdx === idx ? `<div class="correct-form">
+          <label class="field">Heard<input type="text" id="corr-heard" value="${esc(h.raw_text || h.text)}"></label>
+          <label class="field">Should be<input type="text" id="corr-written" placeholder="the correct spelling or phrase"></label>
+          <button class="small" id="corr-add">Add to dictionary</button>
+        </div>` : ""}
       </div>`;
     })
     .join("");
@@ -906,24 +1074,30 @@ function renderHistoryList(): void {
 }
 
 function viewDictionary(): string {
-  const rows = dict.length
-    ? dict
+  const filtered = dict.filter((e) => (dictTab === "snippet") === (e.kind === "snippet"));
+  const rows = filtered.length
+    ? filtered
         .map(
           (e) => `<div class="dict-row${e.enabled ? "" : " dict-off"}">
+        <button class="icon-btn star${e.starred ? " on" : ""}" data-dict-star="${e.id}" title="Star">${e.starred ? "Starred" : "Star"}</button>
         <input type="checkbox" data-dict-toggle="${e.id}" ${e.enabled ? "checked" : ""} title="Enable rule">
-        <div class="dict-rule"><b>${esc(e.trigger)}</b><span class="arrow">→</span>${esc(e.replacement) || "<i class='muted'>(delete)</i>"}</div>
+        <div class="dict-rule"><b>${esc(e.trigger)}</b><span class="arrow">→</span>${esc(e.replacement) || "<i class='muted'>(delete)</i>"}${e.usage ? ` <span class="muted">×${e.usage}</span>` : ""}</div>
         <button class="icon-btn" data-dict-del="${e.id}">Delete</button>
       </div>`
         )
         .join("")
-    : `<div class="empty">No rules yet. Example: say “my email” → get “you@example.com”.</div>`;
+    : `<div class="empty">${dictTab === "snippet" ? "No snippets yet. Longer expansions live here (email sign-offs, boilerplate)." : "No vocab yet. Example: say “my email” → get “you@example.com”."}</div>`;
   return `
     <h1>Dictionary</h1>
-    <p class="page-sub">Spoken triggers expand to exact text after every transcription — snippets, names, jargon. Runs fully offline.</p>
-    <div class="card"><h3>Add rule</h3>
+    <p class="page-sub">Vocab is short names and jargon. Snippets are longer expansions. Starred and most-used rise to the top. Runs fully offline.</p>
+    <div class="filter-tabs">
+      <button class="${dictTab === "vocab" ? "active" : ""}" id="dict-tab-vocab">Vocab</button>
+      <button class="${dictTab === "snippet" ? "active" : ""}" id="dict-tab-snippet">Snippets</button>
+    </div>
+    <div class="card"><h3>Add ${dictTab === "snippet" ? "snippet" : "vocab"}</h3>
       <div class="add-form">
-        <label class="field">You say<input type="text" id="dict-trigger" placeholder="my email" style="min-width:180px"></label>
-        <label class="field">Inserted<input type="text" id="dict-repl" placeholder="you@example.com" style="min-width:180px"></label>
+        <label class="field">You say<input type="text" id="dict-trigger" placeholder="${dictTab === "snippet" ? "sign off" : "my email"}" style="min-width:180px"></label>
+        <label class="field">Inserted<input type="text" id="dict-repl" placeholder="${dictTab === "snippet" ? "Best regards, …" : "you@example.com"}" style="min-width:180px"></label>
         <label class="check"><input type="checkbox" id="dict-ww" checked> Whole word</label>
         <button id="dict-add">Add</button>
       </div>
@@ -1116,9 +1290,12 @@ function viewSettings(): string {
   const langOpts = LANGUAGES.map(
     ([v, l]) => `<option value="${v}" ${settings!.language === v ? "selected" : ""}>${l}</option>`
   ).join("");
+  const llmReady = settings.llm_backend !== "off";
   const cleanupOpts = CLEANUPS.map(
     ([v, l]) => `<option value="${v}" ${settings!.cleanup === v ? "selected" : ""}>${l}</option>`
-  ).join("");
+  ).join("") +
+    `<option value="medium" ${settings.cleanup === "medium" ? "selected" : ""} ${llmReady ? "" : "disabled"}>Medium — LLM clean${llmReady ? "" : " (set Models → LLM)"}</option>
+     <option value="high" ${settings.cleanup === "high" ? "selected" : ""} ${llmReady ? "" : "disabled"}>High — LLM professional${llmReady ? "" : " (set Models → LLM)"}</option>`;
   const hotkeyOpts = HOTKEYS.map(
     ([v, l]) => `<option value="${v}" ${settings!.hotkey_key === v ? "selected" : ""}>${l}</option>`
   ).join("");
@@ -1148,7 +1325,7 @@ function viewSettings(): string {
         <select id="set-lang">${langOpts}</select></div>
       <div class="set-row"><div><b>Auto-paste</b><div class="desc">Type the result into the focused app via Ctrl+V right after transcribing.</div></div>
         <input type="checkbox" id="set-paste" ${settings.auto_paste ? "checked" : ""}></div>
-      <div class="set-row"><div><b>Cleanup</b><div class="desc">How much the transcript is polished. Wispr Flow calls this Auto Cleanup.</div></div>
+      <div class="set-row"><div><b>Cleanup</b><div class="desc">None / Light / Full are local rules. Medium and High need an LLM (Models → LLM, coming next).</div></div>
         <select id="set-cleanup">${cleanupOpts}</select></div>
       <div class="set-row"><div><b>Translate to English</b><div class="desc">Whisper only, needs a non-Auto language. Parakeet v3 hears 25 languages as-is.</div></div>
         <input type="checkbox" id="set-translate" ${settings.translate ? "checked" : ""}></div>
@@ -1402,6 +1579,141 @@ function bindView(): void {
       renderView();
     }
   );
+  document.getElementById("pane-audio")?.addEventListener("click", () => {
+    modelsPane = "audio";
+    renderView();
+  });
+  document.getElementById("pane-llm")?.addEventListener("click", () => {
+    modelsPane = "llm";
+    renderView();
+  });
+  const saveAudioApi = async () => {
+    if (!settings) return;
+    const be = (document.querySelector("input[name=audio-be]:checked") as HTMLInputElement | null)?.value ?? settings.audio_backend;
+    const res = await call<Settings>("set_settings", {
+      settings: {
+        ...settings,
+        audio_backend: be,
+        audio_api_base: (document.getElementById("audio-base") as HTMLInputElement | null)?.value ?? settings.audio_api_base,
+        audio_api_model: (document.getElementById("audio-model") as HTMLInputElement | null)?.value ?? settings.audio_api_model,
+      },
+    });
+    if (res) settings = res;
+    const key = (document.getElementById("audio-key") as HTMLInputElement | null)?.value ?? "";
+    if (key.trim()) await call("set_provider_secrets", { audioApiKey: key, llmApiKey: null });
+    await refreshProvider();
+    toast("Audio source saved", "success");
+    renderView();
+  };
+  const saveLlm = async () => {
+    if (!settings) return;
+    const be = (document.querySelector("input[name=llm-be]:checked") as HTMLInputElement | null)?.value ?? settings.llm_backend;
+    const resolved = resolveSavedPrompt(
+      (document.getElementById("llm-preset") as HTMLSelectElement | null)?.value ?? settings.llm_preset,
+      (document.getElementById("llm-custom") as HTMLTextAreaElement | null)?.value ?? settings.llm_custom_prompt,
+    );
+    const res = await call<Settings>("set_settings", {
+      settings: {
+        ...settings,
+        llm_backend: be,
+        llm_api_base: (document.getElementById("llm-base") as HTMLInputElement | null)?.value ?? settings.llm_api_base,
+        llm_api_model: (document.getElementById("llm-model") as HTMLInputElement | null)?.value ?? settings.llm_api_model,
+        llm_preset: resolved.preset,
+        llm_custom_prompt: resolved.custom,
+        llm_enabled: (document.getElementById("llm-on") as HTMLInputElement | null)?.checked ?? settings.llm_enabled,
+      },
+    });
+    if (res) settings = res;
+    const key = (document.getElementById("llm-key") as HTMLInputElement | null)?.value ?? "";
+    if (key.trim()) await call("set_provider_secrets", { audioApiKey: null, llmApiKey: key });
+    await refreshProvider();
+    toast("LLM settings saved", "success");
+    renderView();
+  };
+  document.getElementById("audio-save")?.addEventListener("click", () => saveAudioApi().catch(() => undefined));
+  document.getElementById("audio-host")?.addEventListener("change", () => {
+    const host = AUDIO_HOSTS.find((h) => h.id === (document.getElementById("audio-host") as HTMLSelectElement).value);
+    const base = document.getElementById("audio-base") as HTMLInputElement | null;
+    const model = document.getElementById("audio-model") as HTMLInputElement | null;
+    if (!host || host.id === "custom") return;
+    if (base) base.value = host.base;
+    if (model) model.value = host.model;
+    if (settings) {
+      settings.audio_api_base = host.base;
+      settings.audio_api_model = host.model;
+    }
+  });
+  document.getElementById("llm-save")?.addEventListener("click", () => saveLlm().catch(() => undefined));
+  document.querySelectorAll("input[name=audio-be], input[name=llm-be]").forEach((el) => {
+    el.addEventListener("change", () => {
+      if (!settings) return;
+      const audioBe = (document.querySelector("input[name=audio-be]:checked") as HTMLInputElement | null)?.value;
+      const llmBe = (document.querySelector("input[name=llm-be]:checked") as HTMLInputElement | null)?.value;
+      if (audioBe) settings.audio_backend = audioBe;
+      if (llmBe) settings.llm_backend = llmBe;
+      const base = document.getElementById("audio-base") as HTMLInputElement | null;
+      const model = document.getElementById("audio-model") as HTMLInputElement | null;
+      if (base) settings.audio_api_base = base.value;
+      if (model) settings.audio_api_model = model.value;
+      const lb = document.getElementById("llm-base") as HTMLInputElement | null;
+      const lm = document.getElementById("llm-model") as HTMLInputElement | null;
+      const lp = document.getElementById("llm-preset") as HTMLSelectElement | null;
+      const lc = document.getElementById("llm-custom") as HTMLTextAreaElement | null;
+      const lo = document.getElementById("llm-on") as HTMLInputElement | null;
+      if (lb) settings.llm_api_base = lb.value;
+      if (lm) settings.llm_api_model = lm.value;
+      if (lp && lc) {
+        const resolved = resolveSavedPrompt(lp.value, lc.value);
+        settings.llm_preset = resolved.preset;
+        settings.llm_custom_prompt = resolved.custom;
+      }
+      if (lo) settings.llm_enabled = lo.checked;
+      renderView();
+    });
+  });
+  document.getElementById("llm-preset")?.addEventListener("change", () => {
+    const sel = document.getElementById("llm-preset") as HTMLSelectElement;
+    const ta = document.getElementById("llm-custom") as HTMLTextAreaElement | null;
+    if (!ta) return;
+    if (sel.value === "custom") {
+      ta.value = settings?.llm_custom_prompt?.trim() || processPromptFor("clean", "");
+    } else {
+      ta.value = processPromptFor(sel.value, "");
+    }
+  });
+  document.getElementById("llm-prompt-reset")?.addEventListener("click", async () => {
+    const sel = document.getElementById("llm-preset") as HTMLSelectElement | null;
+    const ta = document.getElementById("llm-custom") as HTMLTextAreaElement | null;
+    const def = provider?.default_prompt || DEFAULT_PROCESS_PROMPT;
+    if (sel) sel.value = "clean";
+    if (ta) ta.value = def;
+    if (settings) {
+      settings.llm_preset = "clean";
+      settings.llm_custom_prompt = "";
+    }
+    await saveLlm();
+  });
+  document.getElementById("audio-test")?.addEventListener("click", async () => {
+    await saveAudioApi();
+    toast("Speak now — recording 1.5 seconds", "info");
+    const btn = document.getElementById("audio-test") as HTMLButtonElement | null;
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Listening…";
+    }
+    const msg = await call<string>("test_audio_api");
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Test — speak 1.5s";
+    }
+    if (msg !== null) toast(msg, "success");
+    else if (btn) renderView();
+  });
+  document.getElementById("llm-test")?.addEventListener("click", async () => {
+    await saveLlm();
+    const msg = await call<string>("test_llm");
+    if (msg !== null) toast(msg, "success");
+  });
   // Setup
   (document.getElementById("mic-refresh") as HTMLButtonElement | null)?.addEventListener("click", refreshAudioDevices);
   (document.getElementById("mic-open-settings") as HTMLButtonElement | null)?.addEventListener("click", async () => {
@@ -1454,8 +1766,8 @@ function bindView(): void {
   (document.getElementById("dict-add") as HTMLButtonElement | null)?.addEventListener("click", async () => {
     const trigger = (document.getElementById("dict-trigger") as HTMLInputElement).value;
     const replacement = (document.getElementById("dict-repl") as HTMLInputElement).value;
-    const whole_word = (document.getElementById("dict-ww") as HTMLInputElement).checked;
-    const res = await call<DictionaryEntry[]>("add_dictionary_entry", { trigger, replacement, whole_word });
+    const wholeWord = (document.getElementById("dict-ww") as HTMLInputElement).checked;
+    const res = await call<DictionaryEntry[]>("add_dictionary_entry", { trigger, replacement, wholeWord, kind: dictTab });
     if (res) {
       dict = res;
       renderView();
@@ -1504,6 +1816,41 @@ function bindView(): void {
       await refreshDict();
     }
   );
+  document.getElementById("dict-tab-vocab")?.addEventListener("click", () => {
+    dictTab = "vocab";
+    renderView();
+  });
+  document.getElementById("dict-tab-snippet")?.addEventListener("click", () => {
+    dictTab = "snippet";
+    renderView();
+  });
+  document.querySelectorAll("[data-dict-star]").forEach((b) =>
+    (b as HTMLButtonElement).onclick = async () => {
+      const id = (b as HTMLButtonElement).dataset.dictStar!;
+      const cur = dict.find((e) => e.id === id);
+      const res = await call<DictionaryEntry[]>("star_dictionary_entry", { id, starred: !cur?.starred });
+      if (res) dict = res;
+      renderView();
+    }
+  );
+  document.querySelectorAll("[data-correct-hist]").forEach((b) =>
+    (b as HTMLButtonElement).onclick = () => {
+      const idx = Number((b as HTMLButtonElement).dataset.correctHist);
+      correctingIdx = correctingIdx === idx ? null : idx;
+      renderView();
+    }
+  );
+  (document.getElementById("corr-add") as HTMLButtonElement | null)?.addEventListener("click", async () => {
+    const heard = (document.getElementById("corr-heard") as HTMLInputElement | null)?.value ?? "";
+    const written = (document.getElementById("corr-written") as HTMLInputElement | null)?.value ?? "";
+    const res = await call<DictionaryEntry[]>("add_correction", { heard, written });
+    if (res) {
+      dict = res;
+      correctingIdx = null;
+      toast("Added to dictionary", "success");
+      renderView();
+    }
+  });
   // Settings
   const sm = document.getElementById("set-model") as HTMLSelectElement | null;
   const sl = document.getElementById("set-lang") as HTMLSelectElement | null;
@@ -1619,8 +1966,13 @@ function bindView(): void {
 
 async function boot(): Promise<void> {
   attachConsole().catch(() => undefined);
+  document.addEventListener("contextmenu", (e) => {
+    const t = e.target as HTMLElement | null;
+    if (t && t.closest("input, textarea, [contenteditable]")) return;
+    e.preventDefault();
+  });
   render();
-  await Promise.all([refreshStatus(), refreshModels(), refreshHistory(), refreshStats(), refreshDict(), refreshSettings(), refreshAudioDevices()]);
+  await Promise.all([refreshStatus(), refreshModels(), refreshHistory(), refreshStats(), refreshDict(), refreshSettings(), refreshAudioDevices(), refreshProvider()]);
   render();
 
   await listen<boolean>("dictflow://recording", (e) => {

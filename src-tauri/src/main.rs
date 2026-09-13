@@ -3,13 +3,16 @@
 //        + in-process sherpa-onnx (Parakeet) + cpal (WASAPI) + SendInput paste.
 //
 // Pipeline (mirrors SpeakType): hotkey → mic capture → STT engine →
-// dictionary snippets → auto-edit → smart punctuation → paste anywhere.
+// spoken commands / backtrack / lists → dictionary → auto-edit → paste.
 
 mod devices;
 mod focus;
+mod format;
 mod models;
 mod onboarding;
 mod overlay;
+mod polish;
+mod prompts;
 mod session;
 mod shortcuts;
 mod stats;
@@ -337,6 +340,28 @@ struct Settings {
     /// Hard-stop the take at 20 minutes. Default off (warn only at 19).
     #[serde(default)]
     session_cap: bool,
+    #[serde(default = "default_audio_backend")]
+    audio_backend: String,
+    #[serde(default)]
+    audio_api_base: String,
+    #[serde(default = "default_audio_model")]
+    audio_api_model: String,
+    #[serde(default = "default_llm_backend")]
+    llm_backend: String,
+    #[serde(default)]
+    llm_api_base: String,
+    #[serde(default = "default_llm_model")]
+    llm_api_model: String,
+    #[serde(default = "default_llm_temp")]
+    llm_temperature: f32,
+    #[serde(default = "default_llm_timeout")]
+    llm_timeout_ms: u64,
+    #[serde(default = "default_llm_preset")]
+    llm_preset: String,
+    #[serde(default)]
+    llm_custom_prompt: String,
+    #[serde(default)]
+    llm_enabled: bool,
 }
 
 fn default_cleanup() -> String {
@@ -353,6 +378,28 @@ fn default_overlay_edge() -> String {
 
 fn default_overlay_offset() -> i32 {
     overlay::OFFSET_CENTER
+}
+
+fn default_audio_backend() -> String {
+    "local".to_owned()
+}
+fn default_audio_model() -> String {
+    "whisper-1".to_owned()
+}
+fn default_llm_backend() -> String {
+    "off".to_owned()
+}
+fn default_llm_model() -> String {
+    "gpt-4o-mini".to_owned()
+}
+fn default_llm_temp() -> f32 {
+    0.2
+}
+fn default_llm_timeout() -> u64 {
+    8000
+}
+fn default_llm_preset() -> String {
+    "clean".to_owned()
 }
 
 impl Default for Settings {
@@ -373,6 +420,17 @@ impl Default for Settings {
             copy_last_key: shortcuts::default_copy_last(),
             onboarded: false,
             session_cap: false,
+            audio_backend: default_audio_backend(),
+            audio_api_base: String::new(),
+            audio_api_model: default_audio_model(),
+            llm_backend: default_llm_backend(),
+            llm_api_base: String::new(),
+            llm_api_model: default_llm_model(),
+            llm_temperature: default_llm_temp(),
+            llm_timeout_ms: default_llm_timeout(),
+            llm_preset: default_llm_preset(),
+            llm_custom_prompt: String::new(),
+            llm_enabled: false,
         }
     }
 }
@@ -1222,6 +1280,53 @@ struct TranscribeInput {
     translate: bool,
     data_dir: PathBuf,
     dictionary: Vec<text::DictionaryEntry>,
+    polish: PolishCfg,
+}
+
+#[derive(Clone)]
+struct PolishCfg {
+    audio_backend: String,
+    audio_api_base: String,
+    audio_api_model: String,
+    audio_api_key: String,
+    llm_backend: String,
+    llm_api_base: String,
+    llm_api_model: String,
+    llm_api_key: String,
+    llm_temperature: f32,
+    llm_timeout_ms: u64,
+    llm_preset: String,
+    llm_custom_prompt: String,
+    llm_enabled: bool,
+}
+
+fn polish_cfg(settings: &Settings, data_dir: &Path) -> PolishCfg {
+    let secrets = polish::load_secrets(data_dir);
+    let audio_base = if settings.audio_api_base.trim().is_empty() {
+        polish::default_base("openai_compat").to_owned()
+    } else {
+        settings.audio_api_base.clone()
+    };
+    let llm_base = if settings.llm_api_base.trim().is_empty() {
+        polish::default_base(&settings.llm_backend).to_owned()
+    } else {
+        settings.llm_api_base.clone()
+    };
+    PolishCfg {
+        audio_backend: settings.audio_backend.clone(),
+        audio_api_base: audio_base,
+        audio_api_model: settings.audio_api_model.clone(),
+        audio_api_key: secrets.audio_api_key,
+        llm_backend: settings.llm_backend.clone(),
+        llm_api_base: llm_base,
+        llm_api_model: settings.llm_api_model.clone(),
+        llm_api_key: secrets.llm_api_key,
+        llm_temperature: settings.llm_temperature,
+        llm_timeout_ms: settings.llm_timeout_ms,
+        llm_preset: settings.llm_preset.clone(),
+        llm_custom_prompt: settings.llm_custom_prompt.clone(),
+        llm_enabled: settings.llm_enabled,
+    }
 }
 
 fn transcribe_whisper(
@@ -1292,11 +1397,21 @@ fn run_transcription(
 ) -> anyhow::Result<TranscriptResult> {
     let samples = text::load_wav_mono_16k(&input.wav_path)?;
     let duration_secs = samples.len() as f64 / 16_000.0;
-    if samples.iter().all(|s| s.abs() < 0.002) {
-        anyhow::bail!("captured only silence — speak closer to the microphone");
+    if let Some(why) = devices::blank_audio(&samples, 16_000) {
+        anyhow::bail!("{}", why.message());
     }
+    let raw = if input.polish.audio_backend == "openai_compat" {
+        let wav = std::fs::read(&input.wav_path).context("read wav for audio API")?;
+        polish::transcribe_openai(
+            &input.polish.audio_api_base,
+            &input.polish.audio_api_key,
+            &input.polish.audio_api_model,
+            input.polish.llm_timeout_ms.max(15_000),
+            &wav,
+        )?
+    } else {
     let entry = models::find(&input.model_id).context("unknown model")?;
-    let raw = match entry.engine {
+    match entry.engine {
         EngineKind::Whisper => {
             let tmp = input.data_dir.join("last_16k.wav");
             text::write_wav_mono_16k(&tmp, &samples, 16_000)?;
@@ -1311,17 +1426,47 @@ fn run_transcription(
         EngineKind::Parakeet => parakeet
             .transcribe(&input.model_id, samples)
             .map_err(anyhow::Error::msg)?,
+    }
     };
     let raw_text = raw.trim().to_owned();
 
-    // SpeakType pipeline order: dictionary → cleanup → smart punctuation.
-    let (mut out, dict_hits) = text::apply_dictionary(&raw_text, &input.dictionary);
+    // P2: spoken commands → backtrack → lists, then dictionary + cleanup.
+    let formatted = format::apply_offline_format(&raw_text);
+    let mut dictionary = input.dictionary.clone();
+    let (mut out, dict_hits) = text::apply_dictionary(&formatted, &mut dictionary);
+    if dict_hits > 0 {
+        text::sort_dictionary(&mut dictionary);
+        let _ = text::save_dictionary(&input.data_dir, &dictionary);
+    }
     match input.cleanup.as_str() {
-        "light" => out = text::remove_fillers(&out),
-        "full" => out = text::tidy_punctuation(&text::remove_fillers(&out)),
+        "light" | "medium" => out = text::remove_fillers(&out),
+        "full" | "high" => out = text::tidy_punctuation(&text::remove_fillers(&out)),
         _ => {}
     }
     out = text::smart_trailing_punctuation(&out);
+    let want_llm = input.polish.llm_enabled
+        || input.cleanup == "medium"
+        || input.cleanup == "high";
+    if want_llm && input.polish.llm_backend != "off" {
+        let preset = match input.cleanup.as_str() {
+            "high" => "professional",
+            "medium" => "clean",
+            _ => input.polish.llm_preset.as_str(),
+        };
+        if let Some(polished) = polish::polish(
+            &input.polish.llm_backend,
+            &input.polish.llm_api_base,
+            &input.polish.llm_api_key,
+            &input.polish.llm_api_model,
+            preset,
+            &input.polish.llm_custom_prompt,
+            input.polish.llm_temperature,
+            input.polish.llm_timeout_ms,
+            &out,
+        ) {
+            out = polished;
+        }
+    }
     let out = out.trim().to_owned();
     if out.is_empty() {
         anyhow::bail!("transcription was empty");
@@ -1641,7 +1786,9 @@ fn read_audio_file(state: State<'_, Mutex<AppState>>, name: String) -> Result<Ve
 #[tauri::command]
 fn get_dictionary(state: State<'_, Mutex<AppState>>) -> Vec<text::DictionaryEntry> {
     let s = state.lock().unwrap();
-    text::load_dictionary(&s.data_dir)
+    let mut entries = text::load_dictionary(&s.data_dir);
+    text::sort_dictionary(&mut entries);
+    entries
 }
 
 /// Monotonic-ish unique id for dictionary entries (nanos since epoch).
@@ -1660,25 +1807,25 @@ fn add_dictionary_entry(
     state: State<'_, Mutex<AppState>>,
     trigger: String,
     replacement: String,
-    whole_word: bool,
+    whole_word: Option<bool>,
+    kind: Option<String>,
 ) -> Result<Vec<text::DictionaryEntry>, String> {
     let trigger = trigger.trim().to_owned();
     if trigger.is_empty() {
         return Err("say-what-you-hear (trigger) must not be empty".to_owned());
     }
+    let kind = match kind.as_deref() {
+        Some("snippet") => "snippet",
+        _ => "vocab",
+    }
+    .to_owned();
     let s = state.lock().unwrap();
     let mut entries = text::load_dictionary(&s.data_dir);
-    let id = new_id("d");
-    entries.insert(
-        0,
-        text::DictionaryEntry {
-            id,
-            trigger,
-            replacement,
-            enabled: true,
-            whole_word,
-        },
-    );
+    let mut entry = text::DictionaryEntry::new(new_id("d"), trigger, replacement);
+    entry.whole_word = whole_word.unwrap_or(true);
+    entry.kind = kind;
+    entries.insert(0, entry);
+    text::sort_dictionary(&mut entries);
     text::save_dictionary(&s.data_dir, &entries).map_err(|e| e.to_string())?;
     Ok(entries)
 }
@@ -1713,6 +1860,45 @@ fn delete_dictionary_entry(state: State<'_, Mutex<AppState>>, id: String) -> Res
     Ok(())
 }
 
+#[tauri::command]
+fn star_dictionary_entry(
+    state: State<'_, Mutex<AppState>>,
+    id: String,
+    starred: bool,
+) -> Result<Vec<text::DictionaryEntry>, String> {
+    let s = state.lock().unwrap();
+    let mut entries = text::load_dictionary(&s.data_dir);
+    entries
+        .iter_mut()
+        .find(|e| e.id == id)
+        .ok_or_else(|| "entry not found".to_owned())?
+        .starred = starred;
+    text::sort_dictionary(&mut entries);
+    text::save_dictionary(&s.data_dir, &entries).map_err(|e| e.to_string())?;
+    Ok(entries)
+}
+
+/// History “this should have been X” — add a vocab rule from a correction.
+#[tauri::command]
+fn add_correction(
+    state: State<'_, Mutex<AppState>>,
+    heard: String,
+    written: String,
+) -> Result<Vec<text::DictionaryEntry>, String> {
+    let heard = heard.trim().to_owned();
+    let written = written.trim().to_owned();
+    if heard.is_empty() {
+        return Err("heard text must not be empty".to_owned());
+    }
+    if written.is_empty() {
+        return Err("correction must not be empty".to_owned());
+    }
+    if heard.eq_ignore_ascii_case(&written) {
+        return Err("correction is the same as what was heard".to_owned());
+    }
+    add_dictionary_entry(state, heard, written, Some(true), Some("vocab".into()))
+}
+
 /// One-click symbol presets (Superwhisper-style): voice models mangle symbols,
 /// so "at sign" said aloud becomes "@". Skips triggers the user already has.
 #[tauri::command]
@@ -1733,21 +1919,14 @@ fn add_symbol_presets(
     let s = state.lock().unwrap();
     let mut entries = text::load_dictionary(&s.data_dir);
     for (trigger, replacement) in PRESETS {
-        if entries
-            .iter()
-            .any(|e| e.trigger.eq_ignore_ascii_case(trigger))
-        {
+        if entries.iter().any(|e| {
+            !e.is_snippet() && e.trigger.eq_ignore_ascii_case(trigger)
+        }) {
             continue;
         }
         entries.insert(
             0,
-            text::DictionaryEntry {
-                id: new_id("d"),
-                trigger: trigger.to_string(),
-                replacement: replacement.to_string(),
-                enabled: true,
-                whole_word: true,
-            },
+            text::DictionaryEntry::new(new_id("d"), *trigger, *replacement),
         );
     }
     text::save_dictionary(&s.data_dir, &entries).map_err(|e| e.to_string())?;
@@ -1838,6 +2017,133 @@ async fn check_for_updates() -> Result<UpdateInfo, String> {
     })
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ProviderStatus {
+    audio_key_masked: String,
+    llm_key_masked: String,
+    has_audio_key: bool,
+    has_llm_key: bool,
+    default_prompt: String,
+    prompt_presets: HashMap<String, String>,
+}
+
+#[tauri::command]
+fn get_provider_status(state: State<'_, Mutex<AppState>>) -> ProviderStatus {
+    let dir = state.lock().unwrap().data_dir.clone();
+    let s = polish::load_secrets(&dir);
+    ProviderStatus {
+        audio_key_masked: polish::mask_key(&s.audio_api_key),
+        llm_key_masked: polish::mask_key(&s.llm_api_key),
+        has_audio_key: !s.audio_api_key.trim().is_empty(),
+        has_llm_key: !s.llm_api_key.trim().is_empty(),
+        default_prompt: polish::default_prompt().to_owned(),
+        prompt_presets: polish::prompt_catalog(),
+    }
+}
+
+#[tauri::command]
+fn set_provider_secrets(
+    state: State<'_, Mutex<AppState>>,
+    audio_api_key: Option<String>,
+    llm_api_key: Option<String>,
+) -> Result<ProviderStatus, String> {
+    let dir = state.lock().unwrap().data_dir.clone();
+    let mut s = polish::load_secrets(&dir);
+    if let Some(k) = audio_api_key {
+        if !k.trim().is_empty() && !k.contains('…') {
+            s.audio_api_key = k.trim().to_owned();
+        }
+    }
+    if let Some(k) = llm_api_key {
+        if !k.trim().is_empty() && !k.contains('…') {
+            s.llm_api_key = k.trim().to_owned();
+        }
+    }
+    polish::save_secrets(&dir, &s).map_err(|e| e.to_string())?;
+    Ok(get_provider_status(state))
+}
+
+#[tauri::command]
+fn test_llm(state: State<'_, Mutex<AppState>>) -> Result<String, String> {
+    let (settings, dir) = {
+        let s = state.lock().unwrap();
+        (s.settings.clone(), s.data_dir.clone())
+    };
+    let cfg = polish_cfg(&settings, &dir);
+    polish::ping_llm(
+        &cfg.llm_backend,
+        &cfg.llm_api_base,
+        &cfg.llm_api_key,
+        &cfg.llm_api_model,
+        cfg.llm_timeout_ms,
+    )
+    .map(|_| "LLM responded".to_owned())
+    .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn test_audio_api(app: tauri::AppHandle) -> Result<String, String> {
+    let (settings, dir) = {
+        let st = app.state::<Mutex<AppState>>();
+        let mut s = st.lock().unwrap();
+        if s.recording {
+            return Err("already recording — stop first".to_owned());
+        }
+        start_recording(&mut s).map_err(|e| e.to_string())?;
+        (s.settings.clone(), s.data_dir.clone())
+    };
+    let _ = app.emit("dictflow://recording", true);
+    spawn_record_ticker(app.clone());
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let wav = {
+        let st = app.state::<Mutex<AppState>>();
+        let mut s = st.lock().unwrap();
+        if !s.recording {
+            return Err("recording stopped early — try again".to_owned());
+        }
+        let (wav, _) = stop_and_save_wav(&mut s).map_err(|e| e.to_string())?;
+        wav
+    };
+    let _ = app.emit("dictflow://recording", false);
+    let cfg = polish_cfg(&settings, &dir);
+    let samples = match text::load_wav_mono_16k(&wav) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = std::fs::remove_file(&wav);
+            return Err(e.to_string());
+        }
+    };
+    if let Some(why) = devices::blank_audio(&samples, 16_000) {
+        let _ = std::fs::remove_file(&wav);
+        return Err(why.message().to_owned());
+    }
+    let bytes = std::fs::read(&wav).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&wav);
+    let base = cfg.audio_api_base.clone();
+    let key = cfg.audio_api_key.clone();
+    let model = cfg.audio_api_model.clone();
+    let timeout = cfg.llm_timeout_ms.max(15_000);
+    let result = tokio::task::spawn_blocking(move || {
+        polish::transcribe_openai(&base, &key, &model, timeout, &bytes)
+    })
+    .await
+    .map_err(|e| format!("audio test task failed: {e}"))?;
+    match result {
+        Ok(t) if t.trim().is_empty() => {
+            Ok("Audio API accepted the clip (empty transcript — speak louder)".to_owned())
+        }
+        Ok(t) => Ok(format!("Audio API heard: {}", truncate(&t, 80))),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            if msg.contains("empty audio transcript") {
+                Ok("Audio API accepted the clip (empty transcript — speak louder)".to_owned())
+            } else {
+                Err(msg)
+            }
+        }
+    }
+}
+
 #[tauri::command]
 fn get_settings(state: State<'_, Mutex<AppState>>) -> Settings {
     state.lock().unwrap().settings.clone()
@@ -1858,11 +2164,23 @@ fn set_settings(
     if settings.recording_mode != "hold" && settings.recording_mode != "toggle" {
         return Err(format!("unknown recording mode: {}", settings.recording_mode));
     }
+    if settings.audio_backend != "local" && settings.audio_backend != "openai_compat" {
+        return Err(format!("unknown audio backend: {}", settings.audio_backend));
+    }
+    if !matches!(
+        settings.llm_backend.as_str(),
+        "off" | "local" | "openai_compat" | "anthropic"
+    ) {
+        return Err(format!("unknown LLM backend: {}", settings.llm_backend));
+    }
     let edge = overlay::DockEdge::parse(&settings.overlay_edge)
         .ok_or_else(|| format!("unknown overlay edge: {}", settings.overlay_edge))?;
     let paste = validate_utility_key(&settings.paste_last_key, &settings.copy_last_key)?;
     let copy = validate_utility_key(&settings.copy_last_key, &settings.paste_last_key)?;
     let mut settings = settings;
+    if !polish::PRESETS.contains(&settings.llm_preset.as_str()) {
+        settings.llm_preset = "clean".to_owned();
+    }
     settings.overlay_edge = edge.as_str().to_owned();
     settings.paste_last_key = shortcuts::format_shortcut(&paste);
     settings.copy_last_key = shortcuts::format_shortcut(&copy);
@@ -2043,6 +2361,7 @@ async fn stop_transcribe(
             translate: s.settings.translate,
             data_dir: s.data_dir.clone(),
             dictionary: text::load_dictionary(&s.data_dir),
+            polish: polish_cfg(&s.settings, &s.data_dir),
         };
         (input, s.transcriber.clone(), duration_secs, model_id, audio, cleanup)
     };
@@ -2051,11 +2370,19 @@ async fn stop_transcribe(
 
     // STT + post-processing can take seconds (model load, inference) — keep it
     // off the async runtime.
+    let wav_for_cleanup = input.wav_path.clone();
     let result = tokio::task::spawn_blocking(move || run_transcription(&input, &parakeet)).await;
     set_transcribing(app, false);
     let result = result
-        .map_err(|e| format!("transcription task failed: {e}"))?
-        .map_err(|e| format!("{e:#}"))?;
+        .map_err(|e| format!("transcription task failed: {e}"))
+        .and_then(|r| r.map_err(|e| format!("{e:#}")));
+    if let Err(e) = &result {
+        if devices::is_blank_audio_error(e) {
+            let _ = std::fs::remove_file(&wav_for_cleanup);
+        }
+        return Err(e.clone());
+    }
+    let result = result.unwrap();
     let text = result.text.clone();
 
     let (auto_paste, saved_target) = {
@@ -2122,6 +2449,7 @@ async fn transcribe_file(
             translate: s.settings.translate,
             data_dir: s.data_dir.clone(),
             dictionary: text::load_dictionary(&s.data_dir),
+            polish: polish_cfg(&s.settings, &s.data_dir),
         };
         (input, s.transcriber.clone())
     };
@@ -2129,8 +2457,15 @@ async fn transcribe_file(
     let result = tokio::task::spawn_blocking(move || run_transcription(&input, &parakeet)).await;
     set_transcribing(&app, false);
     let result = result
-        .map_err(|e| format!("transcription task failed: {e}"))?
-        .map_err(|e| format!("{e:#}"))?;
+        .map_err(|e| format!("transcription task failed: {e}"))
+        .and_then(|r| r.map_err(|e| format!("{e:#}")));
+    if let Err(e) = &result {
+        if devices::is_blank_audio_error(e) {
+            let _ = std::fs::remove_file(&owned);
+        }
+        return Err(e.clone());
+    }
+    let result = result.unwrap();
     {
         let mut s = state.lock().unwrap();
         let model = s.settings.model_id.clone();
@@ -2471,9 +2806,15 @@ pub fn run() {
             add_symbol_presets,
             export_dictionary,
             import_dictionary,
+            star_dictionary_entry,
+            add_correction,
             check_for_updates,
             get_settings,
             set_settings,
+            get_provider_status,
+            set_provider_secrets,
+            test_llm,
+            test_audio_api,
             toggle_recording,
             cancel_dictation,
             copy_last,
@@ -2659,6 +3000,9 @@ mod tests {
         assert!(s.overlay_enabled);
         assert_eq!(s.overlay_edge, "bottom");
         assert!(s.audio_device.is_none());
+        assert_eq!(s.audio_backend, "local");
+        assert_eq!(s.llm_backend, "off");
+        assert!(!s.llm_enabled);
     }
 
     #[test]

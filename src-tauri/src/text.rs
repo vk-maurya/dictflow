@@ -24,6 +24,45 @@ pub struct DictionaryEntry {
     pub replacement: String,
     pub enabled: bool,
     pub whole_word: bool,
+    /// `vocab` (default) or `snippet`. Old files omit this.
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub starred: bool,
+    #[serde(default)]
+    pub usage: u32,
+}
+
+fn default_kind() -> String {
+    "vocab".to_owned()
+}
+
+impl DictionaryEntry {
+    pub fn new(id: impl Into<String>, trigger: impl Into<String>, replacement: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            trigger: trigger.into(),
+            replacement: replacement.into(),
+            enabled: true,
+            whole_word: true,
+            kind: default_kind(),
+            starred: false,
+            usage: 0,
+        }
+    }
+
+    pub fn is_snippet(&self) -> bool {
+        self.kind == "snippet"
+    }
+}
+
+pub fn sort_dictionary(entries: &mut [DictionaryEntry]) {
+    entries.sort_by(|a, b| {
+        b.starred
+            .cmp(&a.starred)
+            .then(b.usage.cmp(&a.usage))
+            .then(a.trigger.to_ascii_lowercase().cmp(&b.trigger.to_ascii_lowercase()))
+    });
 }
 
 fn dictionary_path(data_dir: &Path) -> std::path::PathBuf {
@@ -50,11 +89,12 @@ pub fn word_count(text: &str) -> u32 {
 
 /// Apply every enabled rule. Word-boundary-aware, case-insensitive; spaces in
 /// the trigger match any whitespace run (mirrors `DictionaryService.replace`).
-/// Returns the rewritten text and how many replacements fired.
-pub fn apply_dictionary(text: &str, entries: &[DictionaryEntry]) -> (String, u32) {
+/// Returns the rewritten text and how many replacements fired. Increments
+/// `usage` on each entry that matched.
+pub fn apply_dictionary(text: &str, entries: &mut [DictionaryEntry]) -> (String, u32) {
     let mut result = text.to_owned();
     let mut hits: u32 = 0;
-    for entry in entries.iter().filter(|e| e.enabled) {
+    for entry in entries.iter_mut().filter(|e| e.enabled) {
         let trigger = entry.trigger.trim();
         if trigger.is_empty() {
             continue;
@@ -76,8 +116,12 @@ pub fn apply_dictionary(text: &str, entries: &[DictionaryEntry]) -> (String, u32
                 .replacement
                 .replace('\\', r"\\")
                 .replace('$', "$$");
-            hits += re.find_iter(&result).count() as u32;
-            result = re.replace_all(&result, template).into_owned();
+            let n = re.find_iter(&result).count() as u32;
+            if n > 0 {
+                hits += n;
+                entry.usage = entry.usage.saturating_add(n);
+                result = re.replace_all(&result, template).into_owned();
+            }
         }
     }
     (result, hits)
@@ -106,12 +150,15 @@ pub fn remove_fillers(text: &str) -> String {
         .join(" ")
 }
 
-/// Attach stray spaces before punctuation and collapse whitespace runs.
+/// Attach stray spaces before punctuation. Preserve newlines (P2 lists /
+/// spoken “new line”); collapse other whitespace runs.
 pub fn tidy_punctuation(text: &str) -> String {
-    let tidy = Regex::new(r"\s+([,.;:!?])").expect("tidy pattern compiles");
+    let tidy = Regex::new(r"[^\S\n]+([,.;:!?])").expect("tidy pattern compiles");
     let tidy = tidy.replace_all(text, "$1");
-    let spaces = Regex::new(r"\s+").expect("spaces pattern compiles");
-    spaces.replace_all(&tidy, " ").trim().to_owned()
+    let spaces = Regex::new(r"[^\S\n]+").expect("spaces pattern compiles");
+    let tidy = spaces.replace_all(&tidy, " ");
+    let nls = Regex::new(r"\n{3,}").expect("nl collapse");
+    nls.replace_all(&tidy, "\n\n").trim().to_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -236,36 +283,17 @@ mod tests {
 
     #[test]
     fn dictionary_replaces_whole_words_case_insensitively() {
-        let entries = vec![DictionaryEntry {
-            id: "1".into(),
-            trigger: "my email".into(),
-            replacement: "a@b.com".into(),
-            enabled: true,
-            whole_word: true,
-        }];
+        let mut entries = vec![DictionaryEntry::new("1", "my email", "a@b.com")];
         assert_eq!(
-            apply_dictionary("contact MY EMAIL please", &entries).0,
+            apply_dictionary("contact MY EMAIL please", &mut entries).0,
             "contact a@b.com please"
         );
+        assert_eq!(entries[0].usage, 1);
         // Whole-word: no match inside longer words.
-        let entries = vec![DictionaryEntry {
-            id: "1".into(),
-            trigger: "fig".into(),
-            replacement: "FigJam".into(),
-            enabled: true,
-            whole_word: true,
-        }];
-        assert_eq!(apply_dictionary("a figment", &entries).0, "a figment");
-        let (out, hits) = apply_dictionary(
-            "contact MY EMAIL please",
-            &[DictionaryEntry {
-                id: "1".into(),
-                trigger: "my email".into(),
-                replacement: "a@b.com".into(),
-                enabled: true,
-                whole_word: true,
-            }],
-        );
+        let mut entries = vec![DictionaryEntry::new("1", "fig", "FigJam")];
+        assert_eq!(apply_dictionary("a figment", &mut entries).0, "a figment");
+        let mut entries = vec![DictionaryEntry::new("1", "my email", "a@b.com")];
+        let (out, hits) = apply_dictionary("contact MY EMAIL please", &mut entries);
         assert_eq!(out, "contact a@b.com please");
         assert_eq!(hits, 1);
     }
@@ -286,6 +314,34 @@ mod tests {
         );
         assert_eq!(smart_trailing_punctuation("a@b.com."), "a@b.com");
         assert_eq!(smart_trailing_punctuation("Hello world."), "Hello world.");
+    }
+
+    #[test]
+    fn old_dictionary_json_defaults_kind() {
+        let e: DictionaryEntry = serde_json::from_str(
+            r#"{"id":"1","trigger":"a","replacement":"b","enabled":true,"whole_word":true}"#,
+        )
+        .unwrap();
+        assert_eq!(e.kind, "vocab");
+        assert!(!e.starred);
+        assert_eq!(e.usage, 0);
+        assert!(!e.is_snippet());
+        let mut snip = DictionaryEntry::new("2", "sign off", "Best regards");
+        snip.kind = "snippet".into();
+        assert!(snip.is_snippet());
+    }
+
+    #[test]
+    fn sort_stars_then_usage() {
+        let mut entries = vec![
+            DictionaryEntry::new("1", "zeta", "z"),
+            DictionaryEntry::new("2", "alpha", "a"),
+        ];
+        entries[0].usage = 3;
+        entries[1].starred = true;
+        sort_dictionary(&mut entries);
+        assert_eq!(entries[0].id, "2");
+        assert_eq!(entries[1].id, "1");
     }
 
     #[test]

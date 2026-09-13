@@ -69,6 +69,51 @@ pub fn level_from_samples(samples: &[f32]) -> AudioLevel {
     }
 }
 
+/// Shorter than this is a tap / empty buffer, not speech.
+pub const MIN_SPEECH_SECS: f64 = 0.25;
+/// Peak below this is treated as silence (Setup uses 0.02 as "working").
+pub const SILENCE_PEAK: f32 = 0.01;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlankAudio {
+    Empty,
+    TooShort,
+    Silence,
+}
+
+impl BlankAudio {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Empty => "captured no audio — check the microphone",
+            Self::TooShort => "clip too short to transcribe — hold the talk key and speak",
+            Self::Silence => "only silence — nothing to transcribe",
+        }
+    }
+}
+
+/// Reject empty, sub-quarter-second, or silent clips before local or cloud STT.
+pub fn blank_audio(samples: &[f32], sample_rate: u32) -> Option<BlankAudio> {
+    if samples.is_empty() || sample_rate == 0 {
+        return Some(BlankAudio::Empty);
+    }
+    let secs = samples.len() as f64 / f64::from(sample_rate);
+    if secs < MIN_SPEECH_SECS {
+        return Some(BlankAudio::TooShort);
+    }
+    if level_from_samples(samples).peak < SILENCE_PEAK {
+        return Some(BlankAudio::Silence);
+    }
+    None
+}
+
+pub fn is_blank_audio_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("nothing to transcribe")
+        || m.contains("too short to transcribe")
+        || m.contains("captured no audio")
+        || m.contains("only silence")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +165,14 @@ mod tests {
         let loud = level_from_samples(&[0.5, -1.0]);
         assert!((loud.peak - 1.0).abs() < f32::EPSILON);
         assert!(loud.rms > 0.7 && loud.rms < 0.8);
+    }
+
+    #[test]
+    fn blank_audio_rejects_empty_short_and_silent() {
+        assert_eq!(blank_audio(&[], 16_000), Some(BlankAudio::Empty));
+        assert_eq!(blank_audio(&[0.2; 800], 16_000), Some(BlankAudio::TooShort));
+        assert_eq!(blank_audio(&[0.0; 16_000], 16_000), Some(BlankAudio::Silence));
+        assert_eq!(blank_audio(&[0.2; 16_000], 16_000), None);
+        assert!(is_blank_audio_error(BlankAudio::Silence.message()));
     }
 }
