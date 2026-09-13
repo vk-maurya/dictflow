@@ -335,6 +335,9 @@ const HOTKEYS: [string, string][] = [
   ["LeftCtrl", "Left Ctrl (cancels on Ctrl+key)"],
   ["LeftAlt", "Left Alt (hold)"],
   ["RightAlt", "Right Alt (hold)"],
+  ["LeftWin", "Left Win (hold)"],
+  ["RightWin", "Right Win (hold)"],
+  ["CtrlWin", "Ctrl + Win (hold both)"],
   ["ScrollLock", "Scroll Lock"],
   ["F9", "F9"],
   ["CtrlAltSpace", "Ctrl + Alt + Space"],
@@ -681,11 +684,17 @@ function talkKey(): string {
         ? "Left Alt"
         : k === "RightAlt"
           ? "Right Alt"
-          : k === "ScrollLock"
-            ? "Scroll Lock"
-            : k === "F9"
-              ? "F9"
-              : "Ctrl + Alt + Space";
+          : k === "LeftWin"
+            ? "Left Win"
+            : k === "RightWin"
+              ? "Right Win"
+              : k === "CtrlWin"
+                ? "Ctrl + Win"
+                : k === "ScrollLock"
+                  ? "Scroll Lock"
+                  : k === "F9"
+                    ? "F9"
+                    : "Ctrl + Alt + Space";
 }
 
 /** True when the talk key is a hold-to-talk single key (macOS Fn feel). */
