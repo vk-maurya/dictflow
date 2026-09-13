@@ -349,3 +349,28 @@ label.check { display: flex; gap: 9px; align-items: center; cursor: pointer; }
 .toast.success { background: #235c3a; }
 
 .empty { text-align: center; color: var(--muted); padding: 34px 10px; }
+
+/* ---------- Onboarding / P1 chrome ---------- */
+.onboard-shell { max-width: 640px; margin: 0 auto; }
+.onboard-nav { margin-top: 20px; }
+.device-pick {
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+}
+.device-pick.selected { box-shadow: 0 0 0 1.5px var(--ink); }
+.level-meter {
+  height: 8px;
+  width: min(280px, 80%);
+  margin: 14px auto 0;
+  background: #efece6;
+  border-radius: 5px;
+  overflow: hidden;
+}
+.level-meter > div {
+  height: 100%;
+  width: 0%;
+  background: var(--red);
+  border-radius: 5px;
+  transition: width 0.08s linear;
+}

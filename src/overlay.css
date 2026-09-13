@@ -1,0 +1,67 @@
+html, body {
+  margin: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+  cursor: pointer;
+}
+html:active, body:active { cursor: grabbing; }
+
+#pill {
+  display: flex;
+  align-items: center;
+  background: #1c1b18;
+  border: 1px solid #2e2c27;
+  border-radius: 10px;
+  box-shadow: 0 6px 16px rgba(20, 18, 12, 0.28);
+  box-sizing: border-box;
+  position: relative;
+}
+
+#pill.idle {
+  width: 78px;
+  height: 18px;
+  padding: 0 10px;
+}
+#pill.idle .orb { display: none; }
+
+#pill.recording,
+#pill.transcribing,
+#pill.copychip {
+  width: 152px;
+  height: 34px;
+  padding: 0 8px 0 10px;
+  gap: 8px;
+}
+
+#wave {
+  flex: 1;
+  min-width: 0;
+  height: 16px;
+  display: block;
+}
+
+#pill .orb {
+  width: 14px;
+  height: 14px;
+  border: 1.5px solid #f5b942;
+  border-radius: 4px;
+  background: transparent;
+  flex-shrink: 0;
+  cursor: pointer;
+  padding: 0;
+}
+#pill.recording .orb {
+  background: #c93a3e;
+  border-color: #c93a3e;
+}
+#pill.transcribing .orb,
+#pill.copychip .orb {
+  background: #f5b942;
+  border-color: #f5b942;
+}

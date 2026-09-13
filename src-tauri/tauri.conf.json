@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "DictFlow",
         "width": 1280,
         "height": 800,
@@ -19,6 +20,21 @@
         "minHeight": 680,
         "resizable": true,
         "fullscreen": false
+      },
+      {
+        "label": "overlay",
+        "title": "DictFlow Overlay",
+        "url": "overlay.html",
+        "width": 156,
+        "height": 36,
+        "visible": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "resizable": false,
+        "shadow": false,
+        "focus": false
       }
     ],
     "security": {

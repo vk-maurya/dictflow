@@ -11,7 +11,8 @@ import { enable as autostartEnable, disable as autostartDisable, isEnabled as au
 // ---------------------------------------------------------------------------
 
 type Engine = "whisper" | "parakeet";
-type View = "home" | "dictate" | "models" | "setup" | "history" | "dictionary" | "stats" | "settings";
+type View = "home" | "dictate" | "models" | "setup" | "history" | "dictionary" | "stats" | "settings" | "onboard";
+type OnboardStep = "welcome" | "talkkey" | "mictest" | "download";
 type StatsPeriod = "today" | "7d" | "30d" | "all";
 
 interface DayBucket {
@@ -76,6 +77,14 @@ interface Settings {
   translate: boolean;
   hotkey_key: string;
   recording_mode: string;
+  audio_device: string | null;
+  overlay_enabled: boolean;
+  overlay_edge: string;
+  overlay_offset: number;
+  paste_last_key: string;
+  copy_last_key: string;
+  onboarded: boolean;
+  session_cap: boolean;
 }
 interface Status {
   recording: boolean;
@@ -87,6 +96,8 @@ interface Status {
   data_dir: string;
   audio_device: string | null;
   version: string;
+  recommended_model: string;
+  transcribing: boolean;
 }
 interface DlProgress {
   model_id: string;
@@ -106,6 +117,7 @@ interface AudioDeviceInfo {
   sample_rate: number;
   channels: number;
   is_default: boolean;
+  is_selected: boolean;
 }
 interface MicTest {
   duration_secs: number;
@@ -140,6 +152,8 @@ let dlBars: Record<string, { file: string; pct: number | null }> = {};
 let audioDevices: AudioDeviceInfo[] | null = null;
 let micTest: MicTest | null = null;
 let micTesting = false;
+let onboardStep: OnboardStep = "welcome";
+let livePeak = 0;
 
 type NavItem = { id: View; label: string; ico: string };
 
@@ -210,6 +224,22 @@ const HOTKEYS: [string, string][] = [
   ["ScrollLock", "Scroll Lock"],
   ["F9", "F9"],
   ["CtrlAltSpace", "Ctrl + Alt + Space"],
+];
+
+const UTILITY_KEYS: [string, string][] = [
+  ["Shift+Alt+Z", "Shift + Alt + Z"],
+  ["Shift+Alt+X", "Shift + Alt + X"],
+  ["Ctrl+Alt+Z", "Ctrl + Alt + Z"],
+  ["Ctrl+Alt+X", "Ctrl + Alt + X"],
+  ["Ctrl+Shift+Z", "Ctrl + Shift + Z"],
+  ["Ctrl+Shift+X", "Ctrl + Shift + X"],
+];
+
+const OVERLAY_EDGES: [string, string][] = [
+  ["top", "Top"],
+  ["bottom", "Bottom"],
+  ["left", "Left"],
+  ["right", "Right"],
 ];
 
 // ---------------------------------------------------------------------------
@@ -454,7 +484,7 @@ async function refreshModels(): Promise<void> {
   const m = await call<ModelStatus[]>("get_models");
   if (m) {
     models = m;
-    if (view === "models") renderView();
+    if (view === "models" || view === "onboard") renderView();
     paintStatusBits();
   }
 }
@@ -496,7 +526,27 @@ async function refreshAudioDevices(): Promise<void> {
   const d = await call<AudioDeviceInfo[]>("get_audio_devices");
   if (d) {
     audioDevices = d;
-    if (view === "setup") renderView();
+    if (view === "setup" || view === "onboard" || view === "settings") renderView();
+  }
+}
+
+async function finishOnboarding(): Promise<void> {
+  if (!settings) return;
+  const res = await call<Settings>("set_settings", { settings: { ...settings, onboarded: true } });
+  if (res) {
+    settings = res;
+    view = "home";
+    render();
+  }
+}
+
+async function pickAudioDevice(name: string | null): Promise<void> {
+  if (!settings) return;
+  const res = await call<Settings>("set_settings", { settings: { ...settings, audio_device: name } });
+  if (res) {
+    settings = res;
+    await refreshAudioDevices();
+    await refreshStatus();
   }
 }
 
@@ -697,7 +747,12 @@ function viewDictate(): string {
         <div class="rec-timer" id="rec-timer" hidden></div>
       </div>
       <p class="hotkey-hint muted">Talk key <code>${talkHold() ? `hold ${talkKey()}` : talkKey()}</code> works from any app
-      ${m ? ` • Using <b>${esc(m.name)}</b> (${esc(m.languages)})` : ""}</p>
+      ${m ? ` • Using <b>${esc(m.name)}</b> (${esc(m.languages)})` : ""}
+      • Esc cancels this take
+      • Paste last <code>${esc(settings?.paste_last_key ?? "Shift+Alt+Z")}</code>
+      • Copy last <code>${esc(settings?.copy_last_key ?? "Shift+Alt+X")}</code></p>
+      <div class="level-meter" id="level-meter" ${status?.recording ? "" : "hidden"}><div id="level-fill" style="width:${Math.round(Math.min(livePeak, 1) * 100)}%"></div></div>
+      ${status?.recording ? `<div class="row" style="justify-content:center;margin-top:12px"><button class="danger-ghost small" id="cancel-rec">Cancel (Esc)</button></div>` : ""}
       <div class="row" style="justify-content:center;margin-top:12px">
         <button class="ghost small" id="file-btn">${ico("file")} Transcribe audio file (WAV)</button>
       </div>
@@ -722,7 +777,7 @@ function viewModels(): string {
         m.active && m.downloaded
           ? `<button class="ghost small" disabled>In use</button>`
           : dl
-            ? `<button class="small" disabled>Downloading…</button>`
+            ? `<button class="ghost small" data-cancel-dl="${m.id}">Cancel</button>`
             : !m.downloaded
               ? `<button class="small" data-dl="${m.id}">Download</button>`
               : `<button class="small" data-use="${m.id}">Use</button>`;
@@ -768,9 +823,9 @@ function viewSetup(): string {
         ? `<div class="empty">No input devices found — check the Windows microphone privacy toggle below.</div>`
         : audioDevices
             .map(
-              (d) => `<div class="dict-row"><div class="dict-rule"><b>${esc(d.name)}</b>
+              (d) => `<button class="dict-row device-pick${d.is_selected ? " selected" : ""}" data-pick-mic="${esc(d.name)}"><div class="dict-rule"><b>${esc(d.name)}</b>
                 <span class="muted"> — ${d.sample_rate ? `${(d.sample_rate / 1000).toFixed(1)} kHz, ${d.channels}ch` : "unavailable"}</span></div>
-                ${d.is_default ? `<span class="badge">default</span>` : ""}</div>`
+                ${d.is_selected ? `<span class="badge">selected</span>` : d.is_default ? `<span class="badge">default</span>` : ""}</button>`
             )
             .join("");
   const verdict = !micTest
@@ -788,8 +843,10 @@ function viewSetup(): string {
     <div class="card"><h3>1 · Microphone</h3>
       <p class="muted">Windows guards the mic with one global toggle:
       <b>Settings → Privacy &amp; security → Microphone → Let desktop apps access your microphone</b> must be ON.</p>
-      <p class="muted">DictFlow captures from: <b>${esc(status?.audio_device ?? "none found")}</b></p>
+      <p class="muted">DictFlow captures from: <b>${esc(status?.audio_device ?? "none found")}</b>
+      ${settings?.audio_device ? ` (preferred: ${esc(settings.audio_device)})` : " (Windows default)"}.</p>
       <div class="row" style="margin-bottom:12px">
+        <button class="ghost small" id="mic-use-default">Use Windows default</button>
         <button class="small" id="mic-refresh">Refresh devices</button>
         <button class="small" id="mic-open-settings">Open microphone settings</button>
         <button class="small" id="mic-test" ${micTesting ? "disabled" : ""}>${micTesting ? "Testing… speak now" : `${ico("mic")} Test microphone (1.5s)`}</button>
@@ -1068,6 +1125,19 @@ function viewSettings(): string {
   const modeOpts = [["hold", "Hold to talk"], ["toggle", "Toggle"]]
     .map(([v, l]) => `<option value="${v}" ${settings!.recording_mode === v ? "selected" : ""}>${l}</option>`)
     .join("");
+  const micOpts = `<option value="" ${!settings.audio_device ? "selected" : ""}>Windows default</option>` +
+    (audioDevices ?? [])
+      .map((d) => `<option value="${esc(d.name)}" ${settings!.audio_device === d.name ? "selected" : ""}>${esc(d.name)}${d.is_default ? " (default)" : ""}</option>`)
+      .join("");
+  const edgeOpts = OVERLAY_EDGES.map(
+    ([v, l]) => `<option value="${v}" ${settings!.overlay_edge === v ? "selected" : ""}>${l}</option>`
+  ).join("");
+  const pasteOpts = UTILITY_KEYS.map(
+    ([v, l]) => `<option value="${v}" ${settings!.paste_last_key === v ? "selected" : ""}>${l}</option>`
+  ).join("");
+  const copyOpts = UTILITY_KEYS.map(
+    ([v, l]) => `<option value="${v}" ${settings!.copy_last_key === v ? "selected" : ""}>${l}</option>`
+  ).join("");
   return `
     <h1>Settings</h1>
     <p class="page-sub">Everything stays on this PC. No accounts, no telemetry.</p>
@@ -1089,6 +1159,22 @@ function viewSettings(): string {
       <div class="set-row"><div><b>Mode</b><div class="desc">Hold: press-and-hold to record, release to transcribe. Toggle: press to start, press again to stop.</div></div>
         <select id="set-mode">${modeOpts}</select></div>
     </div>
+    <div class="card"><h3>Microphone</h3>
+      <div class="set-row"><div><b>Input device</b><div class="desc">Leave as Windows default, or pin a headset. If that device is unplugged, the next take falls back automatically.</div></div>
+        <select id="set-mic">${micOpts}</select></div>
+    </div>
+    <div class="card"><h3>Overlay &amp; shortcuts</h3>
+      <div class="set-row"><div><b>Floating pill</b><div class="desc">Small always-on-top meter. Click to start or stop talking. Drag to dock. Idle is a quiet line; talking draws a gold wave.</div></div>
+        <input type="checkbox" id="set-overlay" ${settings.overlay_enabled ? "checked" : ""}></div>
+      <div class="set-row"><div><b>Dock edge</b><div class="desc">Where the pill sits. Dragging also updates this.</div></div>
+        <select id="set-edge">${edgeOpts}</select></div>
+      <div class="set-row"><div><b>Paste last</b><div class="desc">Wispr default is Shift+Alt+Z. Pastes the newest transcript into the focused app.</div></div>
+        <select id="set-paste-last">${pasteOpts}</select></div>
+      <div class="set-row"><div><b>Copy last</b><div class="desc">Wispr default is Shift+Alt+X. Copies without pasting.</div></div>
+        <select id="set-copy-last">${copyOpts}</select></div>
+      <div class="set-row"><div><b>20-minute cap</b><div class="desc">Always warns at 19 minutes. Turn this on to auto-finish (keep) the take at 20, matching Wispr. Off = unlimited.</div></div>
+        <input type="checkbox" id="set-cap" ${settings.session_cap ? "checked" : ""}></div>
+    </div>
     <div class="card"><h3>Storage & engine</h3>
       <div class="set-row"><div><b>Data folder</b><div class="desc"><code>${esc(status?.data_dir ?? "")}</code></div></div></div>
       <div class="set-row"><div><b>Whisper binary</b><div class="desc">${
@@ -1103,7 +1189,92 @@ function viewSettings(): string {
     </div>`;
 }
 
+function viewOnboard(): string {
+  const recId = status?.recommended_model || "parakeet-v3";
+  const rec = models.find((m) => m.id === recId);
+  const recReady = Boolean(rec?.downloaded);
+  const recDl = dlBars[recId];
+  const hotkeyOpts = HOTKEYS.map(
+    ([v, l]) => `<option value="${v}" ${settings?.hotkey_key === v ? "selected" : ""}>${l}</option>`
+  ).join("");
+  const modeOpts = [["hold", "Hold to talk"], ["toggle", "Toggle"]]
+    .map(([v, l]) => `<option value="${v}" ${settings?.recording_mode === v ? "selected" : ""}>${l}</option>`)
+    .join("");
+  const devices =
+    audioDevices === null
+      ? `<p class="muted">Click Refresh to list microphones.</p>`
+      : audioDevices.length === 0
+        ? `<p class="muted">No input devices — check the Windows microphone privacy toggle.</p>`
+        : audioDevices
+            .map(
+              (d) => `<button class="dict-row device-pick${d.is_selected ? " selected" : ""}" data-pick-mic="${esc(d.name)}"><div class="dict-rule"><b>${esc(d.name)}</b></div>${d.is_selected ? `<span class="badge">selected</span>` : ""}</button>`
+            )
+            .join("");
+  const verdict = !micTest
+    ? ""
+    : micTest.peak > 0.02
+      ? `<p style="color:var(--green)">Heard you on <b>${esc(micTest.device)}</b>.</p>`
+      : `<p style="color:var(--amber)">Mic opened but peak was low — unmute and try again.</p>`;
+  let body = "";
+  if (onboardStep === "welcome") {
+    body = `<h1>Welcome to DictFlow</h1>
+      <p class="page-sub">Hold a key, speak, and polished text lands in whichever app has focus. After you download a speech model, nothing leaves this PC.</p>
+      <div class="card"><p>Four quick steps: pick a talk key, test the mic, download the recommended model. You can skip any of them.</p></div>`;
+  } else if (onboardStep === "talkkey") {
+    body = `<h1>Talk key</h1>
+      <p class="page-sub">Right Ctrl is the safest default — it never types a character. Hold to talk, release to paste.</p>
+      <div class="card">
+        <div class="set-row"><div><b>Key</b></div><select id="on-hotkey">${hotkeyOpts}</select></div>
+        <div class="set-row"><div><b>Mode</b></div><select id="on-mode">${modeOpts}</select></div>
+      </div>`;
+  } else if (onboardStep === "mictest") {
+    body = `<h1>Microphone</h1>
+      <p class="page-sub">Windows uses one global toggle: Settings → Privacy &amp; security → Microphone → Let desktop apps access your microphone.</p>
+      <div class="card">
+        <div class="row" style="margin-bottom:12px">
+          <button class="small" id="mic-refresh">Refresh devices</button>
+          <button class="small" id="mic-open-settings">Open microphone settings</button>
+          <button class="small" id="mic-test" ${micTesting ? "disabled" : ""}>${micTesting ? "Testing… speak now" : "Test microphone (1.5s)"}</button>
+        </div>
+        ${verdict}${devices}
+      </div>`;
+  } else {
+    const progress = recDl
+      ? `<div class="progress"><div id="dlbar-${recId}" style="width:${recDl.pct ?? 0}%"></div></div>
+         <div class="dl-file">${esc(recDl.file)}${recDl.pct != null ? ` — ${recDl.pct}%` : ""}</div>`
+      : "";
+    body = `<h1>Speech model</h1>
+      <p class="page-sub">Parakeet v3 is the recommended all-rounder (~670 MB, 25 languages). After this, dictation is fully offline.</p>
+      <div class="card">
+        <div class="model-name">${esc(rec?.name ?? "Parakeet TDT 0.6B v3")}</div>
+        <p class="muted">${esc(rec?.essence ?? "Best all-rounder")} • ${esc(rec?.size_label ?? "~670 MB")}</p>
+        ${progress}
+        <div class="row" style="margin-top:12px">
+          ${recReady ? `<span class="muted">Ready on disk.</span>` : recDl
+            ? `<button class="ghost small" data-cancel-dl="${recId}">Cancel</button>`
+            : `<button class="small" data-dl="${recId}">Download recommended</button>`}
+        </div>
+      </div>`;
+  }
+  const back = onboardStep === "welcome" ? "" : `<button class="ghost" id="on-back">Back</button>`;
+  const nextLabel =
+    onboardStep === "download" ? (recReady ? "Finish" : "Skip and finish") : "Continue";
+  return `<div class="onboard">
+    ${body}
+    <div class="row onboard-nav">${back}
+      <button class="ghost" id="on-skip">Skip setup</button>
+      <button id="on-next">${nextLabel}</button>
+    </div>
+  </div>`;
+}
+
 function render(): void {
+  if (settings && !settings.onboarded) {
+    view = "onboard";
+    document.getElementById("app")!.innerHTML = `<main class="main onboard-shell" id="view"></main><div id="toasts"></div>`;
+    renderView();
+    return;
+  }
   document.getElementById("app")!.innerHTML = `
     <aside class="sidebar">
       <div class="brand">
@@ -1131,7 +1302,8 @@ function render(): void {
 function renderView(): void {
   const box = document.getElementById("view");
   if (!box) return;
-  if (view === "home") box.innerHTML = viewHome();
+  if (view === "onboard") box.innerHTML = viewOnboard();
+  else if (view === "home") box.innerHTML = viewHome();
   else if (view === "dictate") box.innerHTML = viewDictate();
   else if (view === "models") box.innerHTML = viewModels();
   else if (view === "setup") box.innerHTML = viewSetup();
@@ -1149,6 +1321,14 @@ function bindView(): void {
   document.querySelectorAll("[data-nav]");
   // Dictate
   (document.getElementById("mic-btn") as HTMLButtonElement | null)?.addEventListener("click", toggleRecord);
+  (document.getElementById("cancel-rec") as HTMLButtonElement | null)?.addEventListener("click", async () => {
+    const msg = await call<string>("cancel_dictation");
+    if (msg !== null) {
+      toast("Take discarded", "info");
+      await refreshStatus();
+      if (view === "dictate") renderView();
+    }
+  });
   (document.getElementById("copy-last") as HTMLButtonElement | null)?.addEventListener("click", () => {
     if (lastResult) copyText(lastResult);
   });
@@ -1188,6 +1368,19 @@ function bindView(): void {
   document.querySelectorAll("[data-dl]").forEach((b) =>
     (b as HTMLButtonElement).onclick = () => downloadModel((b as HTMLButtonElement).dataset.dl!)
   );
+  document.querySelectorAll("[data-cancel-dl]").forEach((b) =>
+    (b as HTMLButtonElement).onclick = async () => {
+      const id = (b as HTMLButtonElement).dataset.cancelDl!;
+      const msg = await call<string>("cancel_download", { id });
+      if (msg !== null) toast("Download cancelled", "info");
+    }
+  );
+  document.querySelectorAll("[data-pick-mic]").forEach((b) =>
+    (b as HTMLButtonElement).onclick = () => pickAudioDevice((b as HTMLButtonElement).dataset.pickMic ?? null)
+  );
+  (document.getElementById("mic-use-default") as HTMLButtonElement | null)?.addEventListener("click", () => {
+    pickAudioDevice(null);
+  });
   document.querySelectorAll("[data-use]").forEach((b) =>
     (b as HTMLButtonElement).onclick = () => selectModel((b as HTMLButtonElement).dataset.use!)
   );
@@ -1217,7 +1410,7 @@ function bindView(): void {
   (document.getElementById("mic-test") as HTMLButtonElement | null)?.addEventListener("click", async () => {
     micTesting = true;
     micTest = null;
-    if (view === "setup") renderView();
+    if (view === "setup" || view === "onboard") renderView();
     const res = await call<MicTest>("test_microphone");
     micTesting = false;
     if (res) {
@@ -1225,7 +1418,7 @@ function bindView(): void {
       if (res.peak <= 0.02) toast("Microphone test heard nothing — check mic + privacy toggle", "error");
       else toast("Microphone test OK", "success");
     }
-    if (view === "setup") renderView();
+    if (view === "setup" || view === "onboard") renderView();
   });
   (document.getElementById("setup-models") as HTMLButtonElement | null)?.addEventListener("click", () => {
     view = "models";
@@ -1319,9 +1512,16 @@ function bindView(): void {
   const st = document.getElementById("set-translate") as HTMLInputElement | null;
   const sk = document.getElementById("set-hotkey") as HTMLSelectElement | null;
   const smo = document.getElementById("set-mode") as HTMLSelectElement | null;
+  const smic = document.getElementById("set-mic") as HTMLSelectElement | null;
+  const sov = document.getElementById("set-overlay") as HTMLInputElement | null;
+  const sedge = document.getElementById("set-edge") as HTMLSelectElement | null;
+  const spl = document.getElementById("set-paste-last") as HTMLSelectElement | null;
+  const scl = document.getElementById("set-copy-last") as HTMLSelectElement | null;
+  const scap = document.getElementById("set-cap") as HTMLInputElement | null;
   const saveSettings = async () => {
     if (!settings || !sm || !sl || !sp || !sc || !st || !sk || !smo) return;
     const next: Settings = {
+      ...settings,
       model_id: sm.value,
       language: sl.value,
       auto_paste: sp.checked,
@@ -1329,13 +1529,19 @@ function bindView(): void {
       translate: st.checked,
       hotkey_key: sk.value,
       recording_mode: smo.value,
+      audio_device: smic?.value ? smic.value : null,
+      overlay_enabled: sov?.checked ?? settings.overlay_enabled,
+      overlay_edge: sedge?.value ?? settings.overlay_edge,
+      paste_last_key: spl?.value ?? settings.paste_last_key,
+      copy_last_key: scl?.value ?? settings.copy_last_key,
+      session_cap: scap?.checked ?? settings.session_cap,
     };
     const res = await call<Settings>("set_settings", { settings: next });
     if (res) {
       settings = res;
       await refreshModels();
       await refreshStatus();
-      if (view === "dictate") renderView();
+      if (view === "dictate" || view === "settings") renderView();
     }
   };
   sm?.addEventListener("change", saveSettings);
@@ -1345,6 +1551,41 @@ function bindView(): void {
   st?.addEventListener("change", saveSettings);
   sk?.addEventListener("change", saveSettings);
   smo?.addEventListener("change", saveSettings);
+  smic?.addEventListener("change", saveSettings);
+  sov?.addEventListener("change", saveSettings);
+  sedge?.addEventListener("change", saveSettings);
+  spl?.addEventListener("change", saveSettings);
+  scl?.addEventListener("change", saveSettings);
+  scap?.addEventListener("change", saveSettings);
+
+  const onHotkey = document.getElementById("on-hotkey") as HTMLSelectElement | null;
+  const onMode = document.getElementById("on-mode") as HTMLSelectElement | null;
+  const saveOnboardTalk = async () => {
+    if (!settings || !onHotkey || !onMode) return;
+    const res = await call<Settings>("set_settings", {
+      settings: { ...settings, hotkey_key: onHotkey.value, recording_mode: onMode.value },
+    });
+    if (res) settings = res;
+  };
+  onHotkey?.addEventListener("change", saveOnboardTalk);
+  onMode?.addEventListener("change", saveOnboardTalk);
+  (document.getElementById("on-skip") as HTMLButtonElement | null)?.addEventListener("click", finishOnboarding);
+  (document.getElementById("on-back") as HTMLButtonElement | null)?.addEventListener("click", async () => {
+    const next = await call<string>("onboard_step", { current: onboardStep, backward: true });
+    if (next && next !== "done") onboardStep = next as OnboardStep;
+    renderView();
+  });
+  (document.getElementById("on-next") as HTMLButtonElement | null)?.addEventListener("click", async () => {
+    if (onboardStep === "talkkey") await saveOnboardTalk();
+    const next = await call<string>("onboard_step", { current: onboardStep, backward: false });
+    if (!next || next === "done") {
+      await finishOnboarding();
+      return;
+    }
+    onboardStep = next as OnboardStep;
+    if (onboardStep === "mictest" && !audioDevices) await refreshAudioDevices();
+    renderView();
+  });
   const sa = document.getElementById("set-autostart") as HTMLInputElement | null;
   if (sa) {
     autostartIsEnabled()
@@ -1379,8 +1620,8 @@ function bindView(): void {
 async function boot(): Promise<void> {
   attachConsole().catch(() => undefined);
   render();
-  await Promise.all([refreshStatus(), refreshModels(), refreshHistory(), refreshStats(), refreshDict(), refreshSettings()]);
-  renderView();
+  await Promise.all([refreshStatus(), refreshModels(), refreshHistory(), refreshStats(), refreshDict(), refreshSettings(), refreshAudioDevices()]);
+  render();
 
   await listen<boolean>("dictflow://recording", (e) => {
     if (e.payload) startTimer();
@@ -1405,11 +1646,29 @@ async function boot(): Promise<void> {
     if (bar && pct !== null) bar.style.width = `${pct}%`;
     const lbl = document.getElementById(`dlfile-${p.model_id}`);
     if (lbl) lbl.textContent = `${p.file}${pct !== null ? ` — ${pct}%` : ""}`;
-    if (view === "models" && !bar) renderView();
+    if ((view === "models" || view === "onboard") && !bar) renderView();
   });
   await listen("dictflow://history-updated", () => {
     refreshHistory();
     refreshStats();
+  });
+  await listen<{ peak: number; rms: number }>("dictflow://level", (e) => {
+    livePeak = e.payload.peak;
+    const fill = document.getElementById("level-fill");
+    if (fill) fill.style.width = `${Math.round(Math.min(livePeak, 1) * 100)}%`;
+  });
+  await listen<{ text: string; chip_ms?: number }>("dictflow://committed", (e) => {
+    lastResult = e.payload.text;
+    if (view === "dictate") renderView();
+  });
+  await listen("dictflow://session-warn", () => {
+    toast("19 minutes — still recording. Esc cancels, talk key finishes.", "info");
+  });
+  await listen<{ from: string; to: string }>("dictflow://device-fallback", (e) => {
+    const { from, to } = e.payload;
+    toast(from ? `Mic “${from}” gone — using ${to}` : to, "info");
+    refreshAudioDevices();
+    refreshStatus();
   });
 
   setInterval(refreshStatus, 2000);

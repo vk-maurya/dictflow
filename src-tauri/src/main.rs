@@ -5,11 +5,17 @@
 // Pipeline (mirrors SpeakType): hotkey → mic capture → STT engine →
 // dictionary snippets → auto-edit → smart punctuation → paste anywhere.
 
+mod devices;
+mod focus;
 mod models;
+mod onboarding;
+mod overlay;
+mod session;
+mod shortcuts;
 mod stats;
 mod text;
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -66,8 +72,10 @@ enum TalkEdge {
     Released,
     /// Another key went down while the talk key was held (e.g. Ctrl+C on a
     /// Left-Ctrl talk key) — discard, don't transcribe. Mirrors SpeakType's
-    /// modifier-combo cancel.
+    /// modifier-combo cancel. Only applies to hotkey-owned takes.
     Cancel,
+    /// Esc while any recording is live — dedicated discard (P1).
+    Escape,
 }
 
 /// Full 256-key snapshot in a single syscall (cheaper than 256 polls).
@@ -90,15 +98,32 @@ fn spawn_hotkey_thread(
         .name("dictflow-hotkey".to_owned())
         .spawn(move || {
             let mut was_down = false;
+            let mut was_esc = false;
             let mut last_change = std::time::Instant::now();
+            let mut last_esc = std::time::Instant::now();
             let mut prev_keys = snapshot_keys();
             loop {
                 std::thread::sleep(Duration::from_millis(10));
-                let vk = app
+                remember_paste_target(&app);
+                let (vk, recording) = app
                     .state::<Mutex<AppState>>()
                     .lock()
-                    .map(|s| hotkey_vk(&s.settings.hotkey_key))
-                    .unwrap_or(None);
+                    .map(|s| (hotkey_vk(&s.settings.hotkey_key), s.recording))
+                    .unwrap_or((None, false));
+                // Esc is polled only while a take is live so we never steal it
+                // from other apps when idle.
+                if recording {
+                    let esc = unsafe { GetAsyncKeyState(0x1B) } < 0;
+                    if esc && !was_esc && last_esc.elapsed() > Duration::from_millis(30) {
+                        last_esc = std::time::Instant::now();
+                        if tx.send(TalkEdge::Escape).is_err() {
+                            break;
+                        }
+                    }
+                    was_esc = esc;
+                } else {
+                    was_esc = false;
+                }
                 let Some(vk) = vk else {
                     was_down = false;
                     prev_keys = snapshot_keys();
@@ -156,6 +181,121 @@ fn apply_hotkey_registration(app: &tauri::AppHandle) {
     }
 }
 
+fn spec_to_shortcut(spec: &shortcuts::ShortcutSpec) -> Result<Shortcut, String> {
+    let mut mods = Modifiers::empty();
+    if spec.ctrl {
+        mods |= Modifiers::CONTROL;
+    }
+    if spec.alt {
+        mods |= Modifiers::ALT;
+    }
+    if spec.shift {
+        mods |= Modifiers::SHIFT;
+    }
+    if spec.meta {
+        mods |= Modifiers::SUPER;
+    }
+    let code = match spec.key.as_str() {
+        "A" => Code::KeyA,
+        "B" => Code::KeyB,
+        "C" => Code::KeyC,
+        "D" => Code::KeyD,
+        "E" => Code::KeyE,
+        "F" => Code::KeyF,
+        "G" => Code::KeyG,
+        "H" => Code::KeyH,
+        "I" => Code::KeyI,
+        "J" => Code::KeyJ,
+        "K" => Code::KeyK,
+        "L" => Code::KeyL,
+        "M" => Code::KeyM,
+        "N" => Code::KeyN,
+        "O" => Code::KeyO,
+        "P" => Code::KeyP,
+        "Q" => Code::KeyQ,
+        "R" => Code::KeyR,
+        "S" => Code::KeyS,
+        "T" => Code::KeyT,
+        "U" => Code::KeyU,
+        "V" => Code::KeyV,
+        "W" => Code::KeyW,
+        "X" => Code::KeyX,
+        "Y" => Code::KeyY,
+        "Z" => Code::KeyZ,
+        "0" => Code::Digit0,
+        "1" => Code::Digit1,
+        "2" => Code::Digit2,
+        "3" => Code::Digit3,
+        "4" => Code::Digit4,
+        "5" => Code::Digit5,
+        "6" => Code::Digit6,
+        "7" => Code::Digit7,
+        "8" => Code::Digit8,
+        "9" => Code::Digit9,
+        "Space" => Code::Space,
+        "Escape" => Code::Escape,
+        "F1" => Code::F1,
+        "F2" => Code::F2,
+        "F3" => Code::F3,
+        "F4" => Code::F4,
+        "F5" => Code::F5,
+        "F6" => Code::F6,
+        "F7" => Code::F7,
+        "F8" => Code::F8,
+        "F9" => Code::F9,
+        "F10" => Code::F10,
+        "F11" => Code::F11,
+        "F12" => Code::F12,
+        other => return Err(format!("unsupported shortcut key: {other}")),
+    };
+    Ok(Shortcut::new(Some(mods), code))
+}
+
+fn validate_utility_key(raw: &str, other: &str) -> Result<shortcuts::ShortcutSpec, String> {
+    let spec = shortcuts::parse_shortcut(raw)?;
+    if !shortcuts::is_safe_utility(&spec) {
+        return Err(format!("{raw} needs a modifier so it does not steal typing"));
+    }
+    if shortcuts::is_talk_combo(&spec) {
+        return Err("that combo is reserved for the talk key".to_owned());
+    }
+    if raw.eq_ignore_ascii_case(other) {
+        return Err("paste-last and copy-last must be different".to_owned());
+    }
+    Ok(spec)
+}
+
+fn apply_utility_shortcuts(app: &tauri::AppHandle) {
+    let (paste_raw, copy_raw, old) = {
+        let st = app.state::<Mutex<AppState>>();
+        let Ok(mut s) = st.lock() else {
+            return;
+        };
+        let old = std::mem::take(&mut s.utility_shortcuts);
+        (s.settings.paste_last_key.clone(), s.settings.copy_last_key.clone(), old)
+    };
+    let gs = app.global_shortcut();
+    for sc in old {
+        let _ = gs.unregister(sc);
+    }
+    let mut next = Vec::new();
+    for raw in [paste_raw, copy_raw] {
+        match shortcuts::parse_shortcut(&raw).and_then(|s| spec_to_shortcut(&s)) {
+            Ok(sc) => {
+                if let Err(e) = gs.register(sc) {
+                    log::warn!("utility shortcut registration failed ({raw}): {e}");
+                } else {
+                    next.push(sc);
+                }
+            }
+            Err(e) => log::warn!("utility shortcut skipped ({raw}): {e}"),
+        }
+    }
+    if let Ok(mut s) = app.state::<Mutex<AppState>>().lock() {
+        s.utility_shortcuts = next;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Settings + history
 // ---------------------------------------------------------------------------
@@ -178,10 +318,41 @@ struct Settings {
     hotkey_key: String,
     /// "hold" (default, macOS-like: down starts, up stops) | "toggle".
     recording_mode: String,
+    /// Preferred WASAPI input name. `None` = OS default.
+    #[serde(default)]
+    audio_device: Option<String>,
+    #[serde(default = "default_true")]
+    overlay_enabled: bool,
+    #[serde(default = "default_overlay_edge")]
+    overlay_edge: String,
+    #[serde(default = "default_overlay_offset")]
+    overlay_offset: i32,
+    #[serde(default = "shortcuts::default_paste_last")]
+    paste_last_key: String,
+    #[serde(default = "shortcuts::default_copy_last")]
+    copy_last_key: String,
+    /// Missing field on old settings.json → already onboarded. Fresh Default → false.
+    #[serde(default = "default_true")]
+    onboarded: bool,
+    /// Hard-stop the take at 20 minutes. Default off (warn only at 19).
+    #[serde(default)]
+    session_cap: bool,
 }
 
 fn default_cleanup() -> String {
     "full".to_owned()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_overlay_edge() -> String {
+    "bottom".to_owned()
+}
+
+fn default_overlay_offset() -> i32 {
+    overlay::OFFSET_CENTER
 }
 
 impl Default for Settings {
@@ -194,6 +365,14 @@ impl Default for Settings {
             translate: false,
             hotkey_key: "RightCtrl".to_owned(),
             recording_mode: "hold".to_owned(),
+            audio_device: None,
+            overlay_enabled: true,
+            overlay_edge: default_overlay_edge(),
+            overlay_offset: default_overlay_offset(),
+            paste_last_key: shortcuts::default_paste_last(),
+            copy_last_key: shortcuts::default_copy_last(),
+            onboarded: false,
+            session_cap: false,
         }
     }
 }
@@ -229,10 +408,12 @@ struct Status {
     model_loaded: bool,
     whisper_binary: Option<String>,
     data_dir: String,
-    /// Name of the OS default input device we capture from (None = none).
+    /// Resolved capture device (preferred if still present, else OS default).
     audio_device: Option<String>,
     /// App version (Cargo package version, single source of truth).
     version: String,
+    recommended_model: String,
+    transcribing: bool,
 }
 
 /// OS default capture endpoint name. Best-effort: never fails status.
@@ -263,10 +444,12 @@ struct ActiveRecording {
     stop: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
     started_at: std::time::Instant,
+    stream_error: Arc<AtomicBool>,
 }
 
 struct AppState {
     recording: bool,
+    transcribing: bool,
     /// True while the current recording was started by the talk key (a key
     /// release must not stop a UI/mic-button-started recording in hold mode).
     hotkey_owned: bool,
@@ -275,9 +458,14 @@ struct AppState {
     history: Vec<HistoryItem>,
     /// Lifetime usage; never cleared with history.
     stats: UsageStats,
-    downloading: HashSet<String>,
+    downloading: HashMap<String, Arc<AtomicBool>>,
+    /// Currently registered paste-last / copy-last shortcuts (so we can swap).
+    utility_shortcuts: Vec<Shortcut>,
     data_dir: PathBuf,
     transcriber: Transcriber,
+    /// Last non-DictFlow foreground HWND. Overlay clicks must not steal the
+    /// caret; we restore this window before Ctrl+V.
+    paste_target: Option<focus::Hwnd>,
 }
 
 impl AppState {
@@ -293,6 +481,12 @@ impl AppState {
             if let Ok(s) = serde_json::from_slice::<Settings>(&bytes) {
                 if models::find(&s.model_id).is_some() {
                     self.settings = s;
+                    // P1 first cut defaulted to top-left. Move that unset pose
+                    // to center-bottom so existing installs match the new default.
+                    if self.settings.overlay_edge == "top" && self.settings.overlay_offset == 0 {
+                        self.settings.overlay_edge = default_overlay_edge();
+                        self.settings.overlay_offset = default_overlay_offset();
+                    }
                     return;
                 }
             }
@@ -567,19 +761,50 @@ fn transcriber_loop(rx: mpsc::Receiver<EngineJob>, data_dir: PathBuf) {
 // Audio capture (WASAPI via cpal, thread owns the !Send stream)
 // ---------------------------------------------------------------------------
 
+fn list_input_names() -> (Vec<String>, Option<String>) {
+    let host = cpal::default_host();
+    let default_name = host.default_input_device().and_then(|d| d.name().ok());
+    let names = host
+        .input_devices()
+        .map(|devs| {
+            devs.filter_map(|d| d.name().ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    (names, default_name)
+}
+
+fn resolve_capture_device(preferred: Option<&str>) -> anyhow::Result<devices::DeviceChoice> {
+    let (names, default_name) = list_input_names();
+    devices::choose_device(&names, default_name.as_deref(), preferred).map_err(anyhow::Error::msg)
+}
+
+fn open_input_named(name: &str) -> anyhow::Result<cpal::Device> {
+    let host = cpal::default_host();
+    if let Ok(devs) = host.input_devices() {
+        for d in devs {
+            if d.name().ok().as_deref() == Some(name) {
+                return Ok(d);
+            }
+        }
+    }
+    host.default_input_device().context(
+        "no input device found — connect a microphone and check Windows \
+         Settings → Privacy & security → Microphone (allow desktop apps)",
+    )
+}
+
 fn run_capture(
     ready_tx: mpsc::Sender<Result<u32, String>>,
     samples: Arc<Mutex<Vec<f32>>>,
     stop: Arc<AtomicBool>,
+    device_name: String,
+    stream_error: Arc<AtomicBool>,
 ) {
     // NOTE: the stream MUST be returned out of this closure — if it is dropped
     // here, capture stops instantly and every recording comes back silent.
     let result = (|| -> anyhow::Result<(cpal::Stream, u32)> {
-        let host = cpal::default_host();
-        let device = host.default_input_device().context(
-            "no input device found — connect a microphone and check Windows \
-             Settings → Privacy & security → Microphone (allow desktop apps)",
-        )?;
+        let device = open_input_named(&device_name)?;
         let supported = device
             .default_input_config()
             .context("no default input config")?;
@@ -588,29 +813,41 @@ fn run_capture(
         let stream = match supported.sample_format() {
             cpal::SampleFormat::F32 => {
                 let config: cpal::StreamConfig = supported.clone().into();
+                let flag = stream_error.clone();
                 device.build_input_stream(
                     &config,
                     move |data: &[f32], _| {
                         writer.lock().unwrap().extend_from_slice(data);
                     },
-                    |err| log::warn!("audio stream error: {err}"),
+                    {
+                        let flag = flag.clone();
+                        move |err| {
+                            log::warn!("audio stream error: {err}");
+                            flag.store(true, Ordering::SeqCst);
+                        }
+                    },
                     None,
                 )?
             }
             cpal::SampleFormat::I16 => {
                 let config: cpal::StreamConfig = supported.clone().into();
+                let flag = stream_error.clone();
                 device.build_input_stream(
                     &config,
                     move |data: &[i16], _| {
                         let mut lock = writer.lock().unwrap();
                         lock.extend(data.iter().map(|s| *s as f32 / i16::MAX as f32));
                     },
-                    |err| log::warn!("audio stream error: {err}"),
+                    move |err| {
+                        log::warn!("audio stream error: {err}");
+                        flag.store(true, Ordering::SeqCst);
+                    },
                     None,
                 )?
             }
             cpal::SampleFormat::U16 => {
                 let config: cpal::StreamConfig = supported.clone().into();
+                let flag = stream_error.clone();
                 device.build_input_stream(
                     &config,
                     move |data: &[u16], _| {
@@ -620,7 +857,10 @@ fn run_capture(
                                 .map(|s| (*s as f32 / u16::MAX as f32) * 2.0 - 1.0),
                         );
                     },
-                    |err| log::warn!("audio stream error: {err}"),
+                    move |err| {
+                        log::warn!("audio stream error: {err}");
+                        flag.store(true, Ordering::SeqCst);
+                    },
                     None,
                 )?
             }
@@ -644,24 +884,30 @@ fn run_capture(
     }
 }
 
-fn start_recording(state: &mut AppState) -> anyhow::Result<()> {
+fn start_recording(state: &mut AppState) -> anyhow::Result<devices::DeviceChoice> {
     if state.recording {
         anyhow::bail!("already recording");
     }
     state.active = None; // defensive: drop any stale session
 
+    let preferred = state.settings.audio_device.clone();
+    let choice = resolve_capture_device(preferred.as_deref())?;
+
     let samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
+    let stream_error = Arc::new(AtomicBool::new(false));
     let (ready_tx, ready_rx) = mpsc::channel();
 
     let t_samples = samples.clone();
     let t_stop = stop.clone();
     let t_done = done.clone();
+    let t_err = stream_error.clone();
+    let t_name = choice.name.clone();
     std::thread::Builder::new()
         .name("dictflow-capture".to_owned())
         .spawn(move || {
-            run_capture(ready_tx, t_samples, t_stop);
+            run_capture(ready_tx, t_samples, t_stop, t_name, t_err);
             t_done.store(true, Ordering::SeqCst);
         })
         .context("spawn capture thread")?;
@@ -680,8 +926,121 @@ fn start_recording(state: &mut AppState) -> anyhow::Result<()> {
         stop,
         done,
         started_at: std::time::Instant::now(),
+        stream_error,
     });
-    Ok(())
+    Ok(choice)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LevelEvent {
+    peak: f32,
+    rms: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DeviceFallback {
+    from: String,
+    to: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CommittedEvent {
+    text: String,
+    chip_ms: u64,
+}
+
+fn committed(text: String) -> CommittedEvent {
+    CommittedEvent {
+        text,
+        chip_ms: overlay::COPY_CHIP_MS,
+    }
+}
+
+fn set_transcribing(app: &tauri::AppHandle, on: bool) {
+    if let Ok(mut s) = app.state::<Mutex<AppState>>().lock() {
+        s.transcribing = on;
+    }
+    let _ = app.emit("dictflow://transcribing", on);
+}
+
+fn emit_device_fallback(app: &tauri::AppHandle, preferred: Option<&str>, choice: &devices::DeviceChoice) {
+    if choice.fell_back {
+        let _ = app.emit(
+            "dictflow://device-fallback",
+            DeviceFallback {
+                from: preferred.unwrap_or("").to_owned(),
+                to: choice.name.clone(),
+            },
+        );
+    }
+}
+
+/// Live peak/RMS + 19-minute warn / optional 20-minute cap. Not used for the
+/// 1.5 s Setup mic test.
+fn spawn_record_ticker(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut warned = false;
+        loop {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let snap = {
+                let st = app.state::<Mutex<AppState>>();
+                let Ok(s) = st.lock() else {
+                    break;
+                };
+                if !s.recording {
+                    break;
+                }
+                let Some(rec) = s.active.as_ref() else {
+                    break;
+                };
+                let samples = rec.samples.lock().unwrap();
+                let start = samples.len().saturating_sub(1024);
+                let level = devices::level_from_samples(&samples[start..]);
+                drop(samples);
+                let elapsed = rec.started_at.elapsed().as_secs_f64();
+                let err = rec.stream_error.load(Ordering::SeqCst);
+                let cap = s.settings.session_cap;
+                (level, elapsed, err, cap)
+            };
+            let (level, elapsed, stream_err, cap) = snap;
+            let _ = app.emit("dictflow://level", LevelEvent {
+                peak: level.peak,
+                rms: level.rms,
+            });
+            if stream_err {
+                let st: State<'_, Mutex<AppState>> = app.state();
+                if let Ok(mut guard) = st.lock() {
+                    if guard.recording {
+                        let _ = cancel_recording(&mut guard);
+                    }
+                }
+                let _ = app.emit("dictflow://recording", false);
+                let _ = app.emit(
+                    "dictflow://device-fallback",
+                    DeviceFallback {
+                        from: String::new(),
+                        to: "stream error — take discarded".to_owned(),
+                    },
+                );
+                break;
+            }
+            match session::session_tick(elapsed, warned, cap) {
+                session::SessionTick::Warn => {
+                    warned = true;
+                    let _ = app.emit("dictflow://session-warn", ());
+                }
+                session::SessionTick::Cap => {
+                    let st: State<'_, Mutex<AppState>> = app.state();
+                    match stop_transcribe(&app, st).await {
+                        Ok(msg) => log::info!("session cap: {msg}"),
+                        Err(e) => log::error!("session cap stop failed: {e}"),
+                    }
+                    break;
+                }
+                session::SessionTick::None => {}
+            }
+        }
+    });
 }
 
 fn stop_and_save_wav(state: &mut AppState) -> anyhow::Result<(PathBuf, f64)> {
@@ -731,13 +1090,18 @@ struct AudioDeviceInfo {
     sample_rate: u32,
     channels: u16,
     is_default: bool,
+    is_selected: bool,
 }
 
 /// List all input devices. Unlike macOS (per-app mic prompt), Windows guards
 /// the mic with a global privacy toggle — if this comes back empty, the
 /// toggle (or a missing mic) is the cause.
 #[tauri::command]
-fn get_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
+fn get_audio_devices(state: State<'_, Mutex<AppState>>) -> Result<Vec<AudioDeviceInfo>, String> {
+    let preferred = state
+        .lock()
+        .ok()
+        .and_then(|s| s.settings.audio_device.clone());
     let host = cpal::default_host();
     let default_name = host
         .default_input_device()
@@ -750,8 +1114,14 @@ fn get_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
             .default_input_config()
             .map(|c| (c.sample_rate().0, c.channels()))
             .unwrap_or((0, 0));
+        let is_default = Some(&name) == default_name.as_ref();
+        let is_selected = match preferred.as_deref() {
+            Some(p) if !p.is_empty() => p == name,
+            _ => is_default,
+        };
         out.push(AudioDeviceInfo {
-            is_default: Some(&name) == default_name.as_ref(),
+            is_default,
+            is_selected,
             name,
             sample_rate,
             channels,
@@ -795,13 +1165,25 @@ async fn test_microphone(state: State<'_, Mutex<AppState>>) -> Result<MicTest, S
         let (wav, duration_secs) = stop_and_save_wav(&mut s).map_err(|e| e.to_string())?;
         (wav, duration_secs, buffered > 0)
     };
+    let preferred = state
+        .lock()
+        .ok()
+        .and_then(|s| s.settings.audio_device.clone());
+    let choice = resolve_capture_device(preferred.as_deref()).ok();
     let host = cpal::default_host();
-    let (device, sample_rate, channels) = host
-        .default_input_device()
-        .and_then(|d| {
-            let name = d.name().ok()?;
+    let (device, sample_rate, channels) = choice
+        .as_ref()
+        .and_then(|c| {
+            let d = open_input_named(&c.name).ok()?;
             let cfg = d.default_input_config().ok()?;
-            Some((name, cfg.sample_rate().0, cfg.channels()))
+            Some((c.name.clone(), cfg.sample_rate().0, cfg.channels()))
+        })
+        .or_else(|| {
+            host.default_input_device().and_then(|d| {
+                let name = d.name().ok()?;
+                let cfg = d.default_input_config().ok()?;
+                Some((name, cfg.sample_rate().0, cfg.channels()))
+            })
         })
         .unwrap_or(("(none)".to_owned(), 0, 0));
     let samples = text::load_wav_mono_16k(&wav).map_err(|e| format!("{e:#}"))?;
@@ -956,7 +1338,30 @@ fn run_transcription(
 // Paste anywhere (clipboard + Ctrl+V)
 // ---------------------------------------------------------------------------
 
-fn paste_text(text: &str) -> anyhow::Result<()> {
+fn remember_paste_target(app: &tauri::AppHandle) {
+    let ours = focus::our_hwnds(app);
+    let Some(fg) = focus::foreground_hwnd() else {
+        return;
+    };
+    if !focus::should_remember(fg, &ours) {
+        return;
+    }
+    if let Ok(mut s) = app.state::<Mutex<AppState>>().lock() {
+        s.paste_target = Some(fg);
+    }
+}
+
+fn paste_target_for(app: &tauri::AppHandle, last_saved: Option<focus::Hwnd>) -> Option<focus::Hwnd> {
+    focus::pick_paste_target(focus::foreground_hwnd(), last_saved, &focus::our_hwnds(app))
+}
+
+fn paste_text(text: &str, target: Option<focus::Hwnd>) -> anyhow::Result<()> {
+    // SpeakType re-activates the previous app before Cmd+V so the caret
+    // never follows the overlay click.
+    if focus::restore_hwnd(target) {
+        std::thread::sleep(Duration::from_millis(180));
+    }
+
     let mut cb = arboard::Clipboard::new().context("open clipboard")?;
     // Snapshot the current *text* clipboard so it can be restored after
     // auto-paste (SpeakType `restoreClipboardAfterAutoPaste`, default on).
@@ -966,8 +1371,7 @@ fn paste_text(text: &str) -> anyhow::Result<()> {
     cb.set_text(text.to_owned()).context("set clipboard")?;
     std::thread::sleep(Duration::from_millis(120));
 
-    // Focus is still the previously-focused app (our window is not focused
-    // when triggered via global hotkey), so Ctrl+V pastes "anywhere".
+    // Target window is in front again; Ctrl+V lands at its previous caret.
     use enigo::{Direction, Enigo, Key, Keyboard, Settings};
     let mut enigo = Enigo::new(&Settings::default()).context("init key injector")?;
     enigo
@@ -1017,8 +1421,13 @@ fn get_status(state: State<'_, Mutex<AppState>>) -> Status {
             .is_some_and(|m| m.is_downloaded(&s.data_dir)),
         whisper_binary: resolve_binary(&s.data_dir).map(|p| p.display().to_string()),
         data_dir: s.data_dir.display().to_string(),
-        audio_device: default_input_name(),
+        audio_device: resolve_capture_device(s.settings.audio_device.as_deref())
+            .ok()
+            .map(|c| c.name)
+            .or_else(default_input_name),
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        recommended_model: onboarding::recommended_model_id().to_owned(),
+        transcribing: s.transcribing,
     }
 }
 
@@ -1032,7 +1441,7 @@ fn get_models(state: State<'_, Mutex<AppState>>) -> Vec<ModelStatus> {
             ModelStatus {
                 downloaded: entry.is_downloaded(&s.data_dir),
                 active: id == s.settings.model_id,
-                downloading: s.downloading.contains(&id),
+                downloading: s.downloading.contains_key(&id),
                 entry,
             }
         })
@@ -1068,12 +1477,14 @@ async fn download_model(
     id: String,
 ) -> Result<String, String> {
     let entry = models::find(&id).ok_or_else(|| format!("unknown model: {id}"))?;
-    let (data_dir, transcriber) = {
+    let (data_dir, transcriber, cancel) = {
         let mut s = state.lock().unwrap();
-        if !s.downloading.insert(id.clone()) {
+        if s.downloading.contains_key(&id) {
             return Err("download already in progress".to_owned());
         }
-        (s.data_dir.clone(), s.transcriber.clone())
+        let cancel = Arc::new(AtomicBool::new(false));
+        s.downloading.insert(id.clone(), cancel.clone());
+        (s.data_dir.clone(), s.transcriber.clone(), cancel)
     };
 
     let result = async {
@@ -1106,6 +1517,11 @@ async fn download_model(
             use tokio::io::AsyncWriteExt as _;
             let mut stream = resp.bytes_stream();
             while let Some(chunk) = stream.next().await {
+                if cancel.load(Ordering::Relaxed) {
+                    drop(out);
+                    let _ = std::fs::remove_file(&part);
+                    return Err("download cancelled".to_owned());
+                }
                 let chunk = chunk.map_err(|e| e.to_string())?;
                 out.write_all(&chunk).await.map_err(|e| e.to_string())?;
                 received += chunk.len() as u64;
@@ -1151,6 +1567,17 @@ async fn download_model(
         }
         Err(e) => Err(e),
     }
+}
+
+#[tauri::command]
+fn cancel_download(state: State<'_, Mutex<AppState>>, id: String) -> Result<String, String> {
+    let s = state.lock().unwrap();
+    let flag = s
+        .downloading
+        .get(&id)
+        .ok_or_else(|| "no download in progress for that model".to_owned())?;
+    flag.store(true, Ordering::Relaxed);
+    Ok(format!("cancelling {id}"))
 }
 
 /// Best-effort removal of a history item's audio file (SpeakType deletes the
@@ -1431,6 +1858,14 @@ fn set_settings(
     if settings.recording_mode != "hold" && settings.recording_mode != "toggle" {
         return Err(format!("unknown recording mode: {}", settings.recording_mode));
     }
+    let edge = overlay::DockEdge::parse(&settings.overlay_edge)
+        .ok_or_else(|| format!("unknown overlay edge: {}", settings.overlay_edge))?;
+    let paste = validate_utility_key(&settings.paste_last_key, &settings.copy_last_key)?;
+    let copy = validate_utility_key(&settings.copy_last_key, &settings.paste_last_key)?;
+    let mut settings = settings;
+    settings.overlay_edge = edge.as_str().to_owned();
+    settings.paste_last_key = shortcuts::format_shortcut(&paste);
+    settings.copy_last_key = shortcuts::format_shortcut(&copy);
     let mut s = state.lock().unwrap();
     let warm = settings.model_id != s.settings.model_id
         && models::find(&settings.model_id).is_some_and(|m| {
@@ -1444,6 +1879,8 @@ fn set_settings(
     }
     drop(s);
     apply_hotkey_registration(&app);
+    apply_utility_shortcuts(&app);
+    apply_overlay_visibility(&app);
     Ok(settings)
 }
 
@@ -1457,16 +1894,127 @@ fn cancel_recording(state: &mut AppState) -> anyhow::Result<()> {
 }
 
 #[tauri::command]
+fn cancel_dictation(
+    app: tauri::AppHandle,
+    state: State<'_, Mutex<AppState>>,
+) -> Result<String, String> {
+    let mut s = state.lock().unwrap();
+    if !s.recording {
+        return Err("not recording".to_owned());
+    }
+    cancel_recording(&mut s).map_err(|e| e.to_string())?;
+    s.transcribing = false;
+    drop(s);
+    let _ = app.emit("dictflow://recording", false);
+    let _ = app.emit("dictflow://transcribing", false);
+    Ok("cancelled".to_owned())
+}
+
+fn last_text(state: &AppState) -> Option<String> {
+    state.history.first().map(|h| h.text.clone()).filter(|t| !t.is_empty())
+}
+
+#[tauri::command]
+fn copy_last(state: State<'_, Mutex<AppState>>) -> Result<String, String> {
+    let text = last_text(&state.lock().unwrap())
+        .ok_or_else(|| "nothing to copy — dictate first".to_owned())?;
+    let mut cb = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    cb.set_text(text.clone()).map_err(|e| e.to_string())?;
+    Ok(format!("copied: {}", truncate(&text, 80)))
+}
+
+#[tauri::command]
+fn paste_last(app: tauri::AppHandle, state: State<'_, Mutex<AppState>>) -> Result<String, String> {
+    remember_paste_target(&app);
+    let (text, saved) = {
+        let s = state.lock().unwrap();
+        (
+            last_text(&s).ok_or_else(|| "nothing to paste — dictate first".to_owned())?,
+            s.paste_target,
+        )
+    };
+    paste_text(&text, paste_target_for(&app, saved)).map_err(|e| format!("{e:#}"))?;
+    Ok(format!("pasted: {}", truncate(&text, 80)))
+}
+
+#[tauri::command]
+fn snap_overlay(x: i32, y: i32, screen_w: i32, screen_h: i32) -> overlay::OverlayPose {
+    overlay::snap_to_edge(x, y, screen_w, screen_h, overlay::PILL_W, overlay::PILL_H)
+}
+
+#[tauri::command]
+fn set_overlay_pose(
+    app: tauri::AppHandle,
+    state: State<'_, Mutex<AppState>>,
+    edge: String,
+    offset: i32,
+) -> Result<Settings, String> {
+    let parsed = overlay::DockEdge::parse(&edge)
+        .ok_or_else(|| format!("unknown overlay edge: {edge}"))?;
+    let mut s = state.lock().unwrap();
+    s.settings.overlay_edge = parsed.as_str().to_owned();
+    s.settings.overlay_offset = offset;
+    s.save_settings();
+    let out = s.settings.clone();
+    drop(s);
+    apply_overlay_visibility(&app);
+    Ok(out)
+}
+
+fn apply_overlay_visibility(app: &tauri::AppHandle) {
+    let Some(win) = app.get_webview_window("overlay") else {
+        return;
+    };
+    let settings = app
+        .state::<Mutex<AppState>>()
+        .lock()
+        .ok()
+        .map(|s| s.settings.clone());
+    let Some(settings) = settings else {
+        return;
+    };
+    if !settings.overlay_enabled {
+        let _ = win.hide();
+        return;
+    }
+    focus::make_non_activating(&win);
+    let _ = win.show();
+    let _ = win.set_size(tauri::LogicalSize::new(
+        overlay::PILL_W as f64,
+        overlay::PILL_H as f64,
+    ));
+    if let Ok(Some(m)) = win.current_monitor() {
+        let size = m.size();
+        let origin = m.position();
+        let edge = overlay::DockEdge::parse(&settings.overlay_edge).unwrap_or(overlay::DockEdge::Bottom);
+        let (x, y) = overlay::pose_to_xy(
+            edge,
+            settings.overlay_offset,
+            size.width as i32,
+            size.height as i32,
+            overlay::PILL_W,
+            overlay::PILL_H,
+        );
+        let _ = win.set_position(tauri::PhysicalPosition::new(origin.x + x, origin.y + y));
+    }
+    focus::make_non_activating(&win);
+}
+
+#[tauri::command]
 async fn toggle_recording(
     app: tauri::AppHandle,
     state: State<'_, Mutex<AppState>>,
 ) -> Result<String, String> {
+    remember_paste_target(&app);
     if !state.lock().unwrap().recording {
         let mut s = state.lock().unwrap();
-        start_recording(&mut s).map_err(|e| e.to_string())?;
+        let preferred = s.settings.audio_device.clone();
+        let choice = start_recording(&mut s).map_err(|e| e.to_string())?;
         s.hotkey_owned = false;
         drop(s);
+        emit_device_fallback(&app, preferred.as_deref(), &choice);
         let _ = app.emit("dictflow://recording", true);
+        spawn_record_ticker(app.clone());
         return Ok("recording… press hotkey again to transcribe".to_owned());
     }
     stop_transcribe(&app, state).await
@@ -1498,18 +2046,19 @@ async fn stop_transcribe(
         };
         (input, s.transcriber.clone(), duration_secs, model_id, audio, cleanup)
     };
+    set_transcribing(app, true);
     let _ = app.emit("dictflow://recording", false);
-    let _ = app.emit("dictflow://transcribing", true);
 
     // STT + post-processing can take seconds (model load, inference) — keep it
     // off the async runtime.
-    let result = tokio::task::spawn_blocking(move || run_transcription(&input, &parakeet))
-        .await
+    let result = tokio::task::spawn_blocking(move || run_transcription(&input, &parakeet)).await;
+    set_transcribing(app, false);
+    let result = result
         .map_err(|e| format!("transcription task failed: {e}"))?
         .map_err(|e| format!("{e:#}"))?;
     let text = result.text.clone();
 
-    let auto_paste = {
+    let (auto_paste, saved_target) = {
         let mut s = state.lock().unwrap();
         s.push_history(NewHistory {
             text: result.text,
@@ -1520,16 +2069,16 @@ async fn stop_transcribe(
             dict_hits: result.dict_hits,
             cleanup,
         });
-        s.settings.auto_paste
+        (s.settings.auto_paste, s.paste_target)
     };
-    let _ = app.emit("dictflow://transcribing", false);
     let _ = app.emit("dictflow://history-updated", ());
+    let _ = app.emit("dictflow://committed", committed(text.clone()));
 
     if !auto_paste {
         return Ok(format!("transcribed (auto-paste off): {}", truncate(&text, 160)));
     }
     // Pasting must not kill the transcription if the foreground app rejects keys.
-    match paste_text(&text) {
+    match paste_text(&text, paste_target_for(app, saved_target)) {
         Ok(()) => Ok(format!("pasted: {}", truncate(&text, 80))),
         Err(e) => Ok(format!(
             "transcribed (paste failed: {e}): {}",
@@ -1576,13 +2125,12 @@ async fn transcribe_file(
         };
         (input, s.transcriber.clone())
     };
-    let _ = app.emit("dictflow://transcribing", true);
-    let result = tokio::task::spawn_blocking(move || run_transcription(&input, &parakeet))
-        .await
+    set_transcribing(&app, true);
+    let result = tokio::task::spawn_blocking(move || run_transcription(&input, &parakeet)).await;
+    set_transcribing(&app, false);
+    let result = result
         .map_err(|e| format!("transcription task failed: {e}"))?
-        .map_err(|e| format!("{e:#}"));
-    let _ = app.emit("dictflow://transcribing", false);
-    let result = result?;
+        .map_err(|e| format!("{e:#}"))?;
     {
         let mut s = state.lock().unwrap();
         let model = s.settings.model_id.clone();
@@ -1598,7 +2146,29 @@ async fn transcribe_file(
         });
     }
     let _ = app.emit("dictflow://history-updated", ());
+    let _ = app.emit("dictflow://committed", committed(result.text.clone()));
     Ok(result.text)
+}
+
+#[tauri::command]
+fn onboard_step(current: String, backward: bool) -> Result<String, String> {
+    let step = onboarding::OnboardStep::parse(&current)
+        .ok_or_else(|| format!("unknown onboard step: {current}"))?;
+    let next = if backward {
+        onboarding::prev(step)
+    } else {
+        onboarding::next(step)
+    };
+    Ok(next.as_str().to_owned())
+}
+
+#[tauri::command]
+fn copy_chip_open(pasted_unix_ms: u64) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    overlay::copy_chip_visible(pasted_unix_ms, now, overlay::COPY_CHIP_MS)
 }
 
 #[tauri::command]
@@ -1692,14 +2262,50 @@ pub fn run() {
                 .with_shortcuts([HOTKEY])
                 .expect("parse hotkey")
                 .with_handler(|app, shortcut, event| {
+                    if event.state != ShortcutState::Pressed {
+                        return;
+                    }
                     let expected = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::Space);
-                    if *shortcut == expected && event.state == ShortcutState::Pressed {
+                    if *shortcut == expected {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
                             let state: State<'_, Mutex<AppState>> = app.state();
                             match toggle_recording(app.clone(), state).await {
                                 Ok(msg) => log::info!("dictation: {msg}"),
                                 Err(e) => log::error!("dictation error: {e}"),
+                            }
+                        });
+                        return;
+                    }
+                    let (paste, copy) = {
+                        let st = app.state::<Mutex<AppState>>();
+                        let Ok(s) = st.lock() else {
+                            return;
+                        };
+                        let paste = shortcuts::parse_shortcut(&s.settings.paste_last_key)
+                            .ok()
+                            .and_then(|sp| spec_to_shortcut(&sp).ok());
+                        let copy = shortcuts::parse_shortcut(&s.settings.copy_last_key)
+                            .ok()
+                            .and_then(|sp| spec_to_shortcut(&sp).ok());
+                        (paste, copy)
+                    };
+                    if paste.as_ref() == Some(shortcut) {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let state: State<'_, Mutex<AppState>> = app.state();
+                            match paste_last(app.clone(), state) {
+                                Ok(msg) => log::info!("{msg}"),
+                                Err(e) => log::error!("paste-last: {e}"),
+                            }
+                        });
+                    } else if copy.as_ref() == Some(shortcut) {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let state: State<'_, Mutex<AppState>> = app.state();
+                            match copy_last(state) {
+                                Ok(msg) => log::info!("{msg}"),
+                                Err(e) => log::error!("copy-last: {e}"),
                             }
                         });
                     }
@@ -1718,14 +2324,17 @@ pub fn run() {
             let transcriber = Transcriber::spawn(data_dir.clone());
             let mut st = AppState {
                 recording: false,
+                transcribing: false,
                 hotkey_owned: false,
                 active: None,
                 settings: Settings::default(),
                 history: Vec::new(),
                 stats: UsageStats::default(),
-                downloading: HashSet::new(),
+                downloading: HashMap::new(),
+                utility_shortcuts: Vec::new(),
                 data_dir,
                 transcriber,
+                paste_target: None,
             };
             st.load_settings();
             st.load_history();
@@ -1741,6 +2350,8 @@ pub fn run() {
             app.manage(Mutex::new(st));
             build_tray(app.handle()).expect("build tray");
             apply_hotkey_registration(app.handle());
+            apply_utility_shortcuts(app.handle());
+            apply_overlay_visibility(app.handle());
 
             // Single-key talk-button edges → start/stop. Lives for the app's
             // lifetime; the polling thread exits if the channel closes.
@@ -1769,11 +2380,14 @@ pub fn run() {
                             } else {
                                 let st: State<'_, Mutex<AppState>> = hk_app.state();
                                 let mut guard = st.lock().unwrap();
+                                let preferred = guard.settings.audio_device.clone();
                                 match start_recording(&mut guard) {
-                                    Ok(()) => {
+                                    Ok(choice) => {
                                         guard.hotkey_owned = true;
                                         drop(guard);
+                                        emit_device_fallback(&hk_app, preferred.as_deref(), &choice);
                                         let _ = hk_app.emit("dictflow://recording", true);
+                                        spawn_record_ticker(hk_app.clone());
                                     }
                                     Err(e) => log::error!("hotkey record failed: {e:#}"),
                                 }
@@ -1816,6 +2430,25 @@ pub fn run() {
                                 }
                             }
                         }
+                        TalkEdge::Escape => {
+                            let recording = {
+                                let s: State<'_, Mutex<AppState>> = hk_app.state();
+                                let rec = s.lock().unwrap().recording;
+                                rec
+                            };
+                            if recording {
+                                let st: State<'_, Mutex<AppState>> = hk_app.state();
+                                let mut guard = st.lock().unwrap();
+                                match cancel_recording(&mut guard) {
+                                    Ok(()) => {
+                                        drop(guard);
+                                        let _ = hk_app.emit("dictflow://recording", false);
+                                        log::info!("dictation cancelled (Esc)");
+                                    }
+                                    Err(e) => log::error!("dictation cancel failed: {e:#}"),
+                                }
+                            }
+                        }
                     }
                 }
             });
@@ -1826,6 +2459,7 @@ pub fn run() {
             get_models,
             select_model,
             download_model,
+            cancel_download,
             get_history,
             get_stats,
             delete_history_item,
@@ -1841,6 +2475,13 @@ pub fn run() {
             get_settings,
             set_settings,
             toggle_recording,
+            cancel_dictation,
+            copy_last,
+            paste_last,
+            snap_overlay,
+            set_overlay_pose,
+            onboard_step,
+            copy_chip_open,
             transcribe_file,
             delete_model,
             get_audio_devices,
@@ -1873,14 +2514,17 @@ mod tests {
         ));
         AppState {
             recording: false,
+            transcribing: false,
             hotkey_owned: false,
             active: None,
             settings: Settings::default(),
             history: Vec::new(),
             stats: UsageStats::default(),
-            downloading: HashSet::new(),
+            downloading: HashMap::new(),
+            utility_shortcuts: Vec::new(),
             data_dir: dir,
             transcriber: Transcriber::spawn(std::env::temp_dir()),
+            paste_target: None,
         }
     }
 
@@ -1988,6 +2632,61 @@ mod tests {
         assert_eq!(s.stats.lifetime_words, 3);
         s.seed_stats_from_history();
         assert_eq!(s.stats.lifetime_dictations, 1, "must not double-count");
+        let _ = std::fs::remove_dir_all(&s.data_dir);
+    }
+
+    #[test]
+    fn fresh_settings_are_not_onboarded() {
+        assert!(!Settings::default().onboarded);
+        assert_eq!(Settings::default().paste_last_key, "Shift+Alt+Z");
+        assert_eq!(Settings::default().copy_last_key, "Shift+Alt+X");
+        assert!(!Settings::default().session_cap);
+        assert!(Settings::default().overlay_enabled);
+    }
+
+    #[test]
+    fn old_settings_json_skips_wizard() {
+        let json = r#"{
+            "model_id": "parakeet-v3",
+            "language": "auto",
+            "auto_paste": true,
+            "hotkey_key": "RightCtrl",
+            "recording_mode": "hold"
+        }"#;
+        let s: Settings = serde_json::from_str(json).expect("legacy settings");
+        assert!(s.onboarded, "missing onboarded must default true");
+        assert_eq!(s.paste_last_key, "Shift+Alt+Z");
+        assert!(s.overlay_enabled);
+        assert_eq!(s.overlay_edge, "bottom");
+        assert!(s.audio_device.is_none());
+    }
+
+    #[test]
+    fn recommended_matches_catalog_default() {
+        assert_eq!(
+            onboarding::recommended_model_id(),
+            models::default_model_id()
+        );
+    }
+
+    #[test]
+    fn cancel_does_not_touch_stats() {
+        let mut s = test_state();
+        s.push_history(NewHistory {
+            text: "keep".into(),
+            raw_text: "keep".into(),
+            duration_secs: 1.0,
+            model: "test".into(),
+            audio_path: None,
+            dict_hits: 0,
+            cleanup: "full".into(),
+        });
+        assert_eq!(s.stats.lifetime_dictations, 1);
+        assert_eq!(s.history.len(), 1);
+        // No live recording — cancel_recording errors and must not wipe the ledger.
+        assert!(cancel_recording(&mut s).is_err());
+        assert_eq!(s.stats.lifetime_dictations, 1);
+        assert_eq!(s.history.len(), 1);
         let _ = std::fs::remove_dir_all(&s.data_dir);
     }
 }

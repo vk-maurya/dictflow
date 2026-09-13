@@ -26,13 +26,19 @@ state (`Arc<Mutex<…>>`, `Arc<AtomicBool>`, `mpsc::Sender`).
 | `models.rs` | Model catalog (both engines): ids, URLs, sizes, scores |
 | `text.rs` | Pure offline text passes: dictionary, fillers, tidy, smart punctuation, WAV I/O + resampling |
 | `stats.rs` | Lifetime usage ledger (`stats.json`); survives History clear-all |
+| `session.rs` | 19-minute warn / optional 20-minute cap policy |
+| `shortcuts.rs` | Parse/validate paste-last and copy-last shortcut strings |
+| `devices.rs` | Mic pick + fallback + peak/RMS (no cpal) |
+| `overlay.rs` | Pill dock snap + copy-chip window |
+| `onboarding.rs` | First-run wizard step machine |
 
 ## Frontend (`src/`)
 
 Framework-free TypeScript + Vite: a tiny view router (`renderView`) over
-`Dashboard / Dictate / Models / Setup / History / Dictionary / Insights / Settings`,
-Tauri `invoke` + event listeners, toasts. No state library — module-level
-caches refreshed from commands.
+`Dashboard / Dictate / Models / Setup / History / Dictionary / Insights / Settings`
+plus a first-run onboarding shell. Second window `overlay.html` / `src/overlay.ts`
+is the always-on-top pill. Tauri `invoke` + event listeners, toasts. No state
+library — module-level caches refreshed from commands.
 
 ## On-disk layout (`%APPDATA%/dictflow/`)
 
@@ -51,7 +57,8 @@ logs/              # tauri-plugin-log file target
 
 `dictflow://recording(bool)` · `dictflow://transcribing(bool)` ·
 `dictflow://download(string)` · `dictflow://download-progress{model_id,file,received,total}` ·
-`dictflow://history-updated`
+`dictflow://history-updated` · `dictflow://level{peak,rms}` · `dictflow://committed{text}` ·
+`dictflow://session-warn` · `dictflow://device-fallback{from,to}`
 
 ## Key design constraints
 
