@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default capability for DictFlow","local":true,"windows":["main"],"permissions":["core:default","core:tray:default","dialog:default","fs:default","global-shortcut:default","autostart:default"]}}
