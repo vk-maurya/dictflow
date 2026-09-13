@@ -1,41 +1,84 @@
-# DictFlow (local-only voice dictation for Windows)
+# DictFlow
+
+Offline voice dictation for Windows 10/11. Hold a key, speak, release —
+text lands in whatever app has focus. Nothing leaves your PC unless you
+turn on an optional online model.
 
 ![DictFlow](assets/screenshot.png)
 
-Fast, private, offline voice-to-text for Windows 10/11. Hold a key, speak,
-release — text lands in whatever app has focus. Nothing ever leaves your PC.
+**Latest:** [v0.2.0](https://github.com/vk-maurya/dictflow/releases/tag/v0.2.0)
 
-**Download v0.2.0:**
-[Portable exe for Windows x64](https://github.com/vk-maurya/dictflow/releases/download/v0.2.0/DictFlow-0.2.0-windows-x64-portable.exe)
-(double-click, no installer) · [All releases](https://github.com/vk-maurya/dictflow/releases)
+## Download
 
-- **100% offline** — Parakeet (in-process) or Whisper (sidecar), zero network
-  after model download. No accounts, no telemetry.
-- **Two engines** — Parakeet TDT 0.6B v2 (English) + v3 (25 languages) via
-  sherpa-onnx, in-process; Whisper tiny/base/small (.en + multilingual) via a
-  whisper.cpp sidecar.
-- **Mac-style talk key** — hold Right Ctrl (default), Scroll Lock, F9, Left
-  Ctrl, or the Ctrl+Alt+Space combo; hold-to-talk or toggle.
-- **Post-processing pipeline** — dictionary snippets, symbol presets, 3-level
-  cleanup, smart trailing punctuation, Whisper→English translate.
-- **Full app** — dashboard views (Dictate, Models, Setup, History, Dictionary,
-  Statistics, Settings), per-dictation audio playback, WAV file transcription,
-  model manager with progress, mic diagnostics, auto-start, update check.
+| File | Use this when |
+|---|---|
+| [DictFlow_0.2.0_x64-setup.exe](https://github.com/vk-maurya/dictflow/releases/download/v0.2.0/DictFlow_0.2.0_x64-setup.exe) | Installer (recommended). Start Menu, current-user install, uninstall. |
+| [DictFlow-0.2.0-windows-x64-portable.exe](https://github.com/vk-maurya/dictflow/releases/download/v0.2.0/DictFlow-0.2.0-windows-x64-portable.exe) | No installer. Double-click to run. |
 
-## Quick start
+[All releases](https://github.com/vk-maurya/dictflow/releases)
 
-1. Install prerequisites (one-time): see [docs/BUILD.md](docs/BUILD.md).
-2. `npm install`
-3. `npm run tauri dev`
-4. Open **AI Models**, download **Parakeet TDT 0.6B v3** (~670 MB, one time).
-5. Hold **Right Ctrl**, speak, release. Text is typed into the focused app.
+The builds are unsigned, so Windows SmartScreen may warn. Choose
+**More info → Run anyway**. WebView2 is required (already on Windows 10/11).
 
-No model + no sidecar needed beyond that: Parakeet runs in-process.
+Portable is not a USB-only copy: settings, models, and history still live in
+`%APPDATA%\dictflow`.
+
+## First run
+
+1. Download the installer or the portable exe above.
+2. Open DictFlow. Allow the microphone if Windows asks
+   (Settings → Privacy & security → Microphone → desktop apps).
+3. Open **AI Models** and download **Parakeet TDT 0.6B v3** (~670 MB, one time).
+4. Click into any text field (browser, editor, chat).
+5. Hold the talk key, speak, release. Text is pasted into the focused app.
+
+Default talk key is **Right Ctrl**. Change it in **Settings** to Left Ctrl,
+Scroll Lock, F9, or Ctrl+Alt+Space. Hold-to-talk or toggle.
+
+Confirm the mic in **Setup** if a take is silent.
+
+## What you get
+
+- **Offline by default** — Parakeet runs in-process. After the model
+  download, dictation does not need the network. No account, no telemetry.
+- **Two local engines** — Parakeet TDT 0.6B v2 (English) and v3 (25
+  languages); Whisper tiny/base/small via an optional whisper.cpp sidecar.
+- **Optional online** — OpenAI-compatible speech (for example Groq) and an
+  optional LLM polish pass. API keys stay in Windows Credential Manager.
+- **Talk key** — hold or toggle; cancel with Esc or another key while held.
+- **Cleanup** — dictionary snippets, spoken punctuation, filler-word cleanup,
+  smart trailing punctuation.
+- **App** — Dashboard, Dictate, History (with playback), Dictionary,
+  Insights, AI Models, Setup, Settings. Tray icon, auto-start, update check.
+
+## Permissions
+
+- **Microphone** — Windows Settings → Privacy & security → Microphone →
+  *Let desktop apps access your microphone*. Use **Setup** to test devices.
+- **Auto-paste** — no extra grant on Windows (no Accessibility prompt).
+
+## Build from source
+
+For contributors. End users can skip this and use the downloads above.
+Full environment notes: [docs/BUILD.md](docs/BUILD.md).
+
+```powershell
+npm install
+npm run tauri dev
+```
+
+Then download Parakeet v3 in **AI Models** and hold the talk key.
+
+Release build (installer + portable):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
+```
 
 ## Documentation
 
-- [docs/BUILD.md](docs/BUILD.md) — dev environment, builds, troubleshooting
-- [docs/RELEASE.md](docs/RELEASE.md) — versioning, installers, GitHub releases
+- [docs/BUILD.md](docs/BUILD.md) — toolchain, daily commands, troubleshooting
+- [docs/RELEASE.md](docs/RELEASE.md) — versioning and GitHub releases
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — pipeline, threads, storage
 
 ## Project layout
@@ -51,17 +94,11 @@ scripts/             # build-windows.ps1, package-portable.ps1, clean-dev.ps1
 docs/                # build / release / architecture notes
 ```
 
-## Permissions (Windows)
-
-- **Microphone** — one global toggle: Settings → Privacy & security →
-  Microphone → *Let desktop apps access your microphone*. The in-app
-  **Setup** view tests the mic and lists devices.
-- **Auto-paste** — needs no grant on Windows (unlike macOS Accessibility).
-
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). PRs welcome — run `npm run build`,
-`cargo clippy -- -D warnings`, and `cargo test` before pushing.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Before a PR: `npm run build`,
+`cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings`,
+and `cargo test --manifest-path src-tauri/Cargo.toml`.
 
 ## License
 
