@@ -2610,40 +2610,73 @@ fn delete_model(state: State<'_, Mutex<AppState>>, id: String) -> Result<String,
 // Tray + app setup
 // ---------------------------------------------------------------------------
 
+fn wants_tray_launch<I, S>(args: I, onboarded: bool) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    onboarded && args.into_iter().any(|a| a.as_ref() == "--minimized")
+}
+
+fn hide_main_to_tray(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+        let _ = w.set_skip_taskbar(true);
+    }
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.set_skip_taskbar(false);
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
+fn spawn_tray_toggle(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state: State<'_, Mutex<AppState>> = app.state();
+        let _ = toggle_recording(app.clone(), state).await;
+    });
+}
+
 fn build_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
     use tauri::menu::{Menu, MenuItem};
-    use tauri::tray::TrayIconBuilder;
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
 
     let toggle = MenuItem::with_id(app, "toggle", "Start/Stop dictation", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Open DictFlow", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&toggle, &settings, &quit])?;
 
-    let icon =
-        tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
-
-    TrayIconBuilder::new()
-        .icon(icon)
-        .menu(&menu)
-        .tooltip("DictFlow — offline voice dictation")
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "quit" => app.exit(0),
-            "settings" => {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                }
-            }
-            "toggle" => {
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state: State<'_, Mutex<AppState>> = app.state();
-                    let _ = toggle_recording(app.clone(), state).await;
-                });
-            }
-            _ => {}
-        })
-        .build(app)?;
+    // tauri.conf.json already creates the "main" tray — attach to it so we
+    // don't end up with a second icon.
+    let tray = app
+        .tray_by_id("main")
+        .ok_or_else(|| anyhow::anyhow!("missing tray icon"))?;
+    tray.set_menu(Some(menu))?;
+    tray.set_tooltip(Some("DictFlow — offline voice dictation"))?;
+    tray.set_show_menu_on_left_click(false)?;
+    tray.on_menu_event(|app, event| match event.id.as_ref() {
+        "quit" => app.exit(0),
+        "settings" => show_main_window(app),
+        "toggle" => spawn_tray_toggle(app),
+        _ => {}
+    });
+    tray.on_tray_icon_event(|tray, event| match event {
+        TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        }
+        | TrayIconEvent::DoubleClick {
+            button: MouseButton::Left,
+            ..
+        } => show_main_window(tray.app_handle()),
+        _ => {}
+    });
     Ok(())
 }
 
@@ -2664,10 +2697,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.set_focus();
-            }
+            show_main_window(app);
         }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
@@ -2768,6 +2798,14 @@ pub fn run() {
             apply_hotkey_registration(app.handle());
             apply_utility_shortcuts(app.handle());
             apply_overlay_visibility(app.handle());
+            let onboarded = app
+                .state::<Mutex<AppState>>()
+                .lock()
+                .map(|s| s.settings.onboarded)
+                .unwrap_or(false);
+            if wants_tray_launch(std::env::args(), onboarded) {
+                hide_main_to_tray(app.handle());
+            }
 
             // Single-key talk-button edges → start/stop. Lives for the app's
             // lifetime; the polling thread exits if the channel closes.
@@ -2869,6 +2907,16 @@ pub fn run() {
                 }
             });
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                hide_main_to_tray(window.app_handle());
+                apply_overlay_visibility(window.app_handle());
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
@@ -3087,6 +3135,13 @@ mod tests {
     }
 
     #[test]
+    fn autostart_minimized_requires_onboarded() {
+        assert!(wants_tray_launch(["dictflow", "--minimized"], true));
+        assert!(!wants_tray_launch(["dictflow", "--minimized"], false));
+        assert!(!wants_tray_launch(["dictflow"], true));
+    }
+
+    #[test]
     fn recommended_matches_catalog_default() {
         assert_eq!(
             onboarding::recommended_model_id(),
@@ -3105,10 +3160,12 @@ mod tests {
 
     #[test]
     fn online_speech_uses_api_model_name() {
-        let mut s = Settings::default();
-        s.audio_backend = "openai_compat".to_owned();
-        s.audio_api_base = "https://api.groq.com/openai/v1".to_owned();
-        s.audio_api_model = "whisper-large-v3-turbo".to_owned();
+        let s = Settings {
+            audio_backend: "openai_compat".to_owned(),
+            audio_api_base: "https://api.groq.com/openai/v1".to_owned(),
+            audio_api_model: "whisper-large-v3-turbo".to_owned(),
+            ..Settings::default()
+        };
         assert_eq!(active_speech_source(&s), "online");
         assert_eq!(active_speech_id(&s), "whisper-large-v3-turbo");
         assert_eq!(active_speech_name(&s), "whisper-large-v3-turbo");
@@ -3118,9 +3175,11 @@ mod tests {
 
     #[test]
     fn online_speech_empty_model_is_not_ready() {
-        let mut s = Settings::default();
-        s.audio_backend = "openai_compat".to_owned();
-        s.audio_api_model = "  ".to_owned();
+        let s = Settings {
+            audio_backend: "openai_compat".to_owned(),
+            audio_api_model: "  ".to_owned(),
+            ..Settings::default()
+        };
         assert_eq!(active_speech_id(&s), "online model");
         assert!(!active_speech_ready(&s, Path::new(".")));
         assert_eq!(audio_host_label("https://api.openai.com/v1"), "OpenAI");

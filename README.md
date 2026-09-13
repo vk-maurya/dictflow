@@ -8,14 +8,14 @@ Nothing leaves your PC unless you turn on an optional online model.
 
 ![DictFlow](assets/screenshot.png)
 
-**Latest:** [v0.2.0](https://github.com/vk-maurya/dictflow/releases/tag/v0.2.0)
+**Latest:** [v0.2.1](https://github.com/vk-maurya/dictflow/releases/tag/v0.2.1)
 
 ## Download
 
 | File | Use this when |
 |---|---|
-| [DictFlow_0.2.0_x64-setup.exe](https://github.com/vk-maurya/dictflow/releases/download/v0.2.0/DictFlow_0.2.0_x64-setup.exe) | Installer (recommended). Start Menu, current-user install, uninstall. |
-| [DictFlow-0.2.0-windows-x64-portable.exe](https://github.com/vk-maurya/dictflow/releases/download/v0.2.0/DictFlow-0.2.0-windows-x64-portable.exe) | No installer. Double-click to run. |
+| [DictFlow_0.2.1_x64-setup.exe](https://github.com/vk-maurya/dictflow/releases/download/v0.2.1/DictFlow_0.2.1_x64-setup.exe) | Installer (recommended). Start Menu, current-user install, uninstall. |
+| [DictFlow-0.2.1-windows-x64-portable.exe](https://github.com/vk-maurya/dictflow/releases/download/v0.2.1/DictFlow-0.2.1-windows-x64-portable.exe) | No installer. Double-click to run. |
 
 [All releases](https://github.com/vk-maurya/dictflow/releases)
 
