@@ -3,10 +3,18 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+# One run per branch/PR. A new push cancels the previous run so minutes
+# are not burned on already-superseded commits.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  # npm build is portable — Linux minutes are cheaper than Windows.
   frontend:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -16,14 +24,29 @@ jobs:
       - run: npm ci
       - run: npm run build
 
+  # DictFlow links user32/advapi32/WebView2 — this job is Windows-only.
+  # Manual only: every automatic Windows compile burns ~10–20 minutes of
+  # the private-repo quota. Run from Actions → ci → Run workflow.
   rust:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+      # tauri::generate_context! requires frontendDist ("../dist") to exist.
+      # dist/ is gitignored and the frontend job's output is not shared, so
+      # cargo check/clippy/test need a stub here. Release builds still run
+      # `npm run build` via beforeBuildCommand.
+      - name: Stub frontend dist
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Set-Content -Path dist/index.html -Value "<!doctype html><html><body></body></html>"
       - name: Check
         run: cargo check --locked
         working-directory: src-tauri

@@ -472,6 +472,14 @@ struct Status {
     version: String,
     recommended_model: String,
     transcribing: bool,
+    /// "local" or "online" — which STT source dictation actually uses.
+    speech_source: String,
+    /// Catalog id, or the API model name when the audio backend is online.
+    speech_model: String,
+    /// Human-readable name for the active speech source.
+    speech_model_name: String,
+    /// Ready to dictate with the selected source (downloaded, or API model set).
+    speech_ready: bool,
 }
 
 /// OS default capture endpoint name. Best-effort: never fails status.
@@ -1453,17 +1461,17 @@ fn run_transcription(
             "medium" => "clean",
             _ => input.polish.llm_preset.as_str(),
         };
-        if let Some(polished) = polish::polish(
-            &input.polish.llm_backend,
-            &input.polish.llm_api_base,
-            &input.polish.llm_api_key,
-            &input.polish.llm_api_model,
+        if let Some(polished) = polish::polish(&polish::PolishArgs {
+            backend: &input.polish.llm_backend,
+            base_url: &input.polish.llm_api_base,
+            api_key: &input.polish.llm_api_key,
+            model: &input.polish.llm_api_model,
             preset,
-            &input.polish.llm_custom_prompt,
-            input.polish.llm_temperature,
-            input.polish.llm_timeout_ms,
-            &out,
-        ) {
+            custom_prompt: &input.polish.llm_custom_prompt,
+            temperature: input.polish.llm_temperature,
+            timeout_ms: input.polish.llm_timeout_ms,
+            text: &out,
+        }) {
             out = polished;
         }
     }
@@ -1551,6 +1559,72 @@ fn truncate(s: &str, n: usize) -> String {
 // Tauri commands
 // ---------------------------------------------------------------------------
 
+fn is_online_audio(settings: &Settings) -> bool {
+    settings.audio_backend == "openai_compat"
+}
+
+fn audio_host_label(base: &str) -> &'static str {
+    let b = base.trim().trim_end_matches('/');
+    if b.contains("api.groq.com") {
+        "Groq"
+    } else if b.is_empty() || b.contains("api.openai.com") {
+        "OpenAI"
+    } else {
+        "Online"
+    }
+}
+
+/// Catalog id, or the API model name when speech is coming from a host.
+fn active_speech_id(settings: &Settings) -> String {
+    if is_online_audio(settings) {
+        let t = settings.audio_api_model.trim();
+        if t.is_empty() {
+            "online model".to_owned()
+        } else {
+            t.to_owned()
+        }
+    } else {
+        settings.model_id.clone()
+    }
+}
+
+fn active_speech_name(settings: &Settings) -> String {
+    if is_online_audio(settings) {
+        active_speech_id(settings)
+    } else {
+        models::find(&settings.model_id)
+            .map(|m| m.name)
+            .unwrap_or_else(|| settings.model_id.clone())
+    }
+}
+
+fn active_speech_engine_label(settings: &Settings) -> String {
+    if is_online_audio(settings) {
+        audio_host_label(&settings.audio_api_base).to_owned()
+    } else {
+        models::find(&settings.model_id)
+            .map(|m| m.engine.label().to_owned())
+            .unwrap_or_else(|| "Local".to_owned())
+    }
+}
+
+fn active_speech_ready(settings: &Settings, data_dir: &Path) -> bool {
+    if is_online_audio(settings) {
+        !settings.audio_api_model.trim().is_empty()
+    } else {
+        models::find(&settings.model_id)
+            .is_some_and(|m| m.is_downloaded(data_dir))
+    }
+}
+
+fn active_speech_source(settings: &Settings) -> &'static str {
+    if is_online_audio(settings) {
+        "online"
+    } else {
+        "local"
+    }
+}
+
 #[tauri::command]
 fn get_status(state: State<'_, Mutex<AppState>>) -> Status {
     let s = state.lock().unwrap();
@@ -1561,7 +1635,7 @@ fn get_status(state: State<'_, Mutex<AppState>>) -> Status {
         recording: s.recording,
         model_id: s.settings.model_id.clone(),
         engine,
-        engine_label: engine.label().to_owned(),
+        engine_label: active_speech_engine_label(&s.settings),
         model_loaded: models::find(&s.settings.model_id)
             .is_some_and(|m| m.is_downloaded(&s.data_dir)),
         whisper_binary: resolve_binary(&s.data_dir).map(|p| p.display().to_string()),
@@ -1573,6 +1647,10 @@ fn get_status(state: State<'_, Mutex<AppState>>) -> Status {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         recommended_model: onboarding::recommended_model_id().to_owned(),
         transcribing: s.transcribing,
+        speech_source: active_speech_source(&s.settings).to_owned(),
+        speech_model: active_speech_id(&s.settings),
+        speech_model_name: active_speech_name(&s.settings),
+        speech_ready: active_speech_ready(&s.settings, &s.data_dir),
     }
 }
 
@@ -1585,7 +1663,7 @@ fn get_models(state: State<'_, Mutex<AppState>>) -> Vec<ModelStatus> {
             let id = entry.id.clone();
             ModelStatus {
                 downloaded: entry.is_downloaded(&s.data_dir),
-                active: id == s.settings.model_id,
+                active: !is_online_audio(&s.settings) && id == s.settings.model_id,
                 downloading: s.downloading.contains_key(&id),
                 entry,
             }
@@ -1598,6 +1676,8 @@ fn select_model(state: State<'_, Mutex<AppState>>, id: String) -> Result<String,
     let entry = models::find(&id).ok_or_else(|| format!("unknown model: {id}"))?;
     let mut s = state.lock().unwrap();
     s.settings.model_id = id.clone();
+    // Catalog "Use" means this local model — leave the online API.
+    s.settings.audio_backend = "local".to_owned();
     s.save_settings();
     // Warm up Parakeet in the background so the first dictation doesn't pay
     // the model-load cost (mirrors SpeakType's warmUp).
@@ -2346,11 +2426,12 @@ async fn stop_transcribe(
 ) -> Result<String, String> {
 
     // Snapshot everything the heavy work needs, then release the lock.
-    let (input, parakeet, duration_secs, model_id, audio, cleanup) = {
+    let (input, parakeet, duration_secs, history_model, audio, cleanup) = {
         let mut s = state.lock().unwrap();
         s.hotkey_owned = false;
         let (wav, duration_secs) = stop_and_save_wav(&mut s).map_err(|e| e.to_string())?;
         let model_id = s.settings.model_id.clone();
+        let history_model = active_speech_id(&s.settings);
         let cleanup = s.settings.cleanup.clone();
         let audio = wav.display().to_string();
         let input = TranscribeInput {
@@ -2363,7 +2444,7 @@ async fn stop_transcribe(
             dictionary: text::load_dictionary(&s.data_dir),
             polish: polish_cfg(&s.settings, &s.data_dir),
         };
-        (input, s.transcriber.clone(), duration_secs, model_id, audio, cleanup)
+        (input, s.transcriber.clone(), duration_secs, history_model, audio, cleanup)
     };
     set_transcribing(app, true);
     let _ = app.emit("dictflow://recording", false);
@@ -2391,7 +2472,7 @@ async fn stop_transcribe(
             text: result.text,
             raw_text: result.raw_text,
             duration_secs,
-            model: model_id,
+            model: history_model,
             audio_path: Some(audio),
             dict_hits: result.dict_hits,
             cleanup,
@@ -2468,7 +2549,7 @@ async fn transcribe_file(
     let result = result.unwrap();
     {
         let mut s = state.lock().unwrap();
-        let model = s.settings.model_id.clone();
+        let model = active_speech_id(&s.settings);
         let cleanup = s.settings.cleanup.clone();
         s.push_history(NewHistory {
             text: result.text.clone(),
@@ -3011,6 +3092,39 @@ mod tests {
             onboarding::recommended_model_id(),
             models::default_model_id()
         );
+    }
+
+    #[test]
+    fn local_speech_uses_catalog_name() {
+        let s = Settings::default();
+        assert_eq!(active_speech_source(&s), "local");
+        assert_eq!(active_speech_id(&s), models::default_model_id());
+        assert_eq!(active_speech_name(&s), "Parakeet TDT 0.6B v3");
+        assert_eq!(active_speech_engine_label(&s), "Parakeet");
+    }
+
+    #[test]
+    fn online_speech_uses_api_model_name() {
+        let mut s = Settings::default();
+        s.audio_backend = "openai_compat".to_owned();
+        s.audio_api_base = "https://api.groq.com/openai/v1".to_owned();
+        s.audio_api_model = "whisper-large-v3-turbo".to_owned();
+        assert_eq!(active_speech_source(&s), "online");
+        assert_eq!(active_speech_id(&s), "whisper-large-v3-turbo");
+        assert_eq!(active_speech_name(&s), "whisper-large-v3-turbo");
+        assert_eq!(active_speech_engine_label(&s), "Groq");
+        assert!(active_speech_ready(&s, Path::new(".")));
+    }
+
+    #[test]
+    fn online_speech_empty_model_is_not_ready() {
+        let mut s = Settings::default();
+        s.audio_backend = "openai_compat".to_owned();
+        s.audio_api_model = "  ".to_owned();
+        assert_eq!(active_speech_id(&s), "online model");
+        assert!(!active_speech_ready(&s, Path::new(".")));
+        assert_eq!(audio_host_label("https://api.openai.com/v1"), "OpenAI");
+        assert_eq!(audio_host_label("http://127.0.0.1:8080/v1"), "Online");
     }
 
     #[test]

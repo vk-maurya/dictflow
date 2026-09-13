@@ -341,6 +341,7 @@ label.check { display: flex; gap: 9px; align-items: center; cursor: pointer; }
 }
 .badge.parakeet { background: #dcefe2; color: #2e6b45; }
 .badge.whisper { background: #e3e9f7; color: #3c55a0; }
+.badge.api { background: #ece8fb; color: #4b3f78; }
 .essence { font-size: 12.5px; color: #6a6350; font-weight: 600; }
 .meter { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
 .meter .bar { flex: 1; height: 6px; background: #efece6; border-radius: 4px; overflow: hidden; }

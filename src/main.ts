@@ -125,6 +125,52 @@ function audioHostId(base: string): string {
   return "custom";
 }
 
+function audioHostLabel(base: string): string {
+  const id = audioHostId(base);
+  if (id === "groq") return "Groq";
+  if (id === "openai") return "OpenAI";
+  return "Online";
+}
+
+/** Live speech source: local catalog name, or the online API model name. */
+function activeSpeech(): {
+  id: string;
+  name: string;
+  engineLabel: string;
+  languages: string;
+  ready: boolean;
+  online: boolean;
+} {
+  const online = settings?.audio_backend === "openai_compat";
+  if (online) {
+    const name = (settings?.audio_api_model ?? "").trim() || "online model";
+    return {
+      id: name,
+      name,
+      engineLabel: audioHostLabel(settings?.audio_api_base ?? ""),
+      languages: "via API",
+      ready: Boolean((settings?.audio_api_model ?? "").trim()),
+      online: true,
+    };
+  }
+  const m = models.find((x) => x.id === status?.model_id);
+  return {
+    id: status?.model_id ?? "",
+    name: m?.name ?? status?.speech_model_name ?? status?.model_id ?? "No model",
+    engineLabel: status?.engine_label ?? "Local",
+    languages: m?.languages ?? "",
+    ready: Boolean(status?.model_loaded),
+    online: false,
+  };
+}
+
+function historyModelLabel(id: string): { name: string; engine: string } {
+  if (!id) return { name: "", engine: "" };
+  const m = models.find((x) => x.id === id);
+  if (m) return { name: m.name, engine: m.engine };
+  return { name: id, engine: "api" };
+}
+
 function processPromptFor(preset: string, custom: string): string {
   if (preset === "custom" && custom.trim()) return custom;
   return provider?.prompt_presets?.[preset] || provider?.default_prompt || DEFAULT_PROCESS_PROMPT;
@@ -156,6 +202,10 @@ interface Status {
   version: string;
   recommended_model: string;
   transcribing: boolean;
+  speech_source?: string;
+  speech_model?: string;
+  speech_model_name?: string;
+  speech_ready?: boolean;
 }
 interface DlProgress {
   model_id: string;
@@ -581,6 +631,7 @@ async function refreshSettings(): Promise<void> {
   if (s) {
     settings = s;
     if (view === "settings") renderView();
+    paintStatusBits();
   }
 }
 
@@ -646,13 +697,15 @@ function paintStatusBits(): void {
   if (dot) {
     dot.className =
       "status-dot " +
-      (status.recording ? "dot-red" : transcribing ? "dot-amber" : status.model_loaded ? "dot-green" : "dot-gray");
+      (status.recording ? "dot-red" : transcribing ? "dot-amber" : activeSpeech().ready ? "dot-green" : "dot-gray");
   }
   const ft = document.getElementById("side-model");
   if (ft) {
-    const m = models.find((x) => x.id === status!.model_id);
-    ft.textContent = `${status.engine_label} • ${m?.name ?? status.model_id}`;
+    const speech = activeSpeech();
+    ft.textContent = `${speech.engineLabel} • ${speech.name}`;
   }
+  const pill = document.getElementById("side-pill");
+  if (pill) pill.textContent = activeSpeech().online ? "Online" : "Offline";
   const ms = document.getElementById("mic-state");
   if (ms) {
     const key = talkKey();
@@ -703,6 +756,7 @@ async function selectModel(id: string): Promise<void> {
   await refreshModels();
   await refreshStatus();
   await refreshSettings();
+  if (view !== "models" && view !== "onboard") renderView();
 }
 
 async function copyText(t: string): Promise<void> {
@@ -787,25 +841,38 @@ function meter(label: string, value: number): string {
 }
 
 function viewDictate(): string {
-  const m = models.find((x) => x.id === status?.model_id);
+  const speech = activeSpeech();
   const last = lastResult
     ? `<div class="card"><h3>Last result</h3><div class="result-box">${esc(lastResult)}</div>
        <div class="row" style="margin-top:10px"><button class="ghost small" id="copy-last">Copy</button></div></div>`
     : "";
   const warn =
-    status && !status.model_loaded
+    !speech.ready
       ? `<div class="card warn-card"><h3>No model ready</h3>
-         <p class="muted">Download <b>${esc(m?.name ?? status.model_id)}</b> from AI Models first — everything runs offline after that.</p>
+         <p class="muted">${
+           speech.online
+             ? `Set an API model name on AI Models — speech is currently using the online source.`
+             : `Download <b>${esc(speech.name)}</b> from AI Models first — everything runs offline after that.`
+         }</p>
          <button class="small" id="goto-models">Open AI Models</button></div>`
       : "";
   const whisperWarn =
-    status && status.engine === "whisper" && status.model_loaded && !status.whisper_binary
+    !speech.online && status && status.engine === "whisper" && status.model_loaded && !status.whisper_binary
       ? `<div class="card warn-card"><h3>Whisper engine needs its binary</h3>
          <p class="muted">Place <code>whisper-cli.exe</code> (whisper.cpp build) in <code>${esc(status.data_dir)}\\bin</code> or on PATH. Parakeet models need no binary.</p></div>`
       : "";
+  const using = speech.name
+    ? speech.online
+      ? ` • Using <b>${esc(speech.name)}</b> (${esc(speech.engineLabel)})`
+      : ` • Using <b>${esc(speech.name)}</b>${speech.languages ? ` (${esc(speech.languages)})` : ""}`
+    : "";
   return `
     <h1>Dictate</h1>
-    <p class="page-sub">Press the mic, speak, press again — text lands in whatever app has focus. 100% offline.</p>
+    <p class="page-sub">${
+      speech.online
+        ? `Press the mic, speak, press again — text lands in the focused app. Speech uses <b>${esc(speech.name)}</b> via ${esc(speech.engineLabel)}.`
+        : "Press the mic, speak, press again — text lands in whatever app has focus. 100% offline."
+    }</p>
     ${warn}${whisperWarn}
     <div class="card">
       <div class="mic-wrap">
@@ -814,7 +881,7 @@ function viewDictate(): string {
         <div class="rec-timer" id="rec-timer" hidden></div>
       </div>
       <p class="hotkey-hint muted">Talk key <code>${talkHold() ? `hold ${talkKey()}` : talkKey()}</code> works from any app
-      ${m ? ` • Using <b>${esc(m.name)}</b> (${esc(m.languages)})` : ""}
+      ${using}
       • Esc cancels this take
       • Paste last <code>${esc(settings?.paste_last_key ?? "Shift+Alt+Z")}</code>
       • Copy last <code>${esc(settings?.copy_last_key ?? "Shift+Alt+X")}</code></p>
@@ -836,12 +903,14 @@ function viewModels(): string {
         }</button>`
     )
     .join("");
+  const speech = activeSpeech();
   const cards = models
     .filter((m) => modelFilter === "all" || m.engine === modelFilter)
     .map((m) => {
+      const inUse = !speech.online && m.id === (settings?.model_id ?? status?.model_id);
       const dl = dlBars[m.id] ?? (m.downloading ? { file: "queued…", pct: null } : null);
       const action =
-        m.active && m.downloaded
+        inUse && m.downloaded
           ? `<button class="ghost small" disabled>In use</button>`
           : dl
             ? `<button class="ghost small" data-cancel-dl="${m.id}">Cancel</button>`
@@ -854,7 +923,7 @@ function viewModels(): string {
              dl.pct != null ? ` — ${dl.pct}%` : ""
            }</div>`
         : "";
-      return `<div class="model-card${m.active ? " active" : ""}">
+      return `<div class="model-card${inUse ? " active" : ""}">
         <div class="model-top">
           <div><div class="model-name">${esc(m.name)}</div>
           <div class="muted" style="font-size:12px">${esc(m.languages)} • ${esc(m.size_label)}</div></div>
@@ -997,8 +1066,8 @@ function viewSetup(): string {
       : micTest.peak > 0.02
         ? `<p style="color:var(--green)">Microphone working — <b>${esc(micTest.device)}</b> at ${(micTest.sample_rate / 1000).toFixed(1)} kHz, peak ${(micTest.peak * 100).toFixed(0)}% over ${micTest.duration_secs.toFixed(1)}s.</p>`
         : `<p style="color:var(--amber)">Frames arrive from <b>${esc(micTest.device)}</b> but only silence (peak ${(micTest.peak * 100).toFixed(1)}%) — unmute the mic and raise its input level in Windows Sound settings.</p>`;
-  const m = models.find((x) => x.id === status?.model_id);
-  const modelOk = status?.model_loaded;
+  const speech = activeSpeech();
+  const modelOk = speech.ready;
   return `
     <h1>Setup</h1>
     <p class="page-sub">Windows has no macOS-style permission popups — everything here is a check, not a grant.</p>
@@ -1021,7 +1090,11 @@ function viewSetup(): string {
       Toggle it in Settings → Auto-paste.</p>
     </div>
     <div class="card"><h3>3 · Speech model</h3>
-      <p>${modelOk ? `<b>${esc(m?.name ?? "")}</b> ready.` : "No model ready yet."}</p>
+      <p>${
+        modelOk
+          ? `<b>${esc(speech.name)}</b> ready${speech.online ? ` via ${esc(speech.engineLabel)}` : ""}.`
+          : "No model ready yet."
+      }</p>
       <button class="small ghost" id="setup-models">Open AI Models</button>
     </div>`;
 }
@@ -1048,12 +1121,12 @@ function renderHistoryList(): void {
   box.innerHTML = items
     .map((h) => {
       const idx = history.indexOf(h);
-      const m = models.find((x) => x.id === h.model);
+      const used = historyModelLabel(h.model);
       return `<div class="hist-item">
         <div class="hist-text">${esc(h.text)}</div>
         <div class="hist-meta">
           <span>${fmtDate(h.date_unix)}</span>
-          ${h.model ? `<span class="badge ${m?.engine ?? ""}">${esc(m?.name ?? h.model)}</span>` : ""}
+          ${h.model ? `<span class="badge ${used.engine}">${esc(used.name)}</span>` : ""}
           ${h.duration_secs ? `<span>${fmtDur(h.duration_secs)}</span>` : ""}
           <span>${wordCount(h.text)} words</span>
           <span class="spacer"></span>
@@ -1184,8 +1257,8 @@ function viewHome(): string {
   const wpm = calcWpm(all.words, all.audio_secs);
   const q = homeQuery.trim().toLowerCase();
   const items = (q ? history.filter((h) => h.text.toLowerCase().includes(q)) : history).slice(0, 60);
-  const ready = Boolean(status?.model_loaded);
-  const m = models.find((x) => x.id === status?.model_id);
+  const speech = activeSpeech();
+  const ready = speech.ready;
   const groups: { head: string; items: { h: HistoryItem; idx: number }[] }[] = [];
   for (const h of items) {
     const head = dayHeading(h.date_unix);
@@ -1218,7 +1291,9 @@ function viewHome(): string {
           <h2>${ready ? "Dictate anywhere on Windows" : "Set up DictFlow in a minute"}</h2>
           <p>${
             ready
-              ? `Hold ${esc(talkKey())} and speak. Text lands in the focused app. Everything stays on this PC.`
+              ? speech.online
+                ? `Hold ${esc(talkKey())} and speak. Audio is transcribed by <b>${esc(speech.name)}</b> via ${esc(speech.engineLabel)}.`
+                : `Hold ${esc(talkKey())} and speak. Text lands in the focused app. Everything stays on this PC.`
               : "Download a speech model first. After that, dictation is fully offline."
           }</p>
           <div><button class="light" id="${ready ? "hero-dictate" : "goto-models"}">${ready ? "Start now" : "Open AI Models"}</button></div>
@@ -1230,8 +1305,14 @@ function viewHome(): string {
         <div class="rail-stat"><div class="n">${wpm || "—"}</div><div class="c">wpm</div></div>
         <div class="rail-stat"><div class="n">${current || 0}</div><div class="c">day streak</div></div>
         <div class="rail-card">
-          <h4>${ready ? esc(m?.name ?? "Model ready") : "No model yet"}</h4>
-          <p>${ready ? "Hold the talk key in any app. Text never leaves this PC." : "Download a model from AI Models to start dictating offline."}</p>
+          <h4>${ready ? esc(speech.name) : "No model yet"}</h4>
+          <p>${
+            ready
+              ? speech.online
+                ? `Hold the talk key in any app. Speech uses ${esc(speech.engineLabel)} (${esc(speech.name)}).`
+                : "Hold the talk key in any app. Text never leaves this PC."
+              : "Download a model from AI Models to start dictating offline."
+          }</p>
           <button class="accent small" id="goto-history">View history</button>
         </div>
       </aside>
@@ -1247,8 +1328,8 @@ function viewStats(): string {
   });
   const rows = [...perModel.entries()]
     .map(([id, n]) => {
-      const m = models.find((x) => x.id === id);
-      return `<div class="dict-row"><div class="dict-rule">${esc(m?.name ?? (id || "unknown"))}</div><b>${n}</b></div>`;
+      const used = historyModelLabel(id);
+      return `<div class="dict-row"><div class="dict-rule">${esc(used.name || "unknown")}</div><b>${n}</b></div>`;
     })
     .join("");
   const { current, longest } = streakInfo();
@@ -1284,9 +1365,17 @@ function viewStats(): string {
 
 function viewSettings(): string {
   if (!settings) return `<div class="empty">Loading…</div>`;
-  const modelOpts = models
-    .map((m) => `<option value="${m.id}" ${m.id === settings!.model_id ? "selected" : ""}>${esc(m.name)} (${m.engine})${m.downloaded ? "" : " — not downloaded"}</option>`)
-    .join("");
+  const speech = activeSpeech();
+  const modelOpts =
+    (speech.online
+      ? `<option value="__online__" selected>Online · ${esc(speech.name)} (${esc(speech.engineLabel)})</option>`
+      : "") +
+    models
+      .map(
+        (m) =>
+          `<option value="${m.id}" ${!speech.online && m.id === settings!.model_id ? "selected" : ""}>${esc(m.name)} (${m.engine})${m.downloaded ? "" : " — not downloaded"}</option>`
+      )
+      .join("");
   const langOpts = LANGUAGES.map(
     ([v, l]) => `<option value="${v}" ${settings!.language === v ? "selected" : ""}>${l}</option>`
   ).join("");
@@ -1319,7 +1408,11 @@ function viewSettings(): string {
     <h1>Settings</h1>
     <p class="page-sub">Everything stays on this PC. No accounts, no telemetry.</p>
     <div class="card"><h3>Transcription</h3>
-      <div class="set-row"><div><b>Model</b><div class="desc">Parakeet v3 is the best all-rounder; Whisper needs its binary (below).</div></div>
+      <div class="set-row"><div><b>Model</b><div class="desc">${
+        speech.online
+          ? `Speech uses <b>${esc(speech.name)}</b> via ${esc(speech.engineLabel)}. Pick a local model below to switch back.`
+          : `Currently <b>${esc(speech.name)}</b>. Parakeet v3 is the best all-rounder; Whisper needs its binary (below).`
+      }</div></div>
         <select id="set-model">${modelOpts}</select></div>
       <div class="set-row"><div><b>Language</b><div class="desc">Whisper source language. Parakeet v3 auto-detects.</div></div>
         <select id="set-lang">${langOpts}</select></div>
@@ -1423,7 +1516,7 @@ function viewOnboard(): string {
     body = `<h1>Speech model</h1>
       <p class="page-sub">Parakeet v3 is the recommended all-rounder (~670 MB, 25 languages). After this, dictation is fully offline.</p>
       <div class="card">
-        <div class="model-name">${esc(rec?.name ?? "Parakeet TDT 0.6B v3")}</div>
+        <div class="model-name">${esc(rec?.name ?? recId)}</div>
         <p class="muted">${esc(rec?.essence ?? "Best all-rounder")} • ${esc(rec?.size_label ?? "~670 MB")}</p>
         ${progress}
         <div class="row" style="margin-top:12px">
@@ -1457,7 +1550,7 @@ function render(): void {
       <div class="brand">
         <div class="brand-mark"><img src="${logoUrl}" alt="DictFlow logo"></div>
         <div class="brand-name">DictFlow</div>
-        <span class="brand-pill">Offline</span>
+        <span class="brand-pill" id="side-pill">${activeSpeech().online ? "Online" : "Offline"}</span>
       </div>
       <nav class="nav">${NAV_MAIN.map(navBtn).join("")}</nav>
       <nav class="nav nav-foot">${NAV_FOOT.map(navBtn).join("")}</nav>
@@ -1602,6 +1695,8 @@ function bindView(): void {
     const key = (document.getElementById("audio-key") as HTMLInputElement | null)?.value ?? "";
     if (key.trim()) await call("set_provider_secrets", { audioApiKey: key, llmApiKey: null });
     await refreshProvider();
+    await refreshStatus();
+    await refreshModels();
     toast("Audio source saved", "success");
     renderView();
   };
@@ -1867,9 +1962,11 @@ function bindView(): void {
   const scap = document.getElementById("set-cap") as HTMLInputElement | null;
   const saveSettings = async () => {
     if (!settings || !sm || !sl || !sp || !sc || !st || !sk || !smo) return;
+    const pickLocal = sm.value && sm.value !== "__online__";
     const next: Settings = {
       ...settings,
-      model_id: sm.value,
+      model_id: pickLocal ? sm.value : settings.model_id,
+      audio_backend: pickLocal ? "local" : settings.audio_backend,
       language: sl.value,
       auto_paste: sp.checked,
       cleanup: sc.value,
@@ -1888,7 +1985,7 @@ function bindView(): void {
       settings = res;
       await refreshModels();
       await refreshStatus();
-      if (view === "dictate" || view === "settings") renderView();
+      renderView();
     }
   };
   sm?.addEventListener("change", saveSettings);

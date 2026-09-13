@@ -269,25 +269,43 @@ fn client(timeout_ms: u64) -> Result<reqwest::blocking::Client> {
         .context("http client")
 }
 
+pub struct PolishArgs<'a> {
+    pub backend: &'a str,
+    pub base_url: &'a str,
+    pub api_key: &'a str,
+    pub model: &'a str,
+    pub preset: &'a str,
+    pub custom_prompt: &'a str,
+    pub temperature: f32,
+    pub timeout_ms: u64,
+    pub text: &'a str,
+}
+
 /// Returns polished text, or None so the caller pastes the raw/rules text.
-pub fn polish(
-    backend: &str,
-    base_url: &str,
-    api_key: &str,
-    model: &str,
-    preset: &str,
-    custom_prompt: &str,
-    temperature: f32,
-    timeout_ms: u64,
-    text: &str,
-) -> Option<String> {
-    if backend == "off" || text.trim().is_empty() {
+pub fn polish(args: &PolishArgs<'_>) -> Option<String> {
+    if args.backend == "off" || args.text.trim().is_empty() {
         return None;
     }
-    let system = system_prompt(preset, custom_prompt);
-    let result = match backend {
-        "anthropic" => polish_anthropic(base_url, api_key, model, timeout_ms, temperature, &system, text),
-        _ => polish_openai(base_url, api_key, model, timeout_ms, temperature, &system, text),
+    let system = system_prompt(args.preset, args.custom_prompt);
+    let result = match args.backend {
+        "anthropic" => polish_anthropic(
+            args.base_url,
+            args.api_key,
+            args.model,
+            args.timeout_ms,
+            args.temperature,
+            &system,
+            args.text,
+        ),
+        _ => polish_openai(
+            args.base_url,
+            args.api_key,
+            args.model,
+            args.timeout_ms,
+            args.temperature,
+            &system,
+            args.text,
+        ),
     };
     match result {
         Ok(s) if !s.trim().is_empty() => Some(s),
@@ -369,17 +387,17 @@ pub fn ping_llm(
     model: &str,
     timeout_ms: u64,
 ) -> Result<String> {
-    polish(
+    polish(&PolishArgs {
         backend,
         base_url,
         api_key,
         model,
-        "clean",
-        "",
-        0.0,
+        preset: "clean",
+        custom_prompt: "",
+        temperature: 0.0,
         timeout_ms,
-        "ping",
-    )
+        text: "ping",
+    })
     .context("LLM returned empty")
 }
 
@@ -439,7 +457,18 @@ mod tests {
 
     #[test]
     fn polish_off_is_none() {
-        assert!(polish("off", "", "", "", "clean", "", 0.2, 1000, "hello").is_none());
+        assert!(polish(&PolishArgs {
+            backend: "off",
+            base_url: "",
+            api_key: "",
+            model: "",
+            preset: "clean",
+            custom_prompt: "",
+            temperature: 0.2,
+            timeout_ms: 1000,
+            text: "hello",
+        })
+        .is_none());
     }
 
     #[test]
