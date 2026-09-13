@@ -4,6 +4,9 @@ on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -29,6 +32,26 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "DictFlow ${{ github.ref_name }}"
-          releaseBody: "Offline voice dictation for Windows. See README for setup."
+          releaseBody: |
+            Offline voice dictation for Windows.
+
+            - **DictFlow_*_x64-setup.exe** — installer (recommended)
+            - **DictFlow-*-windows-x64-portable.exe** — double-click, no installer
+            - **.msi** — optional enterprise install
+
+            WebView2 is required (preinstalled on Windows 10/11). Models download
+            on first use into `%APPDATA%\dictflow`. See README for setup.
           releaseDraft: true
           prerelease: false
+
+      - name: Package portable exe
+        id: portable
+        shell: pwsh
+        run: |
+          $path = & scripts/package-portable.ps1
+          "path=$path" >> $env:GITHUB_OUTPUT
+
+      - name: Attach portable to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" "${{ steps.portable.outputs.path }}" --clobber

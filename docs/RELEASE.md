@@ -8,43 +8,61 @@ One version, three places — keep them in sync:
 2. `src-tauri/Cargo.toml` → `[package] version`
 3. `src-tauri/tauri.conf.json` → `version`
 
-The app displays `env!("CARGO_PKG_VERSION")` (Settings → About), so the Rust
-version is the source of truth at runtime. Use SemVer (`0.2.0`, `0.3.0`…).
+The app displays `env!("CARGO_PKG_VERSION")` (Settings → About). Use SemVer
+(`0.2.0`, `0.3.0`…).
 
-## What to do for a release
+## What users download
+
+| File | What it is |
+|------|------------|
+| `DictFlow_<ver>_x64-setup.exe` | NSIS installer. Recommended. Current-user install, Start Menu, uninstall. |
+| `DictFlow-<ver>-windows-x64-portable.exe` | Same binary, no installer. Double-click to run. |
+| `DictFlow_<ver>_x64_en-US.msi` | Optional enterprise/IT install. |
+
+The portable build is **not** a USB sidecar: settings, models, and history
+still live in `%APPDATA%\dictflow`. WebView2 is required (already on Win 10/11).
+Both artifacts are unsigned, so SmartScreen may warn.
+
+## How to publish (recommended)
 
 1. Bump the three versions above.
-2. Update the model/engine notes in README if anything changed.
-3. Regenerate icons only if `assets/logo-512.png` changed:
-   `npx tauri icon assets/logo-512.png`.
-4. Full local check: `npm run build`, `cargo clippy … -- -D warnings`,
-   `cargo test`, then `npm run tauri build`.
-5. Find artifacts under `src-tauri/target/release/bundle/`:
-   - `nsis/DictFlow_<ver>_x64-setup.exe` — recommended for users
-   - `msi/DictFlow_<ver>_x64_en-US.msi` — enterprise deployment
-   - `portable/DictFlow.exe` — double-click, no installer (from `build-windows.ps1`)
-6. Smoke-test the NSIS installer on a clean machine/VM (mic + hotkey + one
-   dictation + model download).
-7. Push a tag — CI builds and attaches both installers to a **draft** release:
-   `git tag v0.2.0; git push origin v0.2.0`, then review + publish at
-   GitHub → Releases.
+2. Commit on the branch you want to ship.
+3. Tag and push:
 
-See [`.github/workflows/release.yml`](../.github/workflows/release.yml).
+   ```powershell
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
 
-## In-app update check
+4. GitHub Actions (`.github/workflows/release.yml`) builds on Windows and
+   opens a **draft** release with the installer, MSI, and portable exe.
+5. Open GitHub → Releases, smoke-check the draft, then **Publish**.
 
-`Settings → About → Check for updates` compares the running version against
-the latest GitHub release. It is **disabled** until the repo exists: set
-`UPDATE_CHECK_REPO` in `src-tauri/src/main.rs` to `"owner/repo"`.
+`Settings → About → Check for updates` reads the latest *published* release
+from `vk-maurya/dictflow`. Drafts do not count.
 
-## Code signing (recommended before wide distribution)
+## Local build (optional, no tag)
 
-Unsigned installers trigger Windows SmartScreen warnings. Options:
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
+```
 
-- **Managed identity**: Azure Trusted Signing (pay-per-sign, no HSM to own).
-- **OV/EV certificate**: install to the cert store; Tauri picks it up via
-  env (`WINDOWS_CERTIFICATE_THUMBPRINT`, … — see `tauri-action` docs).
-- Document the chosen thumbprint/secret setup in this file when you adopt one.
+Artifacts land under `src-tauri/target/release/bundle/`:
 
-The updater (`tauri-plugin-updater` + signed bundles) is intentionally not
-wired yet — the manual check above covers v0.2. Add it when signing exists.
+- `nsis/DictFlow_<ver>_x64-setup.exe`
+- `msi/DictFlow_<ver>_x64_en-US.msi`
+- `portable/DictFlow.exe` (easy local double-click)
+- `portable/DictFlow-<ver>-windows-x64-portable.exe` (same file, release name)
+
+You can attach those to a GitHub Release by hand if CI is not used.
+
+## Code signing (later)
+
+Unsigned installers trigger Windows SmartScreen. When you are ready to
+distribute widely:
+
+- Azure Trusted Signing, or an OV/EV certificate via
+  `WINDOWS_CERTIFICATE_THUMBPRINT` (see `tauri-action` docs).
+
+The silent in-app updater (`tauri-plugin-updater`) is not wired yet. The
+manual check in Settings is enough for v0.2.

@@ -48,9 +48,12 @@ Or run everything via [`scripts/build-windows.ps1`](../scripts/build-windows.ps1
   production (`tauri-plugin-log`); the webview forwards console via the same
   pipeline. Release builds are a GUI app (no extra CMD window). Open the log
   dir from `%APPDATA%\dictflow\logs`.
-- **Portable exe**: `scripts/build-windows.ps1` copies
-  `src-tauri/target/release/bundle/portable/DictFlow.exe`. Double-click it —
-  no installer. WebView2 (preinstalled on Windows 10/11) is still required.
+- **Portable exe**: `scripts/build-windows.ps1` (via
+  `scripts/package-portable.ps1`) writes
+  `src-tauri/target/release/bundle/portable/DictFlow.exe` and a versioned
+  `DictFlow-<ver>-windows-x64-portable.exe`. Double-click — no installer.
+  WebView2 (preinstalled on Windows 10/11) is still required. Data still
+  lives in `%APPDATA%\dictflow`. See [RELEASE.md](RELEASE.md) to publish.
 
 ## Troubleshooting
 

@@ -2061,9 +2061,8 @@ fn import_dictionary(
     Ok(entries)
 }
 
-/// Set to `"owner/repo"` once the project is pushed to GitHub to enable the
-/// in-app update check (see docs/RELEASE.md).
-const UPDATE_CHECK_REPO: Option<&str> = None;
+/// GitHub repo used by Settings → About → Check for updates.
+const UPDATE_CHECK_REPO: Option<&str> = Some("vk-maurya/dictflow");
 
 #[derive(Debug, Clone, Serialize)]
 struct UpdateInfo {
