@@ -1,8 +1,8 @@
 //! Model catalog: every downloadable STT model DictFlow ships, for both engines.
 //!
 //! Mirrors SpeakType's `AIModel.availableModels` (names, speed/accuracy scores,
-//! RAM guidance) but targets Windows runtimes: whisper.cpp `ggml` binaries and
-//! sherpa-onnx int8 Parakeet transducer bundles.
+//! RAM guidance). Supports whisper.cpp `ggml` binaries and sherpa-onnx int8
+//! Parakeet transducer bundles on both Windows and macOS.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -191,4 +191,37 @@ pub fn find(id: &str) -> Option<ModelEntry> {
 /// multilingual, best accuracy-per-MB in the catalog.
 pub fn default_model_id() -> String {
     "parakeet-v3".to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn catalog_has_both_engines_with_files() {
+        let all = catalog();
+        assert!(all.iter().any(|m| m.engine == EngineKind::Parakeet));
+        assert!(all.iter().any(|m| m.engine == EngineKind::Whisper));
+        for m in &all {
+            assert!(!m.files.is_empty(), "model {} has no files", m.id);
+            assert!(!m.files.iter().any(|f| f.url.is_empty()));
+        }
+        let whisper = find("base.en").expect("base.en in catalog");
+        assert_eq!(
+            whisper
+                .single_path(Path::new("C:\\data"))
+                .expect("single-file model")
+                .file_name()
+                .unwrap(),
+            "ggml-base.en.bin"
+        );
+    }
+
+    #[test]
+    fn default_model_is_parakeet() {
+        let id = default_model_id();
+        let entry = find(&id).expect("default model in catalog");
+        assert_eq!(entry.engine, EngineKind::Parakeet);
+    }
 }

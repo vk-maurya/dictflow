@@ -103,11 +103,15 @@ fn day_key_now() -> String {
     Local::now().format("%Y-%m-%d").to_string()
 }
 
-/// Write via `<name>.json.tmp` then replace. On Windows `rename` cannot
-/// overwrite, so the destination is removed first.
+/// Write via `<name>.json.tmp` then atomically replace.
+/// On Windows `rename` cannot overwrite an existing file, so the destination
+/// is removed first. On POSIX (macOS, Linux) `rename` is an atomic swap with
+/// no removal needed — removing first would create a brief window where the
+/// file disappears, which is a correctness bug.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, bytes)?;
+    #[cfg(target_os = "windows")]
     if path.exists() {
         std::fs::remove_file(path)?;
     }

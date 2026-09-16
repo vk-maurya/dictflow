@@ -12,8 +12,11 @@ import { enable as autostartEnable, disable as autostartDisable, isEnabled as au
 
 type Engine = "whisper" | "parakeet";
 type View = "home" | "dictate" | "models" | "setup" | "history" | "dictionary" | "stats" | "settings" | "onboard";
-type OnboardStep = "welcome" | "talkkey" | "mictest" | "download";
+type OnboardStep = "welcome" | "permissions" | "talkkey" | "mictest" | "download";
 type StatsPeriod = "today" | "7d" | "30d" | "all";
+
+// Platform detection — synchronous, reliable in Tauri's embedded WebView.
+const isMac = navigator.platform.startsWith("Mac");
 
 interface DayBucket {
   dictations: number;
@@ -236,6 +239,12 @@ interface MicTest {
   channels: number;
   callbacks: boolean;
 }
+interface PermStatus {
+  microphone: boolean;
+  accessibility: boolean;
+  input_monitoring: boolean;
+  talk_key_live: boolean;
+}
 
 // ---------------------------------------------------------------------------
 // State
@@ -262,6 +271,8 @@ let micTest: MicTest | null = null;
 let micTesting = false;
 let onboardStep: OnboardStep = "welcome";
 let livePeak = 0;
+let perms: PermStatus | null = null;
+let talkKeyWasLive = false;
 let dictTab: "vocab" | "snippet" = "vocab";
 let correctingIdx: number | null = null;
 let modelsPane: "audio" | "llm" = "audio";
@@ -330,27 +341,52 @@ const CLEANUPS: [string, string][] = [
   ["full", "Full — fillers + tidy"],
 ];
 
-const HOTKEYS: [string, string][] = [
-  ["RightCtrl", "Right Ctrl (hold)"],
-  ["LeftCtrl", "Left Ctrl (cancels on Ctrl+key)"],
-  ["LeftAlt", "Left Alt (hold)"],
-  ["RightAlt", "Right Alt (hold)"],
-  ["LeftWin", "Left Win (hold)"],
-  ["RightWin", "Right Win (hold)"],
-  ["CtrlWin", "Ctrl + Win (hold both)"],
-  ["ScrollLock", "Scroll Lock"],
-  ["F9", "F9"],
-  ["CtrlAltSpace", "Ctrl + Alt + Space"],
-];
+// Platform-native talk keys only. Windows keeps Win / Scroll Lock;
+// macOS lists Fn / Cmd / Option, plus F9 and Ctrl+Alt+Space as fallbacks.
+const HOTKEYS: [string, string][] = isMac
+  ? [
+      ["Fn", "Fn / Globe (recommended)"],
+      ["RightCtrl", "Right Ctrl"],
+      ["LeftCtrl", "Left Ctrl (cancels on Ctrl+key)"],
+      ["FnCtrl", "Fn + Ctrl"],
+      ["LeftAlt", "Left Option"],
+      ["RightAlt", "Right Option"],
+      ["LeftCmd", "Left Cmd"],
+      ["RightCmd", "Right Cmd"],
+      ["CtrlCmd", "Ctrl + Cmd"],
+      ["F9", "F9"],
+      ["CtrlAltSpace", "Ctrl + Alt + Space"],
+    ]
+  : [
+      ["RightCtrl", "Right Ctrl (hold)"],
+      ["LeftCtrl", "Left Ctrl (cancels on Ctrl+key)"],
+      ["LeftAlt", "Left Alt (hold)"],
+      ["RightAlt", "Right Alt (hold)"],
+      ["LeftWin", "Left Win (hold)"],
+      ["RightWin", "Right Win (hold)"],
+      ["CtrlWin", "Ctrl + Win (hold both)"],
+      ["ScrollLock", "Scroll Lock"],
+      ["F9", "F9"],
+      ["CtrlAltSpace", "Ctrl + Alt + Space"],
+    ];
 
-const UTILITY_KEYS: [string, string][] = [
-  ["Shift+Alt+Z", "Shift + Alt + Z"],
-  ["Shift+Alt+X", "Shift + Alt + X"],
-  ["Ctrl+Alt+Z", "Ctrl + Alt + Z"],
-  ["Ctrl+Alt+X", "Ctrl + Alt + X"],
-  ["Ctrl+Shift+Z", "Ctrl + Shift + Z"],
-  ["Ctrl+Shift+X", "Ctrl + Shift + X"],
-];
+const UTILITY_KEYS: [string, string][] = isMac
+  ? [
+      ["Shift+Alt+Z", "Shift + Option + Z"],
+      ["Shift+Alt+X", "Shift + Option + X"],
+      ["Ctrl+Alt+Z", "Ctrl + Option + Z"],
+      ["Ctrl+Alt+X", "Ctrl + Option + X"],
+      ["Ctrl+Shift+Z", "Ctrl + Shift + Z"],
+      ["Ctrl+Shift+X", "Ctrl + Shift + X"],
+    ]
+  : [
+      ["Shift+Alt+Z", "Shift + Alt + Z"],
+      ["Shift+Alt+X", "Shift + Alt + X"],
+      ["Ctrl+Alt+Z", "Ctrl + Alt + Z"],
+      ["Ctrl+Alt+X", "Ctrl + Alt + X"],
+      ["Ctrl+Shift+Z", "Ctrl + Shift + Z"],
+      ["Ctrl+Shift+X", "Ctrl + Shift + X"],
+    ];
 
 const OVERLAY_EDGES: [string, string][] = [
   ["top", "Top"],
@@ -566,13 +602,20 @@ function paintRecTimer(): void {
   el.textContent = fmtClock((Date.now() - recordStartedAt) / 1000);
 }
 
-function toast(msg: string, kind: "info" | "success" | "error" = "info"): void {
+function toast(msg: string, kind: "info" | "success" | "error" = "info", actionLabel?: string, actionFn?: () => void): void {
   const box = document.getElementById("toasts")!;
   const el = document.createElement("div");
   el.className = `toast ${kind}`;
   el.textContent = msg;
+  if (actionLabel && actionFn) {
+    const btn = document.createElement("button");
+    btn.className = "toast-action";
+    btn.textContent = actionLabel;
+    btn.addEventListener("click", () => { actionFn(); el.remove(); });
+    el.appendChild(btn);
+  }
   box.appendChild(el);
-  setTimeout(() => el.remove(), kind === "error" ? 7000 : 4000);
+  setTimeout(() => el.remove(), kind === "error" ? 10000 : 4000);
 }
 
 async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T | null> {
@@ -653,6 +696,36 @@ async function refreshAudioDevices(): Promise<void> {
   }
 }
 
+async function refreshPermissions(): Promise<void> {
+  if (!isMac) {
+    perms = { microphone: true, accessibility: true, input_monitoring: true, talk_key_live: true };
+    return;
+  }
+  const p = await call<PermStatus>("get_permissions");
+  if (p) applyPerms(p);
+}
+
+function applyPerms(p: PermStatus): void {
+  const becameLive = p.talk_key_live && !talkKeyWasLive;
+  perms = p;
+  talkKeyWasLive = p.talk_key_live;
+  if (becameLive) toast("Talk key is live — hold Fn (or your chosen key) to dictate", "success");
+}
+
+function permBadge(ok: boolean): string {
+  return ok
+    ? `<span class="perm-status ok">Granted</span>`
+    : `<span class="perm-status need">Needed</span>`;
+}
+
+function permRow(kind: string, title: string, desc: string, ok: boolean): string {
+  const action = ok ? "" : `<button class="small" data-perm="${kind}">Enable</button>`;
+  return `<div class="set-row">
+    <div><b>${title}</b> ${permBadge(ok)}<div class="desc">${desc}</div></div>
+    ${action}
+  </div>`;
+}
+
 async function finishOnboarding(): Promise<void> {
   if (!settings) return;
   const res = await call<Settings>("set_settings", { settings: { ...settings, onboarded: true } });
@@ -673,35 +746,49 @@ async function pickAudioDevice(name: string | null): Promise<void> {
   }
 }
 
-/** Display name of the configured talk key. */
-function talkKey(): string {
-  const k = settings?.hotkey_key ?? "RightCtrl";
-  return k === "RightCtrl"
-    ? "Right Ctrl"
-    : k === "LeftCtrl"
-      ? "Left Ctrl"
-      : k === "LeftAlt"
-        ? "Left Alt"
-        : k === "RightAlt"
-          ? "Right Alt"
-          : k === "LeftWin"
-            ? "Left Win"
-            : k === "RightWin"
-              ? "Right Win"
-              : k === "CtrlWin"
-                ? "Ctrl + Win"
-                : k === "ScrollLock"
-                  ? "Scroll Lock"
-                  : k === "F9"
-                    ? "F9"
-                    : "Ctrl + Alt + Space";
+function hotkeySelectOptions(current: string | undefined): [string, string][] {
+  const list: [string, string][] = HOTKEYS.map(([v, l]) => [v, l]);
+  if (current && !list.some(([v]) => v === current)) {
+    list.push([current, talkKeyLabel(current)]);
+  }
+  return list;
 }
 
-/** True when the talk key is a hold-to-talk single key (macOS Fn feel). */
+function talkKeyLabel(k: string): string {
+  switch (k) {
+    case "Fn": return "Fn";
+    case "FnCtrl": return "Fn + Ctrl";
+    case "RightCtrl": return "Right Ctrl";
+    case "LeftCtrl": return "Left Ctrl";
+    case "LeftAlt": return isMac ? "Left Option" : "Left Alt";
+    case "RightAlt": return isMac ? "Right Option" : "Right Alt";
+    case "LeftWin":
+    case "LeftCmd": return isMac ? "Left Cmd" : "Left Win";
+    case "RightWin":
+    case "RightCmd": return isMac ? "Right Cmd" : "Right Win";
+    case "CtrlWin":
+    case "CtrlCmd": return isMac ? "Ctrl + Cmd" : "Ctrl + Win";
+    case "ScrollLock": return "Scroll Lock";
+    case "F9": return "F9";
+    default: return "Ctrl + Alt + Space";
+  }
+}
+
+/** Display name of the configured talk key. */
+function talkKey(): string {
+  const k = settings?.hotkey_key ?? (isMac ? "Fn" : "RightCtrl");
+  const mode = settings?.recording_mode ?? "hold";
+  const label = talkKeyLabel(k);
+  if (mode === "double_tap") return `double-tap ${label}`;
+  return label;
+}
+
+/** True when the talk key is a hold-to-talk single key. */
 function talkHold(): boolean {
+  const mode = settings?.recording_mode ?? "hold";
   return (
-    (settings?.recording_mode ?? "hold") === "hold" &&
-    (settings?.hotkey_key ?? "RightCtrl") !== "CtrlAltSpace"
+    mode === "hold" &&
+    (settings?.hotkey_key ?? (isMac ? "Fn" : "RightCtrl")) !== "CtrlAltSpace"
   );
 }
 
@@ -981,7 +1068,7 @@ function viewModels(): string {
       <p class="page-sub">Optional rewrite after local rules. Default is off — nothing leaves this PC. If the API errors, the rules text is pasted instead.</p>
       ${pane}
       <div class="card provider-card"><h3>LLM backend</h3>
-        <p class="provider-note">Keys are stored in Windows Credential Manager (Generic Credentials: <code>DictFlow/…</code>), never in a settings export or a file on disk. A localhost server can use an empty key.</p>
+        <p class="provider-note">Keys are stored in the ${isMac ? "macOS Keychain" : "Windows Credential Manager"}, never in a settings export or a file on disk. A localhost server can use an empty key.</p>
         <div class="radio-list">
           ${bases.map(([v, l]) => `<label class="check"><input type="radio" name="llm-be" value="${v}" ${be === v ? "checked" : ""}> ${l}</label>`).join("")}
         </div>
@@ -1021,7 +1108,7 @@ function viewModels(): string {
   const s = settings;
   const audioBe = s?.audio_backend ?? "local";
   const audioApi = audioBe === "openai_compat";
-  const micName = settings?.audio_device || status?.audio_device || "the Windows default microphone";
+  const micName = settings?.audio_device || status?.audio_device || (isMac ? "the system default microphone" : "the Windows default microphone");
   return `
     <h1>AI Models</h1>
     <p class="page-sub">Local catalog stays the default. An OpenAI-compatible speech API is opt-in and sends the recording to that host.</p>
@@ -1033,7 +1120,7 @@ function viewModels(): string {
       </div>
       ${
         audioApi
-          ? `<p class="provider-note">The API key is stored in Windows Credential Manager. Use the <code>/v1</code> root (Groq: <code>https://api.groq.com/openai/v1</code>), not the full <code>/audio/transcriptions</code> path. Test records 1.5 seconds from <b>${esc(micName)}</b> and POSTs only if the clip has speech.</p>
+          ? `<p class="provider-note">The API key is stored in the ${isMac ? "macOS Keychain" : "Windows Credential Manager"}. Use the <code>/v1</code> root (Groq: <code>https://api.groq.com/openai/v1</code>), not the full <code>/audio/transcriptions</code> path. Test records 1.5 seconds from <b>${esc(micName)}</b> and POSTs only if the clip has speech.</p>
       <div class="provider-grid">
         <label class="field">Host<select id="audio-host">${AUDIO_HOSTS.map((h) => `<option value="${h.id}" ${audioHostId(s?.audio_api_base ?? "") === h.id ? "selected" : ""}>${h.label}</option>`).join("")}</select></label>
         <label class="field">Base URL<input type="text" id="audio-base" value="${esc(s?.audio_api_base ?? "")}" placeholder="https://api.groq.com/openai/v1"></label>
@@ -1062,11 +1149,14 @@ function historyFiltered(): HistoryItem[] {
 }
 
 function viewSetup(): string {
+  const soundSettingsLabel = isMac ? "System Settings → Sound" : "Windows Sound settings";
   const devRows =
     audioDevices === null
       ? `<div class="empty">Click Refresh to list microphones.</div>`
       : audioDevices.length === 0
-        ? `<div class="empty">No input devices found — check the Windows microphone privacy toggle below.</div>`
+        ? `<div class="empty">No input devices found — ${isMac
+            ? "grant Microphone access in System Settings → Privacy &amp; Security → Microphone, then click Refresh."
+            : "check the Windows microphone privacy toggle below."}</div>`
         : audioDevices
             .map(
               (d) => `<button class="dict-row device-pick${d.is_selected ? " selected" : ""}" data-pick-mic="${esc(d.name)}"><div class="dict-rule"><b>${esc(d.name)}</b>
@@ -1077,22 +1167,38 @@ function viewSetup(): string {
   const verdict = !micTest
     ? ""
     : !micTest.callbacks
-      ? `<p style="color:var(--amber)">Stream opened on <b>${esc(micTest.device)}</b> but zero audio frames arrived. Likely: another app holds the mic exclusively (quit voice apps, retest), or the default endpoint is dead — pick a working mic in Windows Sound settings.</p>`
+      ? `<p style="color:var(--amber)">Stream opened on <b>${esc(micTest.device)}</b> but zero audio frames arrived. Likely: another app holds the mic exclusively (quit voice apps, retest), or the default endpoint is dead — pick a working mic in ${soundSettingsLabel}.</p>`
       : micTest.peak > 0.02
         ? `<p style="color:var(--green)">Microphone working — <b>${esc(micTest.device)}</b> at ${(micTest.sample_rate / 1000).toFixed(1)} kHz, peak ${(micTest.peak * 100).toFixed(0)}% over ${micTest.duration_secs.toFixed(1)}s.</p>`
-        : `<p style="color:var(--amber)">Frames arrive from <b>${esc(micTest.device)}</b> but only silence (peak ${(micTest.peak * 100).toFixed(1)}%) — unmute the mic and raise its input level in Windows Sound settings.</p>`;
+        : `<p style="color:var(--amber)">Frames arrive from <b>${esc(micTest.device)}</b> but only silence (peak ${(micTest.peak * 100).toFixed(1)}%) — unmute the mic and raise its input level in ${soundSettingsLabel}.</p>`;
   const speech = activeSpeech();
   const modelOk = speech.ready;
+  const micPermNote = isMac
+    ? `<p class="muted">macOS asks for microphone permission the first time DictFlow records.
+       Grant it in <b>System Settings → Privacy &amp; Security → Microphone</b> if the dialog didn't appear.</p>`
+    : `<p class="muted">Windows guards the mic with one global toggle:
+       <b>Settings → Privacy &amp; security → Microphone → Let desktop apps access your microphone</b> must be ON.</p>`;
+  const autoPasteNote = isMac
+    ? `<p class="muted">Auto-paste uses Cmd+V. Enable Accessibility below so DictFlow can paste into the app you were typing in.</p>`
+    : `<p class="muted">No accessibility permission needed on Windows — Ctrl+V injection always works.
+       Toggle it in Settings → Auto-paste.</p>`;
+  const macPerms = isMac ? `
+    <div class="card"><h3>macOS permissions</h3>
+      <p class="muted">Same two grants SpeakType uses. Click <b>Enable</b> — allow the macOS prompt, then toggle <b>DictFlow</b> in the Accessibility list (not Terminal). Dev builds from the terminal are wrapped as DictFlow.app so they can appear there.</p>
+      ${permRow("microphone", "Microphone", "Capture your voice for dictation.", !!perms?.microphone)}
+      ${permRow("accessibility", "Accessibility", "Fn talk key + paste Cmd+V. Look for DictFlow in the app list.", !!perms?.accessibility)}
+      ${perms?.talk_key_live ? `<p style="color:var(--green);margin:8px 0 0">Talk key is live — hold Fn to dictate.</p>` : perms?.accessibility ? `<p class="muted" style="margin:8px 0 0">Accessibility granted — attaching the talk key…</p>` : ""}
+    </div>` : "";
   return `
     <h1>Setup</h1>
-    <p class="page-sub">Windows has no macOS-style permission popups — everything here is a check, not a grant.</p>
+    <p class="page-sub">${isMac ? "Enable permissions, then pick a microphone." : "Everything here is a check — no extra permissions needed on Windows."}</p>
+    ${macPerms}
     <div class="card"><h3>1 · Microphone</h3>
-      <p class="muted">Windows guards the mic with one global toggle:
-      <b>Settings → Privacy &amp; security → Microphone → Let desktop apps access your microphone</b> must be ON.</p>
+      ${micPermNote}
       <p class="muted">DictFlow captures from: <b>${esc(status?.audio_device ?? "none found")}</b>
-      ${settings?.audio_device ? ` (preferred: ${esc(settings.audio_device)})` : " (Windows default)"}.</p>
+      ${settings?.audio_device ? ` (preferred: ${esc(settings.audio_device)})` : isMac ? " (system default)" : " (Windows default)"}.</p>
       <div class="row" style="margin-bottom:12px">
-        <button class="ghost small" id="mic-use-default">Use Windows default</button>
+        <button class="ghost small" id="mic-use-default">${isMac ? "Use system default" : "Use Windows default"}</button>
         <button class="small" id="mic-refresh">Refresh devices</button>
         <button class="small" id="mic-open-settings">Open microphone settings</button>
         <button class="small" id="mic-test" ${micTesting ? "disabled" : ""}>${micTesting ? "Testing… speak now" : `${ico("mic")} Test microphone (1.5s)`}</button>
@@ -1101,8 +1207,7 @@ function viewSetup(): string {
       ${devRows}
     </div>
     <div class="card"><h3>2 · Auto-paste</h3>
-      <p class="muted">No accessibility permission needed on Windows — Ctrl+V injection always works.
-      Toggle it in Settings → Auto-paste.</p>
+      ${autoPasteNote}
     </div>
     <div class="card"><h3>3 · Speech model</h3>
       <p>${
@@ -1304,7 +1409,7 @@ function viewHome(): string {
       <div class="home-feed">
         <div class="greeting">${greeting()}</div>
         <div class="hero-banner">
-          <h2>${ready ? "Dictate anywhere on Windows" : "Set up DictFlow in a minute"}</h2>
+          <h2>${ready ? `Dictate anywhere on ${isMac ? "macOS" : "Windows"}` : "Set up DictFlow in a minute"}</h2>
           <p>${
             ready
               ? speech.online
@@ -1401,13 +1506,15 @@ function viewSettings(): string {
   ).join("") +
     `<option value="medium" ${settings.cleanup === "medium" ? "selected" : ""} ${llmReady ? "" : "disabled"}>Medium — LLM clean${llmReady ? "" : " (set Models → LLM)"}</option>
      <option value="high" ${settings.cleanup === "high" ? "selected" : ""} ${llmReady ? "" : "disabled"}>High — LLM professional${llmReady ? "" : " (set Models → LLM)"}</option>`;
-  const hotkeyOpts = HOTKEYS.map(
-    ([v, l]) => `<option value="${v}" ${settings!.hotkey_key === v ? "selected" : ""}>${l}</option>`
-  ).join("");
-  const modeOpts = [["hold", "Hold to talk"], ["toggle", "Toggle"]]
-    .map(([v, l]) => `<option value="${v}" ${settings!.recording_mode === v ? "selected" : ""}>${l}</option>`)
+  const hotkeyOpts = hotkeySelectOptions(settings!.hotkey_key)
+    .map(([v, l]) => `<option value="${v}" ${settings!.hotkey_key === v ? "selected" : ""}>${l}</option>`)
     .join("");
-  const micOpts = `<option value="" ${!settings.audio_device ? "selected" : ""}>Windows default</option>` +
+  const modeOpts = (isMac
+    ? [["hold", "Hold key to talk, release to stop"], ["toggle", "Tap to start, tap to stop"], ["double_tap", "Double-tap to start, tap to stop"]]
+    : [["hold", "Hold to talk"], ["toggle", "Toggle"]]
+  ).map(([v, l]) => `<option value="${v}" ${settings!.recording_mode === v ? "selected" : ""}>${l}</option>`)
+    .join("");
+  const micOpts = `<option value="" ${!settings.audio_device ? "selected" : ""}>${isMac ? "System default" : "Windows default"}</option>` +
     (audioDevices ?? [])
       .map((d) => `<option value="${esc(d.name)}" ${settings!.audio_device === d.name ? "selected" : ""}>${esc(d.name)}${d.is_default ? " (default)" : ""}</option>`)
       .join("");
@@ -1432,7 +1539,7 @@ function viewSettings(): string {
         <select id="set-model">${modelOpts}</select></div>
       <div class="set-row"><div><b>Language</b><div class="desc">Whisper source language. Parakeet v3 auto-detects.</div></div>
         <select id="set-lang">${langOpts}</select></div>
-      <div class="set-row"><div><b>Auto-paste</b><div class="desc">Type the result into the focused app via Ctrl+V right after transcribing.</div></div>
+      <div class="set-row"><div><b>Auto-paste</b><div class="desc">Type the result into the focused app via ${isMac ? "Cmd+V" : "Ctrl+V"} right after transcribing.</div></div>
         <input type="checkbox" id="set-paste" ${settings.auto_paste ? "checked" : ""}></div>
       <div class="set-row"><div><b>Cleanup</b><div class="desc">None / Light / Full are local rules. Medium and High need an LLM (Models → LLM, coming next).</div></div>
         <select id="set-cleanup">${cleanupOpts}</select></div>
@@ -1440,17 +1547,17 @@ function viewSettings(): string {
         <input type="checkbox" id="set-translate" ${settings.translate ? "checked" : ""}></div>
     </div>
     <div class="card"><h3>Talk key</h3>
-      <div class="set-row"><div><b>Key</b><div class="desc">Single-key hold feels like the Mac Fn key. Right Ctrl is the safest default; Scroll Lock / F9 never type anything. Left Ctrl works but every Ctrl+C/S/V briefly opens then discards the mic — the combo needs no polling.</div></div>
+      <div class="set-row"><div><b>Key</b><div class="desc">${isMac ? `<b>Fn / Globe</b> is the most natural macOS choice — works like Apple's built-in dictation key. If Fn conflicts with system dictation, go to System Settings → Keyboard and set "Press Fn key to: Do Nothing". Other single-key options never interfere with typing.` : `Right Ctrl is the safest default. Left Ctrl works but Ctrl+C/S/V briefly opens then discards the mic.`}</div></div>
         <select id="set-hotkey">${hotkeyOpts}</select></div>
-      <div class="set-row"><div><b>Mode</b><div class="desc">Hold: press-and-hold to record, release to transcribe. Toggle: press to start, press again to stop.</div></div>
+      <div class="set-row"><div><b>Mode</b><div class="desc">${isMac ? `<b>Hold</b>: hold to record, release to stop. <b>Tap toggle</b>: tap once to start, tap again to stop. <b>Double-tap</b> (Fn only): double-tap to start continuous dictation, tap once to stop — exactly like Apple dictation.` : `Hold: press-and-hold to record, release to transcribe. Toggle: press to start, press again to stop.`}</div></div>
         <select id="set-mode">${modeOpts}</select></div>
     </div>
     <div class="card"><h3>Microphone</h3>
-      <div class="set-row"><div><b>Input device</b><div class="desc">Leave as Windows default, or pin a headset. If that device is unplugged, the next take falls back automatically.</div></div>
+      <div class="set-row"><div><b>Input device</b><div class="desc">Leave as ${isMac ? "system" : "Windows"} default, or pin a headset. If that device is unplugged, the next take falls back automatically.</div></div>
         <select id="set-mic">${micOpts}</select></div>
     </div>
     <div class="card"><h3>Overlay &amp; shortcuts</h3>
-      <div class="set-row"><div><b>Floating pill</b><div class="desc">Small always-on-top meter. Click to start or stop talking. Drag to dock. Idle is a quiet line; talking draws a gold wave.</div></div>
+      <div class="set-row"><div><b>Floating pill</b><div class="desc">Always-on-top Flow-style meter above the Dock / taskbar. Click to start or stop. Drag to dock an edge.</div></div>
         <input type="checkbox" id="set-overlay" ${settings.overlay_enabled ? "checked" : ""}></div>
       <div class="set-row"><div><b>Dock edge</b><div class="desc">Where the pill sits. Dragging also updates this.</div></div>
         <select id="set-edge">${edgeOpts}</select></div>
@@ -1470,7 +1577,7 @@ function viewSettings(): string {
     <div class="card"><h3>About</h3>
       <div class="set-row"><div><b>Version</b><div class="desc">DictFlow ${esc(status?.version ?? "")} — MIT open source, 100% offline.</div></div>
         <button class="small ghost" id="check-updates">Check for updates</button></div>
-      <div class="set-row"><div><b>Start with Windows</b><div class="desc">Launch minimized to the tray at login.</div></div>
+      <div class="set-row"><div><b>Launch at Login</b><div class="desc">Launch minimized to the tray at login.</div></div>
         <input type="checkbox" id="set-autostart"></div>
     </div>`;
 }
@@ -1480,17 +1587,19 @@ function viewOnboard(): string {
   const rec = models.find((m) => m.id === recId);
   const recReady = Boolean(rec?.downloaded);
   const recDl = dlBars[recId];
-  const hotkeyOpts = HOTKEYS.map(
-    ([v, l]) => `<option value="${v}" ${settings?.hotkey_key === v ? "selected" : ""}>${l}</option>`
-  ).join("");
-  const modeOpts = [["hold", "Hold to talk"], ["toggle", "Toggle"]]
-    .map(([v, l]) => `<option value="${v}" ${settings?.recording_mode === v ? "selected" : ""}>${l}</option>`)
+  const hotkeyOpts = hotkeySelectOptions(settings?.hotkey_key)
+    .map(([v, l]) => `<option value="${v}" ${settings?.hotkey_key === v ? "selected" : ""}>${l}</option>`)
+    .join("");
+  const modeOpts = (isMac
+    ? [["hold", "Hold key to talk, release to stop"], ["toggle", "Tap to start, tap to stop"], ["double_tap", "Double-tap to start, tap to stop"]]
+    : [["hold", "Hold to talk"], ["toggle", "Toggle"]]
+  ).map(([v, l]) => `<option value="${v}" ${settings?.recording_mode === v ? "selected" : ""}>${l}</option>`)
     .join("");
   const devices =
     audioDevices === null
       ? `<p class="muted">Click Refresh to list microphones.</p>`
       : audioDevices.length === 0
-        ? `<p class="muted">No input devices — check the Windows microphone privacy toggle.</p>`
+        ? `<p class="muted">No input devices — check the ${isMac ? "macOS System Settings → Privacy &amp; Security → Microphone" : "Windows Settings → Privacy &amp; security → Microphone"} toggle.</p>`
         : audioDevices
             .map(
               (d) => `<button class="dict-row device-pick${d.is_selected ? " selected" : ""}" data-pick-mic="${esc(d.name)}"><div class="dict-rule"><b>${esc(d.name)}</b></div>${d.is_selected ? `<span class="badge">selected</span>` : ""}</button>`
@@ -1505,17 +1614,36 @@ function viewOnboard(): string {
   if (onboardStep === "welcome") {
     body = `<h1>Welcome to DictFlow</h1>
       <p class="page-sub">Hold a key, speak, and polished text lands in whichever app has focus. After you download a speech model, nothing leaves this PC.</p>
-      <div class="card"><p>Four quick steps: pick a talk key, test the mic, download the recommended model. You can skip any of them.</p></div>`;
+      <div class="card"><p>${
+        isMac
+          ? "A few quick steps: enable macOS permissions, pick a talk key, test the mic, download the recommended model. You can skip any of them."
+          : "Four quick steps: pick a talk key, test the mic, download the recommended model. You can skip any of them."
+      }</p></div>`;
   } else if (onboardStep === "talkkey") {
     body = `<h1>Talk key</h1>
-      <p class="page-sub">Right Ctrl is the safest default — it never types a character. Hold to talk, release to paste.</p>
+      <p class="page-sub">${
+        isMac
+          ? "Fn / Globe is the macOS default — it never types a character. Hold to talk, release to paste. Fn + Ctrl is a good alternative if Fn is already used for system dictation."
+          : "Right Ctrl is the safest default — it never types a character. Hold to talk, release to paste."
+      }</p>
       <div class="card">
         <div class="set-row"><div><b>Key</b></div><select id="on-hotkey">${hotkeyOpts}</select></div>
         <div class="set-row"><div><b>Mode</b></div><select id="on-mode">${modeOpts}</select></div>
       </div>`;
+  } else if (onboardStep === "permissions") {
+    body = `<h1>Permissions</h1>
+      <p class="page-sub">Microphone to hear you. Accessibility for the global Fn key and Cmd+V paste — the same pair SpeakType asks for. Click Enable, allow the prompt, and toggle <b>DictFlow</b> in the list (not Terminal).</p>
+      <div class="card">
+        ${permRow("microphone", "Microphone", "Required to capture your voice.", !!perms?.microphone)}
+        ${permRow("accessibility", "Accessibility", "Required for Fn and paste. DictFlow must appear in the Accessibility app list.", !!perms?.accessibility)}
+        ${perms?.talk_key_live ? `<p style="color:var(--green);margin:8px 0 0">Talk key is live. Continue when you are ready.</p>` : perms?.accessibility ? `<p class="muted" style="margin:8px 0 0">Accessibility granted — attaching the talk key…</p>` : ""}
+      </div>`;
   } else if (onboardStep === "mictest") {
+    const micHint = isMac
+      ? "macOS prompts for microphone access automatically on first use."
+      : "Windows uses one global toggle: Settings → Privacy &amp; security → Microphone → Let desktop apps access your microphone.";
     body = `<h1>Microphone</h1>
-      <p class="page-sub">Windows uses one global toggle: Settings → Privacy &amp; security → Microphone → Let desktop apps access your microphone.</p>
+      <p class="page-sub">${micHint}</p>
       <div class="card">
         <div class="row" style="margin-bottom:12px">
           <button class="small" id="mic-refresh">Refresh devices</button>
@@ -1666,6 +1794,15 @@ function bindView(): void {
   );
   (document.getElementById("mic-use-default") as HTMLButtonElement | null)?.addEventListener("click", () => {
     pickAudioDevice(null);
+  });
+  document.querySelectorAll("[data-perm]").forEach((b) => {
+    (b as HTMLButtonElement).onclick = async () => {
+      const kind = (b as HTMLButtonElement).dataset.perm;
+      if (!kind) return;
+      const res = await call<PermStatus>("request_permission", { kind });
+      if (res) applyPerms(res);
+      if (view === "setup" || view === "onboard") renderView();
+    };
   });
   document.querySelectorAll("[data-use]").forEach((b) =>
     (b as HTMLButtonElement).onclick = () => selectModel((b as HTMLButtonElement).dataset.use!)
@@ -2029,6 +2166,7 @@ function bindView(): void {
   };
   onHotkey?.addEventListener("change", saveOnboardTalk);
   onMode?.addEventListener("change", saveOnboardTalk);
+
   (document.getElementById("on-skip") as HTMLButtonElement | null)?.addEventListener("click", finishOnboarding);
   (document.getElementById("on-back") as HTMLButtonElement | null)?.addEventListener("click", async () => {
     const next = await call<string>("onboard_step", { current: onboardStep, backward: true });
@@ -2057,7 +2195,7 @@ function bindView(): void {
       try {
         if (sa.checked) await autostartEnable();
         else await autostartDisable();
-        toast(sa.checked ? "DictFlow will start with Windows" : "Auto-start off", "success");
+        toast(sa.checked ? `DictFlow will start with ${isMac ? "macOS" : "Windows"}` : "Auto-start off", "success");
       } catch (e) {
         toast(`${e}`, "error");
         sa.checked = !sa.checked;
@@ -2085,7 +2223,7 @@ async function boot(): Promise<void> {
     e.preventDefault();
   });
   render();
-  await Promise.all([refreshStatus(), refreshModels(), refreshHistory(), refreshStats(), refreshDict(), refreshSettings(), refreshAudioDevices(), refreshProvider()]);
+  await Promise.all([refreshStatus(), refreshModels(), refreshHistory(), refreshStats(), refreshDict(), refreshSettings(), refreshAudioDevices(), refreshProvider(), refreshPermissions()]);
   render();
 
   await listen<boolean>("dictflow://recording", (e) => {
@@ -2134,6 +2272,11 @@ async function boot(): Promise<void> {
     toast(from ? `Mic “${from}” gone — using ${to}` : to, "info");
     refreshAudioDevices();
     refreshStatus();
+  });
+
+  await listen<PermStatus>("dictflow://permissions", (e) => {
+    applyPerms(e.payload);
+    if (view === "setup" || view === "onboard" || view === "settings") renderView();
   });
 
   setInterval(refreshStatus, 2000);

@@ -2,7 +2,7 @@ import "./overlay.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { currentMonitor, getCurrentWindow } from "@tauri-apps/api/window";
-import { PhysicalPosition } from "@tauri-apps/api/dpi";
+import { LogicalPosition } from "@tauri-apps/api/dpi";
 
 type Phase = "idle" | "recording" | "transcribing";
 
@@ -141,13 +141,16 @@ async function snapAfterDrag(): Promise<void> {
     if (!mon) return;
     const origin = mon.position;
     const size = mon.size;
+    const scale = mon.scaleFactor || 1;
     const snapped = await invoke<OverlayPose>("snap_overlay", {
-      x: pos.x - origin.x,
-      y: pos.y - origin.y,
-      screenW: size.width,
-      screenH: size.height,
+      x: Math.round((pos.x - origin.x) / scale),
+      y: Math.round((pos.y - origin.y) / scale),
+      screenW: Math.round(size.width / scale),
+      screenH: Math.round(size.height / scale),
     });
-    await win.setPosition(new PhysicalPosition(origin.x + snapped.x, origin.y + snapped.y));
+    await win.setPosition(
+      new LogicalPosition(origin.x / scale + snapped.x, origin.y / scale + snapped.y),
+    );
     await invoke("set_overlay_pose", { edge: snapped.edge, offset: snapped.offset });
   } catch {
     /* pose is best-effort */
