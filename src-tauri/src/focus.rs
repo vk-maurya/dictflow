@@ -45,6 +45,15 @@ pub fn pick_paste_target(
     last_saved.filter(|h| should_remember(*h, ours))
 }
 
+/// Keep the overlay on every Mission Control Space. No-op on Windows
+/// (topmost + tool window is the virtual-desktop equivalent).
+pub fn spawn_overlay_space_follow(app: &tauri::AppHandle) {
+    #[cfg(target_os = "macos")]
+    platform::spawn_overlay_space_follow(app);
+    #[cfg(not(target_os = "macos"))]
+    let _ = app;
+}
+
 /// Make the overlay non-activating so clicks don't steal the caret.
 pub fn make_non_activating(win: &tauri::WebviewWindow) {
     platform::make_non_activating_impl(win);
@@ -245,6 +254,23 @@ mod platform {
         use objc2::runtime::AnyObject;
 
         let w = ns_window as *mut AnyObject;
+        let obj = &*w;
+        // NSPanel can join every Mission Control Space (including other apps'
+        // fullscreen Spaces). NSWindow often stays glued to the launch Space.
+        let panel = objc2::class!(NSPanel);
+        let is_panel = obj.class().instance_size() == panel.instance_size();
+        if is_panel {
+            let _ = AnyObject::set_class(obj, panel);
+        }
+
+        let style: u64 = msg_send![w, styleMask];
+        if is_panel {
+            // NSWindowStyleMaskNonactivatingPanel | UtilityWindow
+            let _: () = msg_send![w, setStyleMask: style | 0x80 | 0x10];
+            let _: () = msg_send![w, setFloatingPanel: true];
+            let _: () = msg_send![w, setBecomesKeyOnlyIfNeeded: true];
+            let _: () = msg_send![w, setWorksWhenModal: true];
+        }
         let _: () = msg_send![w, setOpaque: false];
         let _: () = msg_send![w, setHasShadow: false];
         let cls = objc2::class!(NSColor);
@@ -252,11 +278,30 @@ mod platform {
         if !clear.is_null() {
             let _: () = msg_send![w, setBackgroundColor: clear];
         }
-        // NSFloatingWindowLevel = 3, above normal windows, below the menu bar.
-        let _: () = msg_send![w, setLevel: 3i64];
         let _: () = msg_send![w, setHidesOnDeactivate: false];
-        // CanJoinAllSpaces | IgnoresCycle | FullScreenAuxiliary
-        let _: () = msg_send![w, setCollectionBehavior: 0x141u64];
+        let _: () = msg_send![w, setReleasedWhenClosed: false];
+        // CanJoinAllSpaces | Transient | Stationary | IgnoresCycle | FullScreenAuxiliary
+        let _: () = msg_send![w, setCollectionBehavior: overlay_space_behavior()];
+        // NSStatusWindowLevel = 25, same band as menu extras — survives Space swipes.
+        let _: () = msg_send![w, setLevel: 25i64];
+        let _: () = msg_send![w, orderFrontRegardless];
+    }
+
+    /// CanJoinAllSpaces (1) | Transient (8) | Stationary (0x10) | IgnoresCycle (0x40)
+    /// | FullScreenAuxiliary (0x100). Do not mix with MoveToActiveSpace.
+    pub(crate) const fn overlay_space_behavior() -> u64 {
+        0x1 | 0x8 | 0x10 | 0x40 | 0x100
+    }
+
+    pub fn spawn_overlay_space_follow(app: &tauri::AppHandle) {
+        // Re-apply after Spaces exist; CanJoinAllSpaces is already set on the
+        // overlay NSPanel. A second pass catches launch-time race with Mission
+        // Control assigning the window to the first Space only.
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            crate::tray::apply_overlay_visibility(&app);
+        });
     }
 
     pub fn restore_impl(target: FocusHandle) -> bool {
@@ -323,5 +368,14 @@ mod tests {
     fn paste_ignores_a_stale_dictflow_handle() {
         assert_eq!(pick_paste_target(Some(OVERLAY), Some(MAIN), OURS), None);
         assert_eq!(pick_paste_target(None, None, OURS), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn overlay_joins_all_spaces_bits() {
+        let bits = platform::overlay_space_behavior();
+        assert_eq!(bits & 0x1, 0x1, "CanJoinAllSpaces");
+        assert_eq!(bits & 0x100, 0x100, "FullScreenAuxiliary");
+        assert_eq!(bits & 0x2, 0, "must not set MoveToActiveSpace");
     }
 }

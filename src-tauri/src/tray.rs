@@ -172,6 +172,7 @@ pub(crate) fn apply_overlay_visibility(app: &tauri::AppHandle) {
         ));
     }
     let _ = win.show();
+    let _ = win.set_visible_on_all_workspaces(true);
     focus::make_non_activating(&win);
 }
 
