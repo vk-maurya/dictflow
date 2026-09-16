@@ -69,6 +69,31 @@ pub fn level_from_samples(samples: &[f32]) -> AudioLevel {
     }
 }
 
+/// Vertical-bar count for the SpeakType-style live waveform.
+pub const WAVE_BINS: usize = 40;
+
+/// Peak per equal slice of `samples`, for the floating recording HUD.
+pub fn peak_bins(samples: &[f32], n: usize) -> Vec<f32> {
+    if n == 0 {
+        return Vec::new();
+    }
+    if samples.is_empty() {
+        return vec![0.0; n];
+    }
+    let mut out = vec![0.0f32; n];
+    let len = samples.len();
+    for (i, slot) in out.iter_mut().enumerate() {
+        let start = i * len / n;
+        let end = ((i + 1) * len / n).max(start + 1).min(len);
+        let mut peak = 0.0f32;
+        for s in &samples[start..end] {
+            peak = peak.max(s.abs());
+        }
+        *slot = peak;
+    }
+    out
+}
+
 /// Shorter than this is a tap / empty buffer, not speech.
 pub const MIN_SPEECH_SECS: f64 = 0.25;
 /// Peak below this is treated as silence (Setup uses 0.02 as "working").
@@ -165,6 +190,16 @@ mod tests {
         let loud = level_from_samples(&[0.5, -1.0]);
         assert!((loud.peak - 1.0).abs() < f32::EPSILON);
         assert!(loud.rms > 0.7 && loud.rms < 0.8);
+    }
+
+    #[test]
+    fn peak_bins_split_and_empty() {
+        assert_eq!(peak_bins(&[], 4), vec![0.0, 0.0, 0.0, 0.0]);
+        assert!(peak_bins(&[0.1], 0).is_empty());
+        let bins = peak_bins(&[0.1, 0.2, 0.8, 0.3], 2);
+        assert_eq!(bins.len(), 2);
+        assert!((bins[0] - 0.2).abs() < f32::EPSILON);
+        assert!((bins[1] - 0.8).abs() < f32::EPSILON);
     }
 
     #[test]

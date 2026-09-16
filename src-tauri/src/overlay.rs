@@ -2,8 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PILL_W: i32 = 168;
-pub const PILL_H: i32 = 44;
+/// Overlay window is sized for the expanded recording HUD. The pill morphs
+/// inside it (SpeakType MiniRecorder: idle 58x24, recording ~250x44).
+pub const PILL_W: i32 = 268;
+pub const PILL_H: i32 = 56;
 pub const MARGIN: i32 = 16;
 /// Logical pixels above the screen bottom so the pill clears the Windows
 /// taskbar (~40) and the macOS Dock (~68–80) on Retina displays.
@@ -216,5 +218,11 @@ mod tests {
         assert!(y + PILL_H + 80 <= SH, "must clear a typical taskbar or Dock");
         let (cx, _) = pose_to_xy(DockEdge::Bottom, OFFSET_CENTER, SW, SH, PILL_W, PILL_H);
         assert_eq!(cx, x);
+    }
+
+    #[test]
+    fn window_fits_speaktype_recording_pill() {
+        assert!(PILL_W >= 250, "recording HUD is 250px wide");
+        assert!(PILL_H >= 44, "recording HUD is 44px tall");
     }
 }

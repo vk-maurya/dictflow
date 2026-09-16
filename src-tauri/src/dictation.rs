@@ -21,6 +21,8 @@ use crate::text;
 struct LevelEvent {
     peak: f32,
     rms: f32,
+    bins: Vec<f32>,
+    elapsed: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -80,18 +82,22 @@ pub(crate) fn spawn_record_ticker(app: tauri::AppHandle) {
                     break;
                 };
                 let samples = rec.samples.lock().unwrap();
-                let start = samples.len().saturating_sub(1024);
-                let level = devices::level_from_samples(&samples[start..]);
+                let start = samples.len().saturating_sub(1920);
+                let slice = &samples[start..];
+                let level = devices::level_from_samples(slice);
+                let bins = devices::peak_bins(slice, devices::WAVE_BINS);
                 drop(samples);
                 let elapsed = rec.started_at.elapsed().as_secs_f64();
                 let err = rec.stream_error.load(Ordering::SeqCst);
                 let cap = s.settings.session_cap;
-                (level, elapsed, err, cap)
+                (level, bins, elapsed, err, cap)
             };
-            let (level, elapsed, stream_err, cap) = snap;
+            let (level, bins, elapsed, stream_err, cap) = snap;
             let _ = app.emit("dictflow://level", LevelEvent {
                 peak: level.peak,
                 rms: level.rms,
+                bins,
+                elapsed,
             });
             if stream_err {
                 let st: State<'_, Mutex<AppState>> = app.state();

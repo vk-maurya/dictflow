@@ -84,6 +84,7 @@ mod platform {
     const GWL_EXSTYLE: i32 = -20;
     const WS_EX_NOACTIVATE: isize = 0x0800_0000;
     const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
+    const WS_EX_LAYERED: isize = 0x0008_0000;
     const SWP_NOSIZE: u32 = 0x0001;
     const SWP_NOMOVE: u32 = 0x0002;
     const SWP_NOACTIVATE: u32 = 0x0010;
@@ -110,6 +111,11 @@ mod platform {
         fn GetWindowThreadProcessId(hwnd: *mut c_void, pid: *mut u32) -> u32;
         fn AttachThreadInput(id_attach: u32, id_attach_to: u32, attach: i32) -> i32;
         fn AllowSetForegroundWindow(process_id: u32) -> i32;
+    }
+
+    #[link(name = "dwmapi")]
+    extern "system" {
+        fn DwmExtendFrameIntoClientArea(hwnd: *mut c_void, margins: *const i32) -> i32;
     }
 
     #[link(name = "kernel32")]
@@ -146,13 +152,21 @@ mod platform {
         let Some(h) = hwnd_of_impl(win) else { return; };
         unsafe {
             let style = GetWindowLongPtrW(to_ptr(h), GWL_EXSTYLE);
-            SetWindowLongPtrW(to_ptr(h), GWL_EXSTYLE, style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
+            SetWindowLongPtrW(
+                to_ptr(h),
+                GWL_EXSTYLE,
+                style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+            );
             SetWindowPos(
                 to_ptr(h),
                 to_ptr(HWND_TOPMOST),
                 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
             );
+            // -1 margins: per-pixel alpha so the SpeakType pill is transparent
+            // over the desktop, same as the macOS overlay.
+            let margins = [-1i32; 4];
+            let _ = DwmExtendFrameIntoClientArea(to_ptr(h), margins.as_ptr());
         }
     }
 
