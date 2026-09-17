@@ -33,6 +33,7 @@ mod stats;
 mod sys;
 mod text;
 mod tray;
+mod vad;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -142,6 +143,16 @@ pub fn run() {
             let _ = std::fs::create_dir_all(data_dir.join("bin"));
 
             let transcriber = crate::engine::Transcriber::spawn(data_dir.clone());
+            // Prefetch the ~629 KB Silero VAD model in the background so the
+            // speech gate is live by the first dictation. Best-effort: the
+            // gate falls back to the peak check while the file is missing.
+            {
+                let dd = data_dir.clone();
+                std::thread::Builder::new()
+                    .name("dictflow-vad-prefetch".to_owned())
+                    .spawn(move || crate::vad::ensure_model(&dd))
+                    .ok();
+            }
             let mut st = crate::state::AppState {
                 recording: false,
                 transcribing: false,
