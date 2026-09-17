@@ -29,6 +29,50 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "DictFlow ${{ github.ref_name }}"
-          releaseBody: "Offline voice dictation for Windows. See README for setup."
+          releaseBody: "Offline voice dictation for Windows and macOS. See README for setup."
           releaseDraft: true
           prerelease: false
+
+  build-macos-arm:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - name: Build app (Apple Silicon)
+        run: npx tauri build --target aarch64-apple-darwin
+
+      # Ad-hoc sign the .app so Apple Silicon Macs can launch unsigned binaries.
+      # Users downloading from GitHub Releases still need to run:
+      #   xattr -dr com.apple.quarantine DictFlow.app
+      # or right-click → Open on first launch.
+      - name: Ad-hoc code sign
+        run: |
+          APP=$(find src-tauri/target/aarch64-apple-darwin/release/bundle/macos -name "*.app" | head -1)
+          codesign --force --deep --sign - "$APP"
+
+      - name: Upload release assets
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "DictFlow ${{ github.ref_name }}"
+          releaseBody: "Offline voice dictation for Windows and macOS. See README for setup."
+          releaseDraft: true
+          prerelease: false
+          args: --target aarch64-apple-darwin

@@ -97,6 +97,10 @@ pub fn format_shortcut(s: &ShortcutSpec) -> String {
         parts.push("Alt");
     }
     if s.meta {
+        // Show platform-native label for the meta/super key.
+        #[cfg(target_os = "macos")]
+        parts.push("Cmd");
+        #[cfg(not(target_os = "macos"))]
         parts.push("Win");
     }
     parts.push(s.key.as_str());
