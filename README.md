@@ -1,6 +1,7 @@
 # DictFlow
 
-Offline voice dictation for Windows 10/11. Hold a key, speak, release —
+Offline voice dictation for Windows 10/11 and macOS (Apple Silicon).
+Hold a key, speak, release —
 text lands in whatever app has focus.
 
 Your voice stays on your machine. Your words go wherever you type.
@@ -8,26 +9,29 @@ Nothing leaves your PC unless you turn on an optional online model.
 
 ![DictFlow](assets/screenshot.png)
 
-**Latest:** [v0.2.1](https://github.com/vk-maurya/dictflow/releases/tag/v0.2.1)
+**Latest:** [v0.3.0](https://github.com/vk-maurya/dictflow/releases/tag/v0.3.0)
 
 ## Download
 
 | File | Use this when |
 |---|---|
-| [DictFlow_0.2.1_x64-setup.exe](https://github.com/vk-maurya/dictflow/releases/download/v0.2.1/DictFlow_0.2.1_x64-setup.exe) | Installer (recommended). Start Menu, current-user install, uninstall. |
-| [DictFlow-0.2.1-windows-x64-portable.exe](https://github.com/vk-maurya/dictflow/releases/download/v0.2.1/DictFlow-0.2.1-windows-x64-portable.exe) | No installer. Double-click to run. |
+| [DictFlow_0.3.0_x64-setup.exe](https://github.com/vk-maurya/dictflow/releases/download/v0.3.0/DictFlow_0.3.0_x64-setup.exe) | Windows installer (recommended). Start Menu, current-user install, uninstall. |
+| [DictFlow_0.3.0_x64_en-US.msi](https://github.com/vk-maurya/dictflow/releases/download/v0.3.0/DictFlow_0.3.0_x64_en-US.msi) | Windows MSI package (enterprise installs). |
+| [DictFlow_0.3.0_aarch64.dmg](https://github.com/vk-maurya/dictflow/releases/download/v0.3.0/DictFlow_0.3.0_aarch64.dmg) | macOS (Apple Silicon) disk image. |
 
 [All releases](https://github.com/vk-maurya/dictflow/releases)
 
 The builds are unsigned, so Windows SmartScreen may warn. Choose
-**More info → Run anyway**.
+**More info → Run anyway**. On macOS, clear the quarantine flag after
+installing (`xattr -dr com.apple.quarantine DictFlow.app`) or right-click →
+Open on first launch.
 
-Portable is not a USB-only copy: settings, models, and history still live in
-`%APPDATA%\com.dictflow.app\dictflow`.
+Settings, models, and history live in
+`%APPDATA%\com.dictflow.app\dictflow` (Windows) or the app data dir (macOS).
 
 ## First run
 
-1. Download the installer or the portable exe above.
+1. Download the installer (Windows) or the .dmg (macOS) above.
 2. Open DictFlow. Allow the microphone if Windows asks
    (Settings → Privacy & security → Microphone → desktop apps).
 3. Open **AI Models** and download **Parakeet TDT 0.6B v3** (~670 MB, one time).
