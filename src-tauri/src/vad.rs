@@ -31,8 +31,18 @@ pub const MIN_SPEECH_SECS: f32 = 0.25;
 /// Minimum silence duration the VAD itself enforces between segments.
 pub const MIN_SILENCE_SECS: f32 = 0.30;
 /// Padding kept around the first/last speech edge so the first and last
-/// phoneme are not clipped.
-pub const EDGE_PAD_SECS: f32 = 0.15;
+/// phoneme are not clipped. Deliberately generous, and asymmetric: word
+/// tails fade below the Silero threshold while still being perfectly
+/// transcribable, so the trailing pad is the larger one.
+pub const LEAD_PAD_SECS: f32 = 0.30;
+pub const TRAIL_PAD_SECS: f32 = 0.60;
+/// If detected speech starts/ends within this distance of the buffer edge,
+/// keep through the edge instead of cutting. Leftover edge silence is
+/// harmless to batch STT; a clipped phoneme is not. (Hold-mode takes
+/// typically end right after speech, so the trailing rule covers the
+/// common "last word cut off" report.)
+pub const LEAD_EDGE_SECS: f32 = 1.0;
+pub const TRAIL_EDGE_SECS: f32 = 2.0;
 /// Silero window at 16 kHz.
 pub const WINDOW_SIZE: i32 = 512;
 
@@ -147,7 +157,8 @@ pub fn detect_segments(samples_16k: &[f32], data_dir: &Path) -> Option<Vec<(usiz
     Some(out)
 }
 
-/// First-speech-start minus pad … last-speech-end plus pad, clamped.
+/// First-speech-start minus lead pad … last-speech-end plus trail pad,
+/// clamped, with near-edge speech kept through the buffer edge.
 ///
 /// Interior pauses are untouched: the range spans the islands, it never
 /// stitches them. `None` = no segments.
@@ -155,21 +166,30 @@ pub fn trim_range(
     segments: &[(usize, usize)],
     total_len: usize,
     sample_rate: u32,
-    pad_secs: f32,
 ) -> Option<(usize, usize)> {
     if segments.is_empty() || total_len == 0 || sample_rate == 0 {
         return None;
     }
-    let pad = (pad_secs.max(0.0) * sample_rate as f32) as usize;
+    let sr = sample_rate as f32;
     let first = segments.iter().map(|s| s.0).min()?;
     let last = segments.iter().map(|s| s.1).max()?;
     if first >= total_len || last == 0 || first >= last {
         return None;
     }
-    Some((
-        first.saturating_sub(pad),
-        last.saturating_add(pad).min(total_len),
-    ))
+    let mut start = first.saturating_sub((LEAD_PAD_SECS * sr) as usize);
+    let mut end = last
+        .saturating_add((TRAIL_PAD_SECS * sr) as usize)
+        .min(total_len);
+    if first <= (LEAD_EDGE_SECS * sr) as usize {
+        start = 0;
+    }
+    if last.saturating_add((TRAIL_EDGE_SECS * sr) as usize) >= total_len {
+        end = total_len;
+    }
+    if end <= start {
+        return None;
+    }
+    Some((start, end))
 }
 
 /// Gate + trim used by tests and by the runtime once segments exist.
@@ -199,8 +219,20 @@ pub fn gate_with_segments(
         return Err(BlankAudio::Silence);
     }
     let total = samples_16k.len();
-    match trim_range(segments, total, sample_rate, EDGE_PAD_SECS) {
-        Some((start, end)) if end > start => Ok(samples_16k[start..end].to_vec()),
+    match trim_range(segments, total, sample_rate) {
+        Some((start, end)) if end > start => {
+            log::info!(
+                "vad: {} segment(s), speech {:.2}–{:.2}s of {:.2}s → stt {:.2}s",
+                segments.len(),
+                segments.iter().map(|s| s.0).min().unwrap_or(0) as f32
+                    / sample_rate as f32,
+                segments.iter().map(|s| s.1).max().unwrap_or(0) as f32
+                    / sample_rate as f32,
+                total as f32 / sample_rate as f32,
+                (end - start) as f32 / sample_rate as f32,
+            );
+            Ok(samples_16k[start..end].to_vec())
+        }
         _ => Err(BlankAudio::Silence),
     }
 }
@@ -257,15 +289,6 @@ mod tests {
 
     const SR: u32 = 16_000;
 
-    /// 2 s buffer: 0.5 s silence, 1 s loud "speech", 0.5 s silence.
-    fn padded_speech() -> Vec<f32> {
-        let mut v = vec![0.0; 2 * SR as usize];
-        for s in &mut v[8000..24_000] {
-            *s = 0.4;
-        }
-        v
-    }
-
     #[test]
     fn empty_and_too_short_keep_existing_copy() {
         assert_eq!(
@@ -289,13 +312,21 @@ mod tests {
 
     #[test]
     fn edges_trimmed_with_pad() {
-        let samples = padded_speech();
-        let out = gate_with_segments(&samples, SR, &[(8000, 24_000)]).unwrap();
-        let pad = (EDGE_PAD_SECS * SR as f32) as usize;
-        assert_eq!(out.len(), 16_000 + 2 * pad);
-        // Pad reaches into the surrounding silence.
+        // 5 s buffer, speech at 1.5–2.5 s: clear of both edge rules, so the
+        // plain lead/trail pads apply.
+        let mut samples = vec![0.0; 5 * SR as usize];
+        for s in &mut samples[24_000..40_000] {
+            *s = 0.4;
+        }
+        let out = gate_with_segments(&samples, SR, &[(24_000, 40_000)]).unwrap();
+        let lead = (LEAD_PAD_SECS * SR as f32) as usize;
+        let trail = (TRAIL_PAD_SECS * SR as f32) as usize;
+        assert_eq!(out.len(), 16_000 + lead + trail);
+        // Pads reach into the surrounding silence; speech starts intact.
         assert_eq!(out[0], 0.0);
-        assert_eq!(out[pad], 0.4);
+        assert_eq!(out[lead], 0.4);
+        assert_eq!(out[lead + 16_000 - 1], 0.4);
+        assert_eq!(out[lead + 16_000], 0.0);
         assert_eq!(out[out.len() - 1], 0.0);
     }
 
@@ -312,23 +343,39 @@ mod tests {
         }
         let segs = vec![(8000, 16_000), (24_000, 32_000)];
         let out = gate_with_segments(&samples, SR, &segs).unwrap();
-        let pad = (EDGE_PAD_SECS * SR as f32) as usize;
-        assert_eq!(out.len(), (32_000 + pad) - (8000 - pad));
-        let gap_start = 16_000 - (8000 - pad);
-        let gap_end = 24_000 - (8000 - pad);
-        assert!(out[gap_start..gap_end].iter().all(|&s| s == 0.0));
-        assert_eq!(out[gap_end], 0.4);
+        // Speech starts 0.5 s in (≤ 1 s head rule → start 0) and ends 2 s
+        // from the buffer end (≤ 2 s tail rule → end = total).
+        assert_eq!(out.len(), 4 * SR as usize);
+        assert!(out[16_000..24_000].iter().all(|&s| s == 0.0));
+        assert_eq!(out[24_000], 0.4);
+        assert_eq!(out[31_999], 0.4);
+    }
+
+    #[test]
+    fn near_edge_speech_kept_through_edge() {
+        // The hold-mode case: speech runs almost to key-up. Cutting at the
+        // last segment end would eat the final word's tail.
+        let total = 4 * SR as usize;
+        assert_eq!(
+            trim_range(&[(20_000, 60_000)], total, SR),
+            Some((20_000 - (LEAD_PAD_SECS * SR as f32) as usize, total))
+        );
+        // …and symmetric at the head.
+        assert_eq!(
+            trim_range(&[(4000, 30_000)], total, SR),
+            Some((
+                0,
+                30_000 + (TRAIL_PAD_SECS * SR as f32) as usize
+            ))
+        );
     }
 
     #[test]
     fn trim_range_clamps_and_rejects_degenerate() {
-        assert_eq!(trim_range(&[], 100, SR, EDGE_PAD_SECS), None);
+        assert_eq!(trim_range(&[], 100, SR), None);
         // Pad clamped at both ends.
-        assert_eq!(
-            trim_range(&[(10, 90)], 100, 100, 1.0),
-            Some((0, 100))
-        );
-        assert_eq!(trim_range(&[(90, 10)], 100, SR, EDGE_PAD_SECS), None);
+        assert_eq!(trim_range(&[(10, 90)], 100, 100), Some((0, 100)));
+        assert_eq!(trim_range(&[(90, 10)], 100, SR), None);
     }
 
     #[test]
