@@ -74,10 +74,16 @@ npm run tauri dev
 
 Then download Parakeet v3 in **AI Models** and hold the talk key.
 
-Release build (installer + portable):
+Release build:
 
 ```powershell
+# Windows (installer + portable)
 powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
+```
+
+```bash
+# macOS, Apple Silicon (.app + .dmg, ad-hoc signed)
+bash scripts/build-macos.sh
 ```
 
 ## Documentation
