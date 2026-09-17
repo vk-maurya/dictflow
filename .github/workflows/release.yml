@@ -4,8 +4,33 @@ on:
   push:
     tags: ["v*"]
 
+# tauri-action creates the draft release + uploads assets via GITHUB_TOKEN.
+# Without this the token is read-only and both build jobs fail with
+# "Resource not accessible by integration". (Regression from #3 which
+# dropped this block; v0.2.0 had it and released fine.)
+permissions:
+  contents: write
+
 jobs:
+  # Both build jobs race to create the same draft release if it doesn't
+  # exist yet, so create it once up front. The tauri-action steps below
+  # then find the draft and only upload assets.
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create draft release if missing
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          if ! gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "${{ github.repository }}" --draft \
+              --title "DictFlow $TAG" \
+              --notes "Offline voice dictation for Windows and macOS. See README for setup."
+          fi
+
   build-windows:
+    needs: create-release
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,6 +59,7 @@ jobs:
           prerelease: false
 
   build-macos-arm:
+    needs: create-release
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
