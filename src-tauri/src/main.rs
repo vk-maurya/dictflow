@@ -172,6 +172,7 @@ pub fn run() {
             crate::hotkey::apply_hotkey_registration(app.handle());
             crate::hotkey::apply_utility_shortcuts(app.handle());
             crate::tray::apply_overlay_visibility(app.handle());
+            crate::focus::spawn_overlay_space_follow(app.handle());
             let onboarded = app
                 .state::<Mutex<AppState>>()
                 .lock()
