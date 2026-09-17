@@ -9,10 +9,10 @@ use std::sync::mpsc;
 
 use anyhow::Context;
 
-use crate::devices;
 use crate::format;
 use crate::models::{self, EngineKind};
 use crate::polish;
+use crate::vad;
 use crate::settings::Settings;
 use crate::text;
 
@@ -296,12 +296,19 @@ pub(crate) fn run_transcription(
     parakeet: &Transcriber,
 ) -> anyhow::Result<TranscriptResult> {
     let samples = text::load_wav_mono_16k(&input.wav_path)?;
+    // Original length drives History duration/playback; STT gets the trimmed
+    // clip below. `input.wav_path` itself is never modified.
     let duration_secs = samples.len() as f64 / 16_000.0;
-    if let Some(why) = devices::blank_audio(&samples, 16_000) {
-        anyhow::bail!("{}", why.message());
-    }
+    // Silero speech gate + edge trim. Falls back to the peak gate while the
+    // model file is missing, and keeps the existing blank-audio copy either
+    // way. Runs here on the finished buffer — never the capture thread.
+    vad::ensure_model(&input.data_dir);
+    let stt_samples = match vad::gate_and_trim(&samples, 16_000, &input.data_dir) {
+        Ok(trimmed) => trimmed,
+        Err(why) => anyhow::bail!("{}", why.message()),
+    };
     let raw = if input.polish.audio_backend == "openai_compat" {
-        let wav = std::fs::read(&input.wav_path).context("read wav for audio API")?;
+        let wav = vad::encode_wav_bytes_16k(&stt_samples)?;
         polish::transcribe_openai(
             &input.polish.audio_api_base,
             &input.polish.audio_api_key,
@@ -314,7 +321,7 @@ pub(crate) fn run_transcription(
     match entry.engine {
         EngineKind::Whisper => {
             let tmp = input.data_dir.join("last_16k.wav");
-            text::write_wav_mono_16k(&tmp, &samples, 16_000)?;
+            text::write_wav_mono_16k(&tmp, &stt_samples, 16_000)?;
             transcribe_whisper(
                 &input.data_dir,
                 &input.model_id,
@@ -324,7 +331,7 @@ pub(crate) fn run_transcription(
             )?
         }
         EngineKind::Parakeet => parakeet
-            .transcribe(&input.model_id, samples)
+            .transcribe(&input.model_id, stt_samples)
             .map_err(anyhow::Error::msg)?,
     }
     };
