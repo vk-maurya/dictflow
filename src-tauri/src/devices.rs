@@ -7,6 +7,36 @@ pub struct DeviceChoice {
     pub fell_back: bool,
 }
 
+/// Label shown in Settings and used to pin a device.
+///
+/// cpal 0.17 WASAPI puts the short form-factor (`Headset`) in `name` and the
+/// Windows Sound-settings string (`Headset (WH-1000XM5)`) in `extended`.
+/// CoreAudio already puts the product name in `name` and leaves `extended`
+/// empty, so this is a no-op on macOS.
+pub fn display_name(name: &str, extended: &[String]) -> String {
+    let name = name.trim();
+    let friendly = extended
+        .iter()
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty());
+    match friendly {
+        Some(f) if f.len() > name.len() && !f.eq_ignore_ascii_case(name) => f.to_owned(),
+        _ => name.to_owned(),
+    }
+}
+
+/// True when `want` is this device's display name, form-factor, or friendly name.
+pub fn name_matches(want: &str, name: &str, extended: &[String]) -> bool {
+    let want = want.trim();
+    if want.is_empty() {
+        return false;
+    }
+    if display_name(name, extended) == want || name.trim() == want {
+        return true;
+    }
+    extended.iter().any(|s| s.trim() == want)
+}
+
 /// Prefer `preferred` when it is still plugged in; otherwise the OS default.
 pub fn choose_device(
     names: &[String],
@@ -178,6 +208,38 @@ mod tests {
         let c = choose_device(&names(), Some("Built-in"), Some("  ")).unwrap();
         assert_eq!(c.name, "Built-in");
         assert!(!c.fell_back);
+    }
+
+    #[test]
+    fn wasapi_prefers_friendly_over_form_factor() {
+        assert_eq!(
+            display_name("Headset", &["Headset (WH-1000XM5)".into()]),
+            "Headset (WH-1000XM5)"
+        );
+        assert!(name_matches(
+            "Headset",
+            "Headset",
+            &["Headset (WH-1000XM5)".into()]
+        ));
+        assert!(name_matches(
+            "Headset (WH-1000XM5)",
+            "Headset",
+            &["Headset (WH-1000XM5)".into()]
+        ));
+    }
+
+    #[test]
+    fn coreaudio_keeps_product_name() {
+        assert_eq!(
+            display_name("MacBook Pro Microphone", &[]),
+            "MacBook Pro Microphone"
+        );
+        assert!(name_matches(
+            "MacBook Pro Microphone",
+            "MacBook Pro Microphone",
+            &[]
+        ));
+        assert!(!name_matches("Headset", "MacBook Pro Microphone", &[]));
     }
 
     #[test]

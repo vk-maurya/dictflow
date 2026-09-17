@@ -27,7 +27,7 @@
         "url": "overlay.html",
         "width": 268,
         "height": 56,
-        "visible": true,
+        "visible": false,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,

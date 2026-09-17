@@ -34,12 +34,22 @@ const PRESENCE_FULL = 0.08;
 const MIN_BAR = 2;
 const DRAG_PX = 12;
 
+type Press = {
+  sx: number;
+  sy: number;
+  originX: number;
+  originY: number;
+  ready: boolean;
+};
+
 let phase: Phase = "idle";
 let bins = new Array<number>(BAR_COUNT).fill(0);
-let press: { x: number; y: number } | null = null;
+let press: Press | null = null;
 let dragged = false;
 let toggling = false;
 let raf = 0;
+let placing = false;
+let pending: { x: number; y: number } | null = null;
 
 const pill = () => document.getElementById("pill");
 const canvas = () => document.getElementById("wave") as HTMLCanvasElement | null;
@@ -171,6 +181,50 @@ async function toggleFromOverlay(): Promise<void> {
 function resetPress(): void {
   press = null;
   dragged = false;
+  pending = null;
+}
+
+async function captureOrigin(): Promise<void> {
+  try {
+    const pos = await win.outerPosition();
+    const scale = await win.scaleFactor();
+    if (!press) return;
+    press.originX = pos.x / scale;
+    press.originY = pos.y / scale;
+    press.ready = true;
+  } catch {
+    /* origin is best-effort; drag is skipped until it lands */
+  }
+}
+
+function queuePlace(x: number, y: number): void {
+  pending = { x, y };
+  if (placing) return;
+  placing = true;
+  void (async () => {
+    while (pending && press) {
+      const next = pending;
+      pending = null;
+      try {
+        await win.setPosition(new LogicalPosition(next.x, next.y));
+      } catch {
+        break;
+      }
+    }
+    placing = false;
+  })();
+}
+
+function onPointerMove(e: PointerEvent): void {
+  if (!press) return;
+  const dx = e.screenX - press.sx;
+  const dy = e.screenY - press.sy;
+  if (!dragged) {
+    if (Math.hypot(dx, dy) < DRAG_PX) return;
+    dragged = true;
+  }
+  if (!press.ready) return;
+  queuePlace(press.originX + dx, press.originY + dy);
 }
 
 async function snapAfterDrag(): Promise<void> {
@@ -202,29 +256,36 @@ async function boot(): Promise<void> {
   setPhase("idle");
 
   const host = pill();
-  host?.addEventListener("pointerdown", (e) => {
-    if (e.button !== 0) return;
-    press = { x: e.clientX, y: e.clientY };
-    dragged = false;
-  });
-  host?.addEventListener("pointermove", (e) => {
-    if (!press || dragged) return;
-    if (Math.hypot(e.clientX - press.x, e.clientY - press.y) < DRAG_PX) return;
-    dragged = true;
-    win.startDragging().catch(() => undefined);
-  });
-  const onRelease = () => {
-    const wasDrag = dragged;
-    const hadPress = press !== null;
-    resetPress();
-    if (wasDrag) {
-      snapAfterDrag();
-      return;
-    }
-    if (hadPress) toggleFromOverlay();
-  };
-  window.addEventListener("pointerup", onRelease);
-  window.addEventListener("pointercancel", resetPress);
+  if (host) {
+    host.addEventListener("pointerdown", (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      press = { sx: e.screenX, sy: e.screenY, originX: 0, originY: 0, ready: false };
+      dragged = false;
+      host.setPointerCapture(e.pointerId);
+      void captureOrigin();
+    });
+    host.addEventListener("pointermove", onPointerMove);
+    const onRelease = (e: PointerEvent) => {
+      try {
+        if (host.hasPointerCapture(e.pointerId)) {
+          host.releasePointerCapture(e.pointerId);
+        }
+      } catch {
+        /* capture already released */
+      }
+      const wasDrag = dragged;
+      const hadPress = press !== null;
+      resetPress();
+      if (wasDrag) {
+        void snapAfterDrag();
+        return;
+      }
+      if (hadPress) void toggleFromOverlay();
+    };
+    host.addEventListener("pointerup", onRelease);
+    host.addEventListener("pointercancel", onRelease);
+  }
 
   await listen<boolean>("dictflow://recording", (e) => {
     if (e.payload) setPhase("recording");

@@ -90,7 +90,14 @@ mod platform {
     use std::ffi::c_void;
     use tauri::Manager;
 
+    const GWL_STYLE: i32 = -16;
     const GWL_EXSTYLE: i32 = -20;
+    const WS_POPUP: isize = 0x8000_0000u32 as isize;
+    const WS_CAPTION: isize = 0x00C0_0000;
+    const WS_SYSMENU: isize = 0x0008_0000;
+    const WS_THICKFRAME: isize = 0x0004_0000;
+    const WS_MINIMIZEBOX: isize = 0x0002_0000;
+    const WS_MAXIMIZEBOX: isize = 0x0001_0000;
     const WS_EX_NOACTIVATE: isize = 0x0800_0000;
     const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
     const WS_EX_LAYERED: isize = 0x0008_0000;
@@ -100,6 +107,29 @@ mod platform {
     const SWP_FRAMECHANGED: u32 = 0x0020;
     const HWND_TOPMOST: FocusHandle = -1;
     const ASFW_ANY: u32 = 0xFFFF_FFFF;
+    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+    const DWMWCP_DONOTROUND: u32 = 1;
+    const DWMWA_BORDER_COLOR: u32 = 34;
+    const DWMWA_CAPTION_COLOR: u32 = 35;
+    const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
+    const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
+    const DWMSBT_NONE: u32 = 1;
+
+    /// Drop caption / sysmenu / resize-border so Win11 does not paint a
+    /// tool-window bubble (outline + close button) over the overlay pill.
+    pub(crate) fn overlay_window_style(style: isize) -> isize {
+        (style
+            & !WS_CAPTION
+            & !WS_THICKFRAME
+            & !WS_SYSMENU
+            & !WS_MINIMIZEBOX
+            & !WS_MAXIMIZEBOX)
+            | WS_POPUP
+    }
+
+    pub(crate) fn overlay_window_exstyle(style: isize) -> isize {
+        style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED
+    }
 
     #[link(name = "user32")]
     extern "system" {
@@ -125,6 +155,12 @@ mod platform {
     #[link(name = "dwmapi")]
     extern "system" {
         fn DwmExtendFrameIntoClientArea(hwnd: *mut c_void, margins: *const i32) -> i32;
+        fn DwmSetWindowAttribute(
+            hwnd: *mut c_void,
+            attr: u32,
+            value: *const c_void,
+            size: u32,
+        ) -> i32;
     }
 
     #[link(name = "kernel32")]
@@ -157,25 +193,35 @@ mod platform {
             .collect()
     }
 
+    unsafe fn dwm_attr(hwnd: *mut c_void, attr: u32, value: u32) {
+        let _ = DwmSetWindowAttribute(hwnd, attr, (&value as *const u32).cast(), 4);
+    }
+
     pub fn make_non_activating_impl(win: &tauri::WebviewWindow) {
         let Some(h) = hwnd_of_impl(win) else { return; };
+        let hwnd = to_ptr(h);
         unsafe {
-            let style = GetWindowLongPtrW(to_ptr(h), GWL_EXSTYLE);
-            SetWindowLongPtrW(
-                to_ptr(h),
-                GWL_EXSTYLE,
-                style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
-            );
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, overlay_window_style(style));
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, overlay_window_exstyle(ex));
+            // Win11 still draws a rounded mica card + 1px border on popups
+            // unless these DWM attributes are cleared.
+            dwm_attr(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND);
+            dwm_attr(hwnd, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE);
+            dwm_attr(hwnd, DWMWA_CAPTION_COLOR, DWMWA_COLOR_NONE);
+            dwm_attr(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_NONE);
+            // -1 margins: per-pixel alpha so the 268x56 window is invisible
+            // around the pill. Must run after caption bits are stripped,
+            // otherwise DWM paints the close button into the glass frame.
+            let margins = [-1i32; 4];
+            let _ = DwmExtendFrameIntoClientArea(hwnd, margins.as_ptr());
             SetWindowPos(
-                to_ptr(h),
+                hwnd,
                 to_ptr(HWND_TOPMOST),
                 0, 0, 0, 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
             );
-            // -1 margins: per-pixel alpha so the SpeakType pill is transparent
-            // over the desktop, same as the macOS overlay.
-            let margins = [-1i32; 4];
-            let _ = DwmExtendFrameIntoClientArea(to_ptr(h), margins.as_ptr());
         }
     }
 
@@ -377,5 +423,24 @@ mod tests {
         assert_eq!(bits & 0x1, 0x1, "CanJoinAllSpaces");
         assert_eq!(bits & 0x100, 0x100, "FullScreenAuxiliary");
         assert_eq!(bits & 0x2, 0, "must not set MoveToActiveSpace");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn overlay_style_hides_tool_window_chrome() {
+        const WS_VISIBLE: isize = 0x1000_0000;
+        const WS_CAPTION: isize = 0x00C0_0000;
+        const WS_SYSMENU: isize = 0x0008_0000;
+        const WS_POPUP: isize = 0x8000_0000u32 as isize;
+        let input = WS_VISIBLE | WS_CAPTION | WS_SYSMENU;
+        let out = platform::overlay_window_style(input);
+        assert_eq!(out & WS_CAPTION, 0, "caption/border must go");
+        assert_eq!(out & WS_SYSMENU, 0, "close button must go");
+        assert_ne!(out & WS_VISIBLE, 0, "keep visible");
+        assert_ne!(out & WS_POPUP, 0);
+        let ex = platform::overlay_window_exstyle(0);
+        assert_ne!(ex & 0x0800_0000, 0, "NOACTIVATE");
+        assert_ne!(ex & 0x0000_0080, 0, "TOOLWINDOW");
+        assert_ne!(ex & 0x0008_0000, 0, "LAYERED");
     }
 }

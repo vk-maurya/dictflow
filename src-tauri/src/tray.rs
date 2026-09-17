@@ -146,6 +146,7 @@ pub(crate) fn apply_overlay_visibility(app: &tauri::AppHandle) {
     let _ = win.set_ignore_cursor_events(false);
     let _ = win.set_always_on_top(true);
     let _ = win.set_visible_on_all_workspaces(true);
+    let _ = win.set_shadow(false);
     let _ = win.set_background_color(Some(tauri::window::Color(0, 0, 0, 0)));
     let _ = win.set_size(tauri::LogicalSize::new(
         overlay::PILL_W as f64,

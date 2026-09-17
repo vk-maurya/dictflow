@@ -20,29 +20,63 @@ use crate::devices;
 use crate::state::{ActiveRecording, AppState};
 use crate::text;
 
+fn device_label(dev: &cpal::Device) -> Option<String> {
+    let desc = dev.description().ok()?;
+    Some(devices::display_name(desc.name(), desc.extended()))
+}
+
+fn device_matches(dev: &cpal::Device, want: &str) -> bool {
+    let Ok(desc) = dev.description() else {
+        return false;
+    };
+    devices::name_matches(want, desc.name(), desc.extended())
+}
+
 pub(crate) fn default_input_name() -> Option<String> {
-    cpal::default_host()
-        .default_input_device()?
-        .description()
-        .map(|d| d.name().to_owned())
-        .ok()
+    device_label(&cpal::default_host().default_input_device()?)
 }
 
 fn list_input_names() -> (Vec<String>, Option<String>) {
     let host = cpal::default_host();
-    let default_name = host.default_input_device().and_then(|d| d.description().map(|d| d.name().to_owned()).ok());
+    let default_name = host.default_input_device().as_ref().and_then(device_label);
     let names = host
         .input_devices()
         .map(|devs| {
-            devs.filter_map(|d| d.description().map(|d| d.name().to_owned()).ok())
-                .collect::<Vec<_>>()
+            let mut names = Vec::new();
+            for d in devs {
+                if let Some(n) = device_label(&d) {
+                    if !names.iter().any(|e| e == &n) {
+                        names.push(n);
+                    }
+                }
+            }
+            names
         })
         .unwrap_or_default();
     (names, default_name)
 }
 
+fn label_for_preferred(want: &str) -> Option<String> {
+    let host = cpal::default_host();
+    let devs = host.input_devices().ok()?;
+    for d in devs {
+        if device_matches(&d, want) {
+            return device_label(&d);
+        }
+    }
+    None
+}
+
 pub(crate) fn resolve_capture_device(preferred: Option<&str>) -> anyhow::Result<devices::DeviceChoice> {
     let (names, default_name) = list_input_names();
+    if let Some(want) = preferred.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(label) = label_for_preferred(want) {
+            return Ok(devices::DeviceChoice {
+                name: label,
+                fell_back: false,
+            });
+        }
+    }
     devices::choose_device(&names, default_name.as_deref(), preferred).map_err(anyhow::Error::msg)
 }
 
@@ -50,7 +84,7 @@ pub(crate) fn open_input_named(name: &str) -> anyhow::Result<cpal::Device> {
     let host = cpal::default_host();
     if let Ok(devs) = host.input_devices() {
         for d in devs {
-            if d.description().map(|d| d.name().to_owned()).ok().as_deref() == Some(name) {
+            if device_matches(&d, name) {
                 return Ok(d);
             }
         }
@@ -272,20 +306,18 @@ pub(crate) fn get_audio_devices(state: State<'_, Mutex<AppState>>) -> Result<Vec
         .ok()
         .and_then(|s| s.settings.audio_device.clone());
     let host = cpal::default_host();
-    let default_name = host
-        .default_input_device()
-        .and_then(|d| d.description().map(|d| d.name().to_owned()).ok());
+    let default_name = host.default_input_device().as_ref().and_then(device_label);
     let mut out = Vec::new();
     let devices = host.input_devices().map_err(|e| e.to_string())?;
     for dev in devices {
-        let name = dev.description().map(|d| d.name().to_owned()).unwrap_or_else(|_| "(unnamed device)".to_owned());
+        let name = device_label(&dev).unwrap_or_else(|| "(unnamed device)".to_owned());
         let (sample_rate, channels) = dev
             .default_input_config()
             .map(|c| (c.sample_rate(), c.channels()))
             .unwrap_or((0, 0));
         let is_default = Some(&name) == default_name.as_ref();
         let is_selected = match preferred.as_deref() {
-            Some(p) if !p.is_empty() => p == name,
+            Some(p) if !p.is_empty() => device_matches(&dev, p),
             _ => is_default,
         };
         out.push(AudioDeviceInfo {
@@ -349,7 +381,7 @@ pub(crate) async fn test_microphone(state: State<'_, Mutex<AppState>>) -> Result
         })
         .or_else(|| {
             host.default_input_device().and_then(|d| {
-                let name = d.description().map(|d| d.name().to_owned()).ok()?;
+                let name = device_label(&d)?;
                 let cfg = d.default_input_config().ok()?;
                 Some((name, cfg.sample_rate(), cfg.channels()))
             })
