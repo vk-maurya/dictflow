@@ -23,150 +23,85 @@ pub struct Secrets {
     pub llm_api_key: String,
 }
 
-pub const CRED_AUDIO: &str = "DictFlow/audio_api_key";
-pub const CRED_LLM: &str = "DictFlow/llm_api_key";
+/// Keyring service name used on all platforms.
+const KEYRING_SERVICE: &str = "DictFlow";
+pub const CRED_AUDIO: &str = "audio_api_key";
+pub const CRED_LLM: &str = "llm_api_key";
 
 pub fn secrets_path(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join("secrets.json")
 }
 
+/// Cross-platform credential storage via the `keyring` crate.
+/// On macOS this reads/writes to the system Keychain.
+/// On Windows this reads/writes to the Windows Credential Manager.
+mod cred {
+    use super::KEYRING_SERVICE;
+    use anyhow::Result;
+
+    pub fn read(key: &str) -> Option<String> {
+        keyring::Entry::new(KEYRING_SERVICE, key)
+            .ok()?
+            .get_password()
+            .ok()
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn write(key: &str, secret: &str) -> Result<()> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, key)
+            .map_err(|e| anyhow::anyhow!("keyring entry: {e}"))?;
+        entry
+            .set_password(secret)
+            .map_err(|e| anyhow::anyhow!("keyring write: {e}"))
+    }
+
+    #[cfg(test)]
+    pub fn delete(key: &str) -> bool {
+        keyring::Entry::new(KEYRING_SERVICE, key)
+            .ok()
+            .and_then(|e| e.delete_credential().ok())
+            .is_some()
+    }
+}
+
 pub fn load_secrets(data_dir: &Path) -> Secrets {
     migrate_file_secrets(data_dir);
     Secrets {
-        audio_api_key: wincred::read(CRED_AUDIO).unwrap_or_default(),
-        llm_api_key: wincred::read(CRED_LLM).unwrap_or_default(),
+        audio_api_key: cred::read(CRED_AUDIO).unwrap_or_default(),
+        llm_api_key: cred::read(CRED_LLM).unwrap_or_default(),
     }
 }
 
 pub fn save_secrets(data_dir: &Path, secrets: &Secrets) -> Result<()> {
     if !secrets.audio_api_key.trim().is_empty() {
-        wincred::write(CRED_AUDIO, secrets.audio_api_key.trim())?;
+        cred::write(CRED_AUDIO, secrets.audio_api_key.trim())?;
     }
     if !secrets.llm_api_key.trim().is_empty() {
-        wincred::write(CRED_LLM, secrets.llm_api_key.trim())?;
+        cred::write(CRED_LLM, secrets.llm_api_key.trim())?;
     }
     let _ = std::fs::remove_file(secrets_path(data_dir));
     Ok(())
 }
 
-/// One-shot: copy leftover `secrets.json` into Credential Manager, then delete the file.
+/// One-shot: copy leftover `secrets.json` into the system keychain, then delete the file.
 fn migrate_file_secrets(data_dir: &Path) {
     let path = secrets_path(data_dir);
     let Ok(bytes) = std::fs::read(&path) else {
         return;
     };
     if let Ok(file) = serde_json::from_slice::<Secrets>(&bytes) {
-        if wincred::read(CRED_AUDIO).unwrap_or_default().is_empty() && !file.audio_api_key.trim().is_empty()
+        if cred::read(CRED_AUDIO).unwrap_or_default().is_empty()
+            && !file.audio_api_key.trim().is_empty()
         {
-            let _ = wincred::write(CRED_AUDIO, file.audio_api_key.trim());
+            let _ = cred::write(CRED_AUDIO, file.audio_api_key.trim());
         }
-        if wincred::read(CRED_LLM).unwrap_or_default().is_empty() && !file.llm_api_key.trim().is_empty() {
-            let _ = wincred::write(CRED_LLM, file.llm_api_key.trim());
+        if cred::read(CRED_LLM).unwrap_or_default().is_empty()
+            && !file.llm_api_key.trim().is_empty()
+        {
+            let _ = cred::write(CRED_LLM, file.llm_api_key.trim());
         }
     }
     let _ = std::fs::remove_file(&path);
-}
-
-/// Generic credentials in Windows Credential Manager (`advapi32` CredWrite / CredRead).
-mod wincred {
-    use anyhow::{bail, Result};
-    use std::ffi::c_void;
-
-    const CRED_TYPE_GENERIC: u32 = 1;
-    const CRED_PERSIST_LOCAL_MACHINE: u32 = 2;
-
-    #[repr(C)]
-    struct FileTime {
-        low: u32,
-        high: u32,
-    }
-
-    #[repr(C)]
-    struct CredentialW {
-        flags: u32,
-        type_: u32,
-        target_name: *const u16,
-        comment: *const u16,
-        last_written: FileTime,
-        credential_blob_size: u32,
-        credential_blob: *const u8,
-        persist: u32,
-        attribute_count: u32,
-        attributes: *const c_void,
-        target_alias: *const u16,
-        user_name: *const u16,
-    }
-
-    #[link(name = "advapi32")]
-    extern "system" {
-        fn CredWriteW(credential: *const CredentialW, flags: u32) -> i32;
-        fn CredReadW(
-            target_name: *const u16,
-            type_: u32,
-            flags: u32,
-            credential: *mut *mut CredentialW,
-        ) -> i32;
-        fn CredFree(buffer: *mut c_void);
-        fn CredDeleteW(target_name: *const u16, type_: u32, flags: u32) -> i32;
-    }
-
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain(std::iter::once(0)).collect()
-    }
-
-    pub fn write(target: &str, secret: &str) -> Result<()> {
-        let target_w = wide(target);
-        let user_w = wide("DictFlow");
-        let blob = secret.as_bytes();
-        let cred = CredentialW {
-            flags: 0,
-            type_: CRED_TYPE_GENERIC,
-            target_name: target_w.as_ptr(),
-            comment: std::ptr::null(),
-            last_written: FileTime { low: 0, high: 0 },
-            credential_blob_size: blob.len() as u32,
-            credential_blob: blob.as_ptr(),
-            persist: CRED_PERSIST_LOCAL_MACHINE,
-            attribute_count: 0,
-            attributes: std::ptr::null(),
-            target_alias: std::ptr::null(),
-            user_name: user_w.as_ptr(),
-        };
-        // SAFETY: target/user/blob pointers stay alive for the CredWriteW call.
-        let ok = unsafe { CredWriteW(&cred, 0) };
-        if ok == 0 {
-            bail!("Windows Credential Manager rejected the key");
-        }
-        Ok(())
-    }
-
-    pub fn read(target: &str) -> Option<String> {
-        let target_w = wide(target);
-        let mut ptr: *mut CredentialW = std::ptr::null_mut();
-        // SAFETY: CredReadW allocates; we copy the blob then CredFree.
-        let ok = unsafe { CredReadW(target_w.as_ptr(), CRED_TYPE_GENERIC, 0, &mut ptr) };
-        if ok == 0 || ptr.is_null() {
-            return None;
-        }
-        let secret = unsafe {
-            let size = (*ptr).credential_blob_size as usize;
-            let p = (*ptr).credential_blob;
-            let bytes = if p.is_null() || size == 0 {
-                Vec::new()
-            } else {
-                std::slice::from_raw_parts(p, size).to_vec()
-            };
-            CredFree(ptr.cast());
-            String::from_utf8(bytes).ok()
-        };
-        secret.filter(|s| !s.is_empty())
-    }
-
-    #[allow(dead_code)]
-    pub fn delete(target: &str) -> bool {
-        let target_w = wide(target);
-        unsafe { CredDeleteW(target_w.as_ptr(), CRED_TYPE_GENERIC, 0) != 0 }
-    }
 }
 
 pub fn mask_key(key: &str) -> String {
@@ -471,13 +406,16 @@ mod tests {
         .is_none());
     }
 
+    /// Keyring roundtrip — skipped on CI where keychains are unavailable.
+    /// Run manually: `cargo test credential_roundtrip -- --ignored`
     #[test]
-    fn credential_manager_roundtrip() {
-        const TARGET: &str = "DictFlow/unit-test";
-        let _ = wincred::delete(TARGET);
-        wincred::write(TARGET, "sk-test-secret").expect("CredWrite");
-        assert_eq!(wincred::read(TARGET).as_deref(), Some("sk-test-secret"));
-        assert!(wincred::delete(TARGET));
-        assert_eq!(wincred::read(TARGET), None);
+    #[ignore]
+    fn credential_roundtrip() {
+        const KEY: &str = "unit-test-key";
+        let _ = cred::delete(KEY);
+        cred::write(KEY, "sk-test-secret").expect("keyring write");
+        assert_eq!(cred::read(KEY).as_deref(), Some("sk-test-secret"));
+        assert!(cred::delete(KEY));
+        assert_eq!(cred::read(KEY), None);
     }
 }

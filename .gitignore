@@ -2,6 +2,9 @@
 /dist/
 /node_modules/
 /src-tauri/target/
+/src-tauri/icons/DictFlow.iconset/
+/DictFlow.app/
+/.venv/
 *.log
 .DS_Store
 Thumbs.db

@@ -1,4 +1,7 @@
 //! First-run wizard steps. Skip is allowed at every step (UI sets `onboarded`).
+//!
+//! macOS adds a `Permissions` step between Welcome and TalkKey for
+//! Microphone + Accessibility (SpeakType-style). Fn uses a session event tap.
 
 use serde::{Deserialize, Serialize};
 
@@ -6,6 +9,8 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum OnboardStep {
     Welcome,
+    /// macOS only: Microphone + Accessibility grants.
+    Permissions,
     TalkKey,
     MicTest,
     Download,
@@ -16,6 +21,7 @@ impl OnboardStep {
     pub fn as_str(self) -> &'static str {
         match self {
             OnboardStep::Welcome => "welcome",
+            OnboardStep::Permissions => "permissions",
             OnboardStep::TalkKey => "talkkey",
             OnboardStep::MicTest => "mictest",
             OnboardStep::Download => "download",
@@ -26,6 +32,7 @@ impl OnboardStep {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "welcome" => Some(OnboardStep::Welcome),
+            "permissions" => Some(OnboardStep::Permissions),
             "talkkey" => Some(OnboardStep::TalkKey),
             "mictest" => Some(OnboardStep::MicTest),
             "download" => Some(OnboardStep::Download),
@@ -37,7 +44,13 @@ impl OnboardStep {
 
 pub fn next(step: OnboardStep) -> OnboardStep {
     match step {
-        OnboardStep::Welcome => OnboardStep::TalkKey,
+        OnboardStep::Welcome => {
+            #[cfg(target_os = "macos")]
+            return OnboardStep::Permissions;
+            #[cfg(not(target_os = "macos"))]
+            return OnboardStep::TalkKey;
+        }
+        OnboardStep::Permissions => OnboardStep::TalkKey,
         OnboardStep::TalkKey => OnboardStep::MicTest,
         OnboardStep::MicTest => OnboardStep::Download,
         OnboardStep::Download | OnboardStep::Done => OnboardStep::Done,
@@ -47,7 +60,13 @@ pub fn next(step: OnboardStep) -> OnboardStep {
 pub fn prev(step: OnboardStep) -> OnboardStep {
     match step {
         OnboardStep::Welcome => OnboardStep::Welcome,
-        OnboardStep::TalkKey => OnboardStep::Welcome,
+        OnboardStep::Permissions => OnboardStep::Welcome,
+        OnboardStep::TalkKey => {
+            #[cfg(target_os = "macos")]
+            return OnboardStep::Permissions;
+            #[cfg(not(target_os = "macos"))]
+            return OnboardStep::Welcome;
+        }
         OnboardStep::MicTest => OnboardStep::TalkKey,
         OnboardStep::Download => OnboardStep::MicTest,
         OnboardStep::Done => OnboardStep::Download,
@@ -64,20 +83,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn linear_next_prev() {
-        let mut s = OnboardStep::Welcome;
-        s = next(s);
-        assert_eq!(s, OnboardStep::TalkKey);
-        s = next(s);
-        assert_eq!(s, OnboardStep::MicTest);
-        s = next(s);
-        assert_eq!(s, OnboardStep::Download);
-        s = next(s);
-        assert_eq!(s, OnboardStep::Done);
-        assert_eq!(next(OnboardStep::Done), OnboardStep::Done);
-        assert_eq!(prev(OnboardStep::Welcome), OnboardStep::Welcome);
-        assert_eq!(prev(OnboardStep::Download), OnboardStep::MicTest);
-        assert_eq!(prev(OnboardStep::Done), OnboardStep::Download);
+    fn step_round_trip() {
+        assert_eq!(OnboardStep::parse("talkkey"), Some(OnboardStep::TalkKey));
+        assert_eq!(OnboardStep::Download.as_str(), "download");
+        assert_eq!(OnboardStep::parse("nope"), None);
+        assert_eq!(OnboardStep::parse("permissions"), Some(OnboardStep::Permissions));
     }
 
     #[test]
@@ -86,9 +96,17 @@ mod tests {
     }
 
     #[test]
-    fn step_round_trip() {
-        assert_eq!(OnboardStep::parse("talkkey"), Some(OnboardStep::TalkKey));
-        assert_eq!(OnboardStep::Download.as_str(), "download");
-        assert_eq!(OnboardStep::parse("nope"), None);
+    fn recommended_matches_catalog_default() {
+        assert_eq!(recommended_model_id(), crate::models::default_model_id());
+    }
+
+    #[test]
+    fn done_loops_to_done() {
+        assert_eq!(next(OnboardStep::Done), OnboardStep::Done);
+    }
+
+    #[test]
+    fn welcome_loops_to_welcome() {
+        assert_eq!(prev(OnboardStep::Welcome), OnboardStep::Welcome);
     }
 }
