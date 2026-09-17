@@ -44,6 +44,7 @@ pub(crate) fn paste_text(
     }
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = app;
         windows::paste_text(text, target)
     }
 }

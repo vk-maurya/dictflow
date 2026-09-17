@@ -4,7 +4,9 @@
 //! need Input Monitoring. Windows has no equivalent; those fields stay granted.
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
+#[cfg(target_os = "macos")]
+use tauri::Emitter;
 
 use crate::state::AppState;
 use std::sync::Mutex;
@@ -89,6 +91,7 @@ pub(crate) fn spawn_watcher(app: AppHandle) {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn should_relaunch_for_taps(app: &AppHandle) -> bool {
     let dir = app
         .state::<Mutex<AppState>>()
