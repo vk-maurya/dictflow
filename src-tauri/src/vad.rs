@@ -43,6 +43,16 @@ pub const TRAIL_PAD_SECS: f32 = 0.60;
 /// common "last word cut off" report.)
 pub const LEAD_EDGE_SECS: f32 = 1.0;
 pub const TRAIL_EDGE_SECS: f32 = 2.0;
+/// Misfire net: minimum share of the take Silero must vouch for before a
+/// narrow trim is trusted. Below this *with sustained buffer energy*, the
+/// VAD is misfiring (quiet mic, soft voice) — deleting 85%+ of an
+/// energetic take is certainly wrong, so the whole take goes to STT.
+/// Takes with zero segments still take the Silence path, so pure noise
+/// keeps its "only silence" copy.
+pub const MIN_TRUSTED_COVERAGE: f32 = 0.15;
+/// Sustained-energy floor for the misfire net (RMS over the whole take).
+/// Room tone sits far below this; normal speech far above.
+pub const SUSTAINED_RMS: f32 = 0.02;
 /// Silero window at 16 kHz.
 pub const WINDOW_SIZE: i32 = 512;
 
@@ -200,7 +210,9 @@ pub fn trim_range(
 /// - a loud buffer with *no* speech segments is `Silence` (this is the
 ///   HVAC/keyboard case the peak gate lets through),
 /// - otherwise the buffer is trimmed at the edges only; interior pauses
-///   stay in the returned clip.
+///   stay in the returned clip,
+/// - unless Silero vouches for < 15% of a take with sustained energy —
+///   that is a VAD misfire, so the whole take goes to STT untouched.
 pub fn gate_with_segments(
     samples_16k: &[f32],
     sample_rate: u32,
@@ -219,10 +231,25 @@ pub fn gate_with_segments(
         return Err(BlankAudio::Silence);
     }
     let total = samples_16k.len();
+    let level = devices::level_from_samples(samples_16k);
+    let speech: usize = segments
+        .iter()
+        .map(|(a, b)| b.saturating_sub(*a).min(total))
+        .sum();
+    let coverage = speech.min(total) as f32 / total.max(1) as f32;
+    if coverage < MIN_TRUSTED_COVERAGE && level.rms >= SUSTAINED_RMS {
+        log::warn!(
+            "vad: only {:.1}% speech coverage at rms {:.3} — misfire, sending full {:.2}s",
+            100.0 * coverage,
+            level.rms,
+            total as f32 / sample_rate as f32,
+        );
+        return Ok(samples_16k.to_vec());
+    }
     match trim_range(segments, total, sample_rate) {
         Some((start, end)) if end > start => {
             log::info!(
-                "vad: {} segment(s), speech {:.2}–{:.2}s of {:.2}s → stt {:.2}s",
+                "vad: {} segment(s), speech {:.2}–{:.2}s of {:.2}s → stt {:.2}s (peak {:.3}, rms {:.3})",
                 segments.len(),
                 segments.iter().map(|s| s.0).min().unwrap_or(0) as f32
                     / sample_rate as f32,
@@ -230,6 +257,8 @@ pub fn gate_with_segments(
                     / sample_rate as f32,
                 total as f32 / sample_rate as f32,
                 (end - start) as f32 / sample_rate as f32,
+                level.peak,
+                level.rms,
             );
             Ok(samples_16k[start..end].to_vec())
         }
@@ -368,6 +397,28 @@ mod tests {
                 30_000 + (TRAIL_PAD_SECS * SR as f32) as usize
             ))
         );
+    }
+
+    #[test]
+    fn low_coverage_with_sustained_energy_sends_full_take() {
+        // The real-mic misfire: ~13 s of sustained speech, Silero vouches
+        // for one 0.3 s blip at the tail. Amputating is certainly wrong.
+        let total = 13 * SR as usize;
+        let samples = vec![0.1; total];
+        let out = gate_with_segments(&samples, SR, &[(total - 4960, total - 160)]).unwrap();
+        assert_eq!(out.len(), total);
+    }
+
+    #[test]
+    fn low_coverage_quiet_take_still_trims() {
+        // Same tiny segment but room-tone energy: trust the trim, the take
+        // is mostly silence.
+        let total = 5 * SR as usize;
+        let samples = vec![0.005; total];
+        let out = gate_with_segments(&samples, SR, &[(30_000, 34_800)]).unwrap();
+        assert!(out.len() < total);
+        // Segment survives inside the trimmed clip.
+        assert!(out.iter().any(|&s| s == 0.005));
     }
 
     #[test]
