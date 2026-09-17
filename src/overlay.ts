@@ -18,37 +18,60 @@ interface AppStatus {
   transcribing: boolean;
 }
 
+interface LevelPayload {
+  peak: number;
+  rms?: number;
+  bins?: number[];
+  elapsed?: number;
+}
+
 const win = getCurrentWindow();
-const HISTORY = 40;
+const BAR_COUNT = 40;
+const BAR_W = 2.5;
+const BAR_GAP = 2;
+const NOISE_GATE = 0.02;
+const PRESENCE_FULL = 0.08;
+const MIN_BAR = 2;
 const DRAG_PX = 12;
 
 let phase: Phase = "idle";
-let peak = 0;
+let bins = new Array<number>(BAR_COUNT).fill(0);
 let press: { x: number; y: number } | null = null;
 let dragged = false;
 let toggling = false;
 let raf = 0;
-const history = new Array<number>(HISTORY).fill(0.04);
 
 const pill = () => document.getElementById("pill");
 const canvas = () => document.getElementById("wave") as HTMLCanvasElement | null;
+const timeEl = () => document.getElementById("time");
+
+function formatTime(secs: number): string {
+  const s = Math.max(0, Math.floor(secs));
+  const m = Math.floor(s / 60);
+  return `${m}:${(s % 60).toString().padStart(2, "0")}`;
+}
+
+function setTime(secs: number): void {
+  const el = timeEl();
+  if (el) el.textContent = formatTime(secs);
+}
 
 function setPhase(next: Phase): void {
   if (phase === next) return;
   phase = next;
   pill()?.classList.remove("idle", "recording", "transcribing", "copychip");
   pill()?.classList.add(next);
-  if (next !== "recording") peak = 0;
-  if (next === "idle") {
-    history.fill(0.04);
-    if (raf) {
-      cancelAnimationFrame(raf);
-      raf = 0;
-    }
-    requestAnimationFrame(() => drawWave(0));
+  if (next === "recording") {
+    bins.fill(0);
+    setTime(0);
+    if (!raf) raf = requestAnimationFrame(tick);
     return;
   }
-  if (!raf) raf = requestAnimationFrame(tick);
+  if (raf) {
+    cancelAnimationFrame(raf);
+    raf = 0;
+  }
+  if (next === "idle") bins.fill(0);
 }
 
 function applyStatus(s: AppStatus): void {
@@ -57,14 +80,42 @@ function applyStatus(s: AppStatus): void {
   else setPhase("idle");
 }
 
-function pushLevel(v: number): void {
-  history.shift();
-  history.push(Math.max(0.03, Math.min(1, v)));
+function applyLevel(p: LevelPayload): void {
+  if (phase !== "recording") return;
+  if (Array.isArray(p.bins) && p.bins.length > 0) {
+    const n = Math.min(BAR_COUNT, p.bins.length);
+    for (let i = 0; i < BAR_COUNT; i++) {
+      bins[i] = i < n ? Math.max(0, p.bins[i]) : 0;
+    }
+  } else {
+    const v = Math.max(0, p.peak);
+    bins.shift();
+    bins.push(v);
+  }
+  if (typeof p.elapsed === "number") setTime(p.elapsed);
 }
 
-function drawWave(t: number): void {
+function roundBar(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+): void {
+  const r = Math.min(w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawWave(): void {
   const el = canvas();
-  if (!el) return;
+  if (!el || phase !== "recording") return;
   const dpr = window.devicePixelRatio || 1;
   const w = el.clientWidth;
   const h = el.clientHeight;
@@ -77,43 +128,31 @@ function drawWave(t: number): void {
   if (!ctx) return;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, w, h);
-  ctx.beginPath();
-  ctx.lineWidth = 1.6;
-  ctx.lineCap = "round";
-  ctx.lineJoin = "round";
-  ctx.strokeStyle = phase === "recording" ? "#f5b942" : "#e8e4da";
 
-  const mid = h / 2;
-  if (phase === "idle") {
-    ctx.moveTo(0, mid);
-    ctx.lineTo(w, mid);
-    ctx.stroke();
-    return;
-  }
+  const gated = bins.map((s) => Math.max(0, s - NOISE_GATE));
+  let peak = 0;
+  for (const s of gated) peak = Math.max(peak, s);
+  const recentPeak = Math.max(peak, 0.05);
+  const presence = Math.min(1, peak / PRESENCE_FULL);
 
-  for (let i = 0; i < HISTORY; i++) {
-    const x = (i / (HISTORY - 1)) * w;
-    const amp =
-      phase === "recording"
-        ? 0.18 + history[i] * 0.72
-        : 0.28 + Math.sin(t * 0.006 + i * 0.35) * 0.12;
-    const wobble = Math.sin(t * 0.004 + i * 0.5) * 0.08;
-    const y = mid + Math.sin((i / HISTORY) * Math.PI * 3.2 + t * 0.003) * (amp + wobble) * mid;
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
+  const n = gated.length;
+  const total = n * BAR_W + (n - 1) * BAR_GAP;
+  let x = (w - total) / 2;
+  ctx.fillStyle = "rgba(255, 255, 255, 0.9)";
+  for (let i = 0; i < n; i++) {
+    const norm = Math.min(1, gated[i] / recentPeak) * presence;
+    const bh = Math.max(MIN_BAR, norm * h);
+    roundBar(ctx, x, (h - bh) / 2, BAR_W, bh);
+    x += BAR_W + BAR_GAP;
   }
-  ctx.stroke();
 }
 
-function tick(now: number): void {
-  if (phase === "idle") {
+function tick(): void {
+  if (phase !== "recording") {
     raf = 0;
-    drawWave(0);
     return;
   }
-  if (phase === "recording") pushLevel(0.12 + Math.min(peak * 3.2, 0.88));
-  else pushLevel(0.3);
-  drawWave(now);
+  drawWave();
   raf = requestAnimationFrame(tick);
 }
 
@@ -161,12 +200,14 @@ async function boot(): Promise<void> {
   await win.setIgnoreCursorEvents(false).catch(() => undefined);
   document.addEventListener("contextmenu", (e) => e.preventDefault());
   setPhase("idle");
-  document.addEventListener("pointerdown", (e) => {
+
+  const host = pill();
+  host?.addEventListener("pointerdown", (e) => {
     if (e.button !== 0) return;
     press = { x: e.clientX, y: e.clientY };
     dragged = false;
   });
-  document.addEventListener("pointermove", (e) => {
+  host?.addEventListener("pointermove", (e) => {
     if (!press || dragged) return;
     if (Math.hypot(e.clientX - press.x, e.clientY - press.y) < DRAG_PX) return;
     dragged = true;
@@ -193,9 +234,7 @@ async function boot(): Promise<void> {
     if (e.payload) setPhase("transcribing");
     else setPhase("idle");
   });
-  await listen<{ peak: number }>("dictflow://level", (e) => {
-    if (phase === "recording") peak = e.payload.peak;
-  });
+  await listen<LevelPayload>("dictflow://level", (e) => applyLevel(e.payload));
   await listen("dictflow://committed", () => setPhase("idle"));
   await listen("dictflow://history-updated", () => {
     if (phase !== "recording") setPhase("idle");
@@ -209,10 +248,9 @@ async function boot(): Promise<void> {
   const wave = canvas();
   if (wave && typeof ResizeObserver !== "undefined") {
     new ResizeObserver(() => {
-      if (phase === "idle") drawWave(0);
+      if (phase === "recording") drawWave();
     }).observe(wave);
   }
-  requestAnimationFrame(() => drawWave(0));
 }
 
 boot();

@@ -7,8 +7,13 @@
   </head>
   <body>
     <div id="pill" class="idle" title="Click to start or stop dictation">
+      <div class="idle-bars" aria-hidden="true">
+        <span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <span class="dot" id="dot" aria-hidden="true"></span>
       <canvas id="wave"></canvas>
-      <button type="button" class="orb" id="orb" aria-label="Start or stop dictation"></button>
+      <span class="time" id="time">0:00</span>
+      <span class="status" id="status">Transcribing...</span>
     </div>
     <script type="module" src="/src/overlay.ts"></script>
   </body>

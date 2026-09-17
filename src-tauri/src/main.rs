@@ -354,11 +354,7 @@ pub fn run() {
             if window.label() != "main" {
                 return;
             }
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                crate::tray::hide_main_to_tray(window.app_handle());
-                crate::tray::apply_overlay_visibility(window.app_handle());
-            }
+            crate::tray::on_main_window_event(window, event);
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
@@ -407,8 +403,16 @@ pub fn run() {
         ]);
 
     builder
-        .run(tauri::generate_context!())
-        .expect("error while running DictFlow");
+        .build(tauri::generate_context!())
+        .expect("error while building DictFlow")
+        .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                crate::tray::show_main_window(app);
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }
 
 fn main() {

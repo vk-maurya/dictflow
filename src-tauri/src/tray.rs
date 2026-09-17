@@ -1,7 +1,8 @@
 //! Tray icon, overlay window, and main-window show/hide.
 //!
-//! Left-click opens the menu on macOS (menu-bar convention). Windows uses the
-//! same menu; the overlay is non-activating on both.
+//! Close and minimize hide to the tray on both platforms. Reopen from the
+//! tray menu, a Windows tray double-click, a second app launch, or the macOS
+//! Dock (`RunEvent::Reopen`).
 
 use std::sync::Mutex;
 
@@ -22,17 +23,60 @@ where
 
 pub(crate) fn hide_main_to_tray(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
+        // Unminimize first: a miniaturized+hidden NSWindow often refuses to
+        // come back on the next Dock click.
+        let _ = w.unminimize();
         let _ = w.hide();
+        // Windows only — on macOS skip_taskbar can drop the Dock icon, which
+        // is how users reopen the hidden window.
+        #[cfg(target_os = "windows")]
         let _ = w.set_skip_taskbar(true);
     }
 }
 
 pub(crate) fn show_main_window(app: &tauri::AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.show();
+        activate_nsapp();
+    }
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.set_skip_taskbar(false);
         let _ = w.unminimize();
         let _ = w.show();
         let _ = w.set_focus();
+    }
+}
+
+/// Close and the yellow/minimize button both park the UI in the tray.
+pub(crate) fn on_main_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
+    match event {
+        tauri::WindowEvent::CloseRequested { api, .. } => {
+            api.prevent_close();
+            hide_main_to_tray(window.app_handle());
+            apply_overlay_visibility(window.app_handle());
+        }
+        tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_)
+            if window.is_minimized().unwrap_or(false) =>
+        {
+            hide_main_to_tray(window.app_handle());
+            apply_overlay_visibility(window.app_handle());
+        }
+        _ => {}
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn activate_nsapp() {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+
+    unsafe {
+        let cls = objc2::class!(NSApplication);
+        let app: *mut AnyObject = msg_send![cls, sharedApplication];
+        if !app.is_null() {
+            let _: bool = msg_send![app, activateIgnoringOtherApps: true];
+        }
     }
 }
 
@@ -68,6 +112,16 @@ pub(crate) fn build_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
         "settings" => show_main_window(app),
         "toggle" => spawn_tray_toggle(app),
         _ => {}
+    });
+    tray.on_tray_icon_event(|tray, event| {
+        use tauri::tray::{MouseButton, TrayIconEvent};
+        if let TrayIconEvent::DoubleClick {
+            button: MouseButton::Left,
+            ..
+        } = event
+        {
+            show_main_window(tray.app_handle());
+        }
     });
     Ok(())
 }
