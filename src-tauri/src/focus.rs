@@ -254,23 +254,10 @@ mod platform {
         use objc2::runtime::AnyObject;
 
         let w = ns_window as *mut AnyObject;
-        let obj = &*w;
-        // NSPanel can join every Mission Control Space (including other apps'
-        // fullscreen Spaces). NSWindow often stays glued to the launch Space.
-        let panel = objc2::class!(NSPanel);
-        let is_panel = obj.class().instance_size() == panel.instance_size();
-        if is_panel {
-            let _ = AnyObject::set_class(obj, panel);
-        }
-
-        let style: u64 = msg_send![w, styleMask];
-        if is_panel {
-            // NSWindowStyleMaskNonactivatingPanel | UtilityWindow
-            let _: () = msg_send![w, setStyleMask: style | 0x80 | 0x10];
-            let _: () = msg_send![w, setFloatingPanel: true];
-            let _: () = msg_send![w, setBecomesKeyOnlyIfNeeded: true];
-            let _: () = msg_send![w, setWorksWhenModal: true];
-        }
+        // Stay an NSWindow. Swapping the class to NSPanel and then sending
+        // panel-only selectors aborts on macOS versions where the instance
+        // sizes match but the object is still a window. CanJoinAllSpaces is
+        // set below and again from the tray helper.
         let _: () = msg_send![w, setOpaque: false];
         let _: () = msg_send![w, setHasShadow: false];
         let cls = objc2::class!(NSColor);
@@ -295,7 +282,7 @@ mod platform {
 
     pub fn spawn_overlay_space_follow(app: &tauri::AppHandle) {
         // Re-apply after Spaces exist; CanJoinAllSpaces is already set on the
-        // overlay NSPanel. A second pass catches launch-time race with Mission
+        // overlay window. A second pass catches launch-time race with Mission
         // Control assigning the window to the first Space only.
         let app = app.clone();
         tauri::async_runtime::spawn(async move {

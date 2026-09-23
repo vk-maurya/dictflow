@@ -56,14 +56,10 @@ jobs:
       - name: Build app (Apple Silicon)
         run: npx tauri build --target aarch64-apple-darwin
 
-      # Ad-hoc sign the .app so Apple Silicon Macs can launch unsigned binaries.
-      # Users downloading from GitHub Releases still need to run:
-      #   xattr -dr com.apple.quarantine DictFlow.app
-      # or right-click → Open on first launch.
-      - name: Ad-hoc code sign
-        run: |
-          APP=$(find src-tauri/target/aarch64-apple-darwin/release/bundle/macos -name "*.app" | head -1)
-          codesign --force --deep --sign - "$APP"
+      # tauri.conf.json signingIdentity "-" signs the .app before the DMG is
+      # packed. Do not codesign --deep afterwards; that does not update the DMG.
+      - name: Verify signed app inside the DMG
+        run: bash scripts/verify-macos-bundle.sh
 
       - name: Upload release assets
         uses: tauri-apps/tauri-action@v0
