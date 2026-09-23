@@ -78,16 +78,18 @@ DictFlow needs two macOS permissions (same pair SpeakType uses). The app prompts
 
 ### Running a downloaded binary (Gatekeeper)
 
-Pre-built binaries from GitHub Releases are ad-hoc signed but not notarized. To open them:
+Pre-built binaries from GitHub Releases are ad-hoc signed but not notarized. A copy that arrived by download, AirDrop, or USB is quarantined. macOS will block the first open until you clear that:
 
 ```bash
 # Option A: remove quarantine attribute
-xattr -dr com.apple.quarantine DictFlow.app
+xattr -dr com.apple.quarantine /Applications/DictFlow.app
 
-# Option B: right-click → Open in Finder on first launch
+# Option B: System Settings → Privacy & Security → Open Anyway
 ```
 
-Self-built binaries (built from source) have no quarantine attribute and launch immediately.
+A build produced on that same Mac (`bash scripts/build-macos.sh` or `npx tauri build`) has no quarantine and launches directly. The DMG is packed after the ad-hoc signature, so the installed app is the signed app.
+
+The linked binary's minimum macOS is 12.0 (`LSMinimumSystemVersion` and the Mach-O `minos` agree). An older system cannot load it.
 
 ### Troubleshooting
 
