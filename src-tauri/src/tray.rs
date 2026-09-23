@@ -75,7 +75,10 @@ fn activate_nsapp() {
         let cls = objc2::class!(NSApplication);
         let app: *mut AnyObject = msg_send![cls, sharedApplication];
         if !app.is_null() {
-            let _: bool = msg_send![app, activateIgnoringOtherApps: true];
+            // activateIgnoringOtherApps: returns void. Declaring a bool
+            // return makes objc2 panic ("expected v, found B"), and that
+            // panic aborts inside tao's applicationShouldHandleReopen.
+            let _: () = msg_send![app, activateIgnoringOtherApps: true];
         }
     }
 }
@@ -127,6 +130,20 @@ pub(crate) fn build_tray(app: &tauri::AppHandle) -> anyhow::Result<()> {
 }
 
 pub(crate) fn apply_overlay_visibility(app: &tauri::AppHandle) {
+    // NSWindow level and collection behavior abort off the main thread
+    // ("Must only be used from the main thread"). The 250ms space follow-up
+    // runs on a tokio worker, so hop back before touching the overlay.
+    #[cfg(target_os = "macos")]
+    if unsafe { libc::pthread_main_np() } == 0 {
+        let app = app.clone();
+        let schedule = app.clone();
+        let _ = schedule.run_on_main_thread(move || apply_overlay_visibility_inner(&app));
+        return;
+    }
+    apply_overlay_visibility_inner(app);
+}
+
+fn apply_overlay_visibility_inner(app: &tauri::AppHandle) {
     let Some(win) = app.get_webview_window("overlay") else {
         return;
     };

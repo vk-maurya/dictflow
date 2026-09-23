@@ -78,9 +78,13 @@ pub fn run() {
             Some(vec!["--minimized"]),
         ))
         .plugin(
+            // Do not pre-register Ctrl+Alt+Space here. Plugin setup runs inside
+            // applicationDidFinishLaunching, and a failed RegisterEventHotKey
+            // returns Err. Tauri turns that into panic!("Failed to setup app"),
+            // which aborts across the extern "C" callback (panic_cannot_unwind)
+            // before any window appears. Talk and utility shortcuts are
+            // registered in setup, where a failure is logged and the app stays up.
             tauri_plugin_global_shortcut::Builder::new()
-                .with_shortcuts([crate::hotkey::HOTKEY])
-                .expect("parse hotkey")
                 .with_handler(|app, shortcut, event| {
                     if event.state != ShortcutState::Pressed {
                         return;
@@ -168,7 +172,9 @@ pub fn run() {
                 }
             }
             app.manage(Mutex::new(st));
-            crate::tray::build_tray(app.handle()).expect("build tray");
+            if let Err(e) = crate::tray::build_tray(app.handle()) {
+                log::error!("tray setup failed: {e}");
+            }
             crate::hotkey::apply_hotkey_registration(app.handle());
             crate::hotkey::apply_utility_shortcuts(app.handle());
             crate::tray::apply_overlay_visibility(app.handle());

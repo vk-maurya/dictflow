@@ -222,7 +222,7 @@ mod tests {
 
     #[test]
     fn window_fits_speaktype_recording_pill() {
-        assert!(PILL_W >= 250, "recording HUD is 250px wide");
-        assert!(PILL_H >= 44, "recording HUD is 44px tall");
+        const { assert!(PILL_W >= 250); }
+        const { assert!(PILL_H >= 44); }
     }
 }

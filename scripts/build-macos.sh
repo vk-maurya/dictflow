@@ -20,6 +20,9 @@
 
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
 ARCH="${ARCH:-aarch64}"
 
 case "$ARCH" in
@@ -53,15 +56,16 @@ if [ -z "$APP" ]; then
 fi
 
 if [ -n "$APP" ]; then
-  echo "==> Ad-hoc signing $APP"
-  codesign --force --deep --sign - "$APP"
+  echo "==> Verifying the app inside the DMG"
+  bash "$ROOT/scripts/verify-macos-bundle.sh"
 
   echo ""
   echo "Build complete: $APP"
   echo ""
-  echo "To run from Finder after downloading, remove quarantine:"
-  echo "  xattr -dr com.apple.quarantine \"$APP\""
-  echo "Or right-click -> Open on first launch."
+  echo "A local build has no quarantine and opens directly."
+  echo "A downloaded DMG still needs Gatekeeper cleared once:"
+  echo "  xattr -dr com.apple.quarantine /Applications/DictFlow.app"
+  echo "Or System Settings -> Privacy & Security -> Open Anyway."
 else
   echo "Build complete (app bundle not found at expected path — check target directory)."
 fi
