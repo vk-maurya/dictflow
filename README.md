@@ -46,8 +46,8 @@ Confirm the mic in **Setup** if a take is silent.
 
 - **Offline by default** — Parakeet runs in-process. After the model
   download, dictation does not need the network. No account, no telemetry.
-- **Two local engines** — Parakeet TDT 0.6B v2 (English) and v3 (25
-  languages); Whisper tiny/base/small via an optional whisper.cpp sidecar.
+- **Two local engines** — Parakeet Ultra 0.6B / TDT 0.6B v3 (25
+  languages) and v2 (English); Whisper tiny/base/small via an optional whisper.cpp sidecar.
 - **Optional online** — OpenAI-compatible speech (for example Groq) and an
   optional LLM polish pass. API keys stay in Windows Credential Manager.
 - **Talk key** — hold or toggle; cancel with Esc or another key while held.
