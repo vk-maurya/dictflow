@@ -26,17 +26,19 @@ Both artifacts are unsigned, so SmartScreen may warn.
 ## How to publish (recommended)
 
 1. Bump the three versions above.
-2. Commit on the branch you want to ship.
-3. Tag and push:
+2. Add a `CHANGELOG.md` entry (newest first, Keep a Changelog style).
+3. Commit on the branch you want to ship.
+4. Tag and push:
 
    ```powershell
    git tag v0.2.0
    git push origin v0.2.0
    ```
 
-4. GitHub Actions (`.github/workflows/release.yml`) builds on Windows and
-   opens a **draft** release with the installer, MSI, and portable exe.
-5. Open GitHub → Releases, smoke-check the draft, then **Publish**.
+5. GitHub Actions (`.github/workflows/release.yml`) builds on Windows and
+   macOS and uploads assets to a **draft** release.
+6. Paste the `CHANGELOG.md` entry into the draft release notes, smoke-check,
+   then **Publish**.
 
 `Settings → About → Check for updates` reads the latest *published* release
 from `vk-maurya/dictflow`. Drafts do not count.
