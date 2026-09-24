@@ -9,14 +9,14 @@ Nothing leaves your PC unless you turn on an optional online model.
 
 ![DictFlow](assets/screenshot.png)
 
-**Latest:** [v0.3.0](https://github.com/vk-maurya/dictflow/releases/tag/v0.3.0)
+**Latest:** [v0.3.1](https://github.com/vk-maurya/dictflow/releases/tag/v0.3.1)
 
 ## Download
 
 | File | Use this when |
 |---|---|
-| [DictFlow_0.3.0_x64-setup.exe](https://github.com/vk-maurya/dictflow/releases/download/v0.3.0/DictFlow_0.3.0_x64-setup.exe) | Windows installer (recommended). Start Menu, current-user install, uninstall. |
-| [DictFlow_0.3.0_aarch64.dmg](https://github.com/vk-maurya/dictflow/releases/download/v0.3.0/DictFlow_0.3.0_aarch64.dmg) | macOS (Apple Silicon) disk image. |
+| [DictFlow_0.3.1_x64-setup.exe](https://github.com/vk-maurya/dictflow/releases/download/v0.3.1/DictFlow_0.3.1_x64-setup.exe) | Windows installer (recommended). Start Menu, current-user install, uninstall. |
+| [DictFlow_0.3.1_aarch64.dmg](https://github.com/vk-maurya/dictflow/releases/download/v0.3.1/DictFlow_0.3.1_aarch64.dmg) | macOS (Apple Silicon) disk image. |
 
 [All releases](https://github.com/vk-maurya/dictflow/releases)
 
