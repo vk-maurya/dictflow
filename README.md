@@ -9,14 +9,14 @@ Nothing leaves your PC unless you turn on an optional online model.
 
 ![DictFlow](assets/screenshot.png)
 
-**Latest:** [v0.3.0](https://github.com/vk-maurya/dictflow/releases/tag/v0.3.0)
+**Latest:** [v0.3.1](https://github.com/vk-maurya/dictflow/releases/tag/v0.3.1)
 
 ## Download
 
 | File | Use this when |
 |---|---|
-| [DictFlow_0.3.0_x64-setup.exe](https://github.com/vk-maurya/dictflow/releases/download/v0.3.0/DictFlow_0.3.0_x64-setup.exe) | Windows installer (recommended). Start Menu, current-user install, uninstall. |
-| [DictFlow_0.3.0_aarch64.dmg](https://github.com/vk-maurya/dictflow/releases/download/v0.3.0/DictFlow_0.3.0_aarch64.dmg) | macOS (Apple Silicon) disk image. |
+| [DictFlow_0.3.1_x64-setup.exe](https://github.com/vk-maurya/dictflow/releases/download/v0.3.1/DictFlow_0.3.1_x64-setup.exe) | Windows installer (recommended). Start Menu, current-user install, uninstall. |
+| [DictFlow_0.3.1_aarch64.dmg](https://github.com/vk-maurya/dictflow/releases/download/v0.3.1/DictFlow_0.3.1_aarch64.dmg) | macOS (Apple Silicon) disk image. |
 
 [All releases](https://github.com/vk-maurya/dictflow/releases)
 
@@ -46,8 +46,8 @@ Confirm the mic in **Setup** if a take is silent.
 
 - **Offline by default** — Parakeet runs in-process. After the model
   download, dictation does not need the network. No account, no telemetry.
-- **Two local engines** — Parakeet TDT 0.6B v2 (English) and v3 (25
-  languages); Whisper tiny/base/small via an optional whisper.cpp sidecar.
+- **Two local engines** — Parakeet Ultra 0.6B / TDT 0.6B v3 (25
+  languages) and v2 (English); Whisper tiny/base/small via an optional whisper.cpp sidecar.
 - **Optional online** — OpenAI-compatible speech (for example Groq) and an
   optional LLM polish pass. API keys stay in Windows Credential Manager.
 - **Talk key** — hold or toggle; cancel with Esc or another key while held.

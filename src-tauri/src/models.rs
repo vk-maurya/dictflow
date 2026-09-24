@@ -127,6 +127,26 @@ fn parakeet(
     size_label: &str,
     meta: CatalogMeta<'_>,
 ) -> ModelEntry {
+    parakeet_sized(
+        id,
+        name,
+        repo,
+        languages,
+        size_label,
+        meta,
+        [640_000_000, 18_000_000, 7_000_000, 4_000],
+    )
+}
+
+fn parakeet_sized(
+    id: &str,
+    name: &str,
+    repo: &str,
+    languages: &str,
+    size_label: &str,
+    meta: CatalogMeta<'_>,
+    expected_bytes: [u64; 4],
+) -> ModelEntry {
     ModelEntry {
         id: id.to_owned(),
         name: name.to_owned(),
@@ -139,15 +159,8 @@ fn parakeet(
         min_ram_gb: 4,
         files: ["encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"]
             .into_iter()
-            .map(|f| {
-                let bytes = match f {
-                    "encoder.int8.onnx" => 640_000_000,
-                    "decoder.int8.onnx" => 18_000_000,
-                    "joiner.int8.onnx" => 7_000_000,
-                    _ => 4_000,
-                };
-                parakeet_file(repo, f, bytes)
-            })
+            .zip(expected_bytes)
+            .map(|(f, bytes)| parakeet_file(repo, f, bytes))
             .collect(),
     }
 }
@@ -160,6 +173,15 @@ pub fn catalog() -> Vec<ModelEntry> {
         essence,
     };
     vec![
+        parakeet_sized(
+            "parakeet-ultra",
+            "Parakeet Ultra 0.6B",
+            "mldecode/parakeet-ultra-onnx-int8",
+            "25 languages",
+            "~630 MB",
+            m(9.5, 9.6, "Most accurate"),
+            [612_000_000, 12_300_000, 5_300_000, 94_000],
+        ),
         parakeet(
             "parakeet-v3",
             "Parakeet TDT 0.6B v3",
