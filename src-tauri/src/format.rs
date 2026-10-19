@@ -103,15 +103,6 @@ const NOUN_MARKERS: &[&str] = &[
     "their", "any", "every", "no",
 ];
 
-/// Number words accepted by `#`/`$`/`%` attachment (mirrors `numbers.rs` scope).
-const NUMBER_WORDS: &[&str] = &[
-    "zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
-    "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
-    "sixteen", "seventeen", "eighteen", "nineteen", "twenty", "thirty",
-    "forty", "fifty", "sixty", "seventy", "eighty", "ninety", "hundred",
-    "thousand", "million", "billion", "trillion",
-];
-
 /// Lowercase a token and strip its edge punctuation (matches `text.rs` style).
 fn normalize(tok: &str) -> String {
     tok.trim_matches(|c: char| c.is_ascii_punctuation())
@@ -182,21 +173,15 @@ fn join_pieces(pieces: &[Piece]) -> String {
     out
 }
 
+/// True when a token is already numeric text (`42`, `1,20,000`, `3.5`).
+///
+/// Symbols only attach to digits: the spoken-numbers pass (`numbers.rs`) runs
+/// just before the command pass, so anything still spelled out was left as
+/// words on purpose (a lone `twenty`, a year pair). Gluing a symbol to it would
+/// produce `$twenty`, so those are left untouched instead.
 fn is_number_token(tok: &str) -> bool {
     let n = normalize(tok);
-    if n.is_empty() {
-        return false;
-    }
-    if n.chars().all(|c| c.is_ascii_digit()) {
-        return true;
-    }
-    let has_digit = n.chars().any(|c| c.is_ascii_digit());
-    let numeric = has_digit
-        && n.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',');
-    if numeric {
-        return true;
-    }
-    NUMBER_WORDS.contains(&n.as_str())
+    !n.is_empty() && n.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',')
 }
 
 fn is_initial(tok: &str) -> bool {
@@ -497,7 +482,11 @@ fn drop_discard_commands(text: &str) -> String {
 }
 
 fn rewrite_actually(text: &str) -> String {
-    let toks: Vec<&str> = text.split_whitespace().collect();
+    per_line(text, rewrite_actually_line)
+}
+
+fn rewrite_actually_line(line: &str) -> String {
+    let toks: Vec<&str> = line.split_whitespace().collect();
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
     while i < toks.len() {
@@ -517,7 +506,11 @@ fn rewrite_actually(text: &str) -> String {
 }
 
 fn rewrite_i_mean(text: &str) -> String {
-    let toks: Vec<&str> = text.split_whitespace().collect();
+    per_line(text, rewrite_i_mean_line)
+}
+
+fn rewrite_i_mean_line(line: &str) -> String {
+    let toks: Vec<&str> = line.split_whitespace().collect();
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
     while i < toks.len() {
@@ -537,6 +530,13 @@ fn rewrite_i_mean(text: &str) -> String {
         i += 1;
     }
     out.join(" ")
+}
+
+/// Apply a whitespace-token rewrite to each line separately, so newlines from
+/// the spoken "new line" / "new paragraph" commands survive (blank lines from
+/// "new paragraph" are preserved as empty segments).
+fn per_line(text: &str, f: impl Fn(&str) -> String) -> String {
+    text.split('\n').map(f).collect::<Vec<_>>().join("\n")
 }
 
 #[cfg(test)]
@@ -681,6 +681,26 @@ mod tests {
         for (input, want) in cases {
             assert_eq!(apply_spoken_commands(input), *want, "input: {input:?}");
         }
+    }
+
+    #[test]
+    fn backtrack_preserves_newlines_and_breaks() {
+        // "new line" / "new paragraph" survive the backtrack pass.
+        let staged = apply_spoken_commands("first new line second new paragraph third");
+        assert_eq!(apply_backtrack(&staged), "first\nsecond\n\nthird");
+        // …and the rewrites still work inside a line.
+        let staged = apply_spoken_commands("first new line the meeting is at 5 actually 3");
+        assert_eq!(apply_backtrack(&staged), "first\nthe meeting is at 3");
+    }
+
+    #[test]
+    fn symbols_only_attach_to_digits() {
+        assert_eq!(apply_spoken_commands("dollar 20"), "$20");
+        assert_eq!(apply_spoken_commands("issue hash 42"), "issue #42");
+        assert_eq!(apply_spoken_commands("50 percent"), "50%");
+        // Unconverted number words stay words (no `$twenty` / `twenty%`).
+        assert_eq!(apply_spoken_commands("dollar twenty"), "dollar twenty");
+        assert_eq!(apply_spoken_commands("twenty percent"), "twenty percent");
     }
 
     #[test]

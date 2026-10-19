@@ -517,5 +517,112 @@ mod tests {
         let out = rules_pipeline("um, hello", "en", "off", &mut d);
         assert_eq!(out.text, "um, hello");
     }
+
+    #[test]
+    fn rules_newlines_survive_light_and_full_cleanup() {
+        for cleanup in ["light", "full"] {
+            let mut d = Vec::new();
+            let out = rules_pipeline(
+                "first new line second new paragraph third",
+                "en",
+                cleanup,
+                &mut d,
+            );
+            assert_eq!(out.text, "first\nsecond\n\nthird", "cleanup: {cleanup}");
+        }
+    }
+
+    /// The examples published in `docs/P0_MANUAL_TEST.md`, run through the whole
+    /// rules chain with the app default cleanup (`full`). Keeps the doc honest.
+    #[test]
+    fn documented_examples_match_pipeline() {
+        let cases: &[(&str, &str)] = &[
+            ("four point five stars", "4.5 stars"),
+            ("one lakh twenty thousand", "1,20,000"),
+            ("two hundred fifty dollars", "250 dollars"),
+            ("hello comma world period", "hello, world."),
+            ("are you there question mark", "are you there?"),
+            ("done exclamation mark", "done!"),
+            ("open parenthesis hello close parenthesis", "(hello)"),
+            (
+                "first new line second new paragraph third",
+                "first\nsecond\n\nthird",
+            ),
+            ("the period of time", "the period of time"),
+            ("send a comma", "send a comma"),
+            ("ping at the rate KV", "ping @KV"),
+            (
+                "send it to name at the rate gmail dot com",
+                "send it to name@gmail.com",
+            ),
+            ("issue hash forty two", "issue #42"),
+            ("save fifty percent", "save 50%"),
+            ("what percent of users", "what percent of users"),
+            ("hash out a plan", "hash out a plan"),
+            ("dollar twenty", "dollar twenty"),
+            (
+                "Let's ship Friday sorry remove that Monday",
+                "Let's ship Monday",
+            ),
+            ("hello world scratch that goodbye", "goodbye"),
+            ("the meeting is at 5 actually 3", "the meeting is at 3"),
+            ("the color is blue I mean red", "the color is red"),
+            ("Um, let's go", "Let's go"),
+            ("well uh yeah", "well yeah"),
+            ("It was, you know, fine", "It was, fine"),
+            (
+                "and then and then we shipped it",
+                "and then we shipped it",
+            ),
+            (
+                "Drinking more and more and more",
+                "Drinking more and more and more",
+            ),
+            (
+                "I live in Delhi no sorry I live in Ahmedabad",
+                "I live in Ahmedabad",
+            ),
+            (
+                "one buy milk two call mom three send email",
+                "1. buy milk\n2. call mom\n3. send email",
+            ),
+            ("bullet milk bullet eggs", "- milk\n- eggs"),
+            (
+                "first wash dishes second take out trash",
+                "1. wash dishes\n2. take out trash",
+            ),
+            (
+                "write an email to Sarah saying I will be on holiday tomorrow, best regards, Kartik",
+                "Hi Sarah,\n\nI will be on holiday tomorrow.\n\nBest regards,\nKartik",
+            ),
+        ];
+        for (input, want) in cases {
+            let mut d: Vec<text::DictionaryEntry> = Vec::new();
+            let out = rules_pipeline(input, "en", "full", &mut d);
+            assert_eq!(out.text, *want, "input: {input:?}");
+        }
+
+        // Dictionary entries (set up in Settings → Dictionary).
+        let mut d = vec![entry("1", "my email", "a@b.com")];
+        let out = rules_pipeline("contact my email please", "en", "full", &mut d);
+        assert_eq!(out.text, "contact a@b.com please");
+
+        // A dictionary entry whose replacement is a spoken command.
+        let mut d = vec![entry("1", "kocia mark", "question mark")];
+        let out = rules_pipeline("are you there kocia mark", "en", "full", &mut d);
+        assert_eq!(out.text, "are you there?");
+
+        // Cleanup off / non-English gate.
+        let mut d = Vec::new();
+        assert_eq!(
+            rules_pipeline("um, hello", "en", "off", &mut d).text,
+            "um, hello"
+        );
+        let mut d = Vec::new();
+        assert_eq!(
+            rules_pipeline("Um, hello world", "de", "full", &mut d).text,
+            "Um, hello world"
+        );
+    }
 }
 
