@@ -12,6 +12,7 @@ use anyhow::Context;
 use crate::devices;
 use crate::format;
 use crate::models::{self, EngineKind};
+use crate::numbers;
 use crate::polish;
 use crate::settings::Settings;
 use crate::text;
@@ -330,8 +331,13 @@ pub(crate) fn run_transcription(
     };
     let raw_text = raw.trim().to_owned();
 
+    // P0a: spoken numbers → digits first, so later passes (spoken commands,
+    // dictionary) already see digits — "issue hash forty two" → "…#42".
+    // `raw_text` is deliberately left untouched for history.
+    let with_numbers = numbers::apply_spoken_numbers(&raw_text);
+
     // P2: spoken commands → backtrack → lists, then dictionary + cleanup.
-    let formatted = format::apply_offline_format(&raw_text);
+    let formatted = format::apply_offline_format(&with_numbers);
     let mut dictionary = input.dictionary.clone();
     let (mut out, dict_hits) = text::apply_dictionary(&formatted, &mut dictionary);
     if dict_hits > 0 {

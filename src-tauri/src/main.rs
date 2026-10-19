@@ -19,6 +19,7 @@ mod focus;
 mod format;
 mod hotkey;
 mod models;
+mod numbers;
 mod onboarding;
 mod overlay;
 mod paste;
