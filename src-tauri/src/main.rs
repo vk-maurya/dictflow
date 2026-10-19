@@ -15,6 +15,7 @@ mod clean;
 mod commands;
 mod devices;
 mod dictation;
+mod email;
 mod engine;
 mod focus;
 mod format;
