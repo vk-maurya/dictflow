@@ -1,18 +1,18 @@
-// Port of BetterWispr EmailDictation.swift plus deviations:
-// - Closing phrases are exactly best regards | kind regards | regards |
-//   thank you | thanks | cheers | sincerely | warmly (no bare "best",
-//   "wishes", "yours", or "warm regards").
-// - "thank you" renders as "Thanks" (not "Thank you").
-// - When a closing has no signature, the addressee's name is used to sign.
-// - A greeting/body with no recognised closing yields no sign-off block.
-// - The addressee name is case-sensitive (one or two capitalized words) and
-//   its trailing punctuation is stripped.
-// - `send` and a leading `please` are accepted as the intent verb/prefix.
-// - No tone or polish gating here; the caller (engine.rs) gates EN/auto.
-//
-// The module is not yet wired into engine.rs (that lands with the caller task),
-// so silence dead-code until the call site exists.
-#![allow(dead_code)]
+//! Spoken email dictation (P0e): turn "write an email to X saying …" into a
+//! laid-out message.
+//!
+//! Port of BetterWispr `EmailDictation.swift` plus deviations:
+//!
+//! - closing phrases are exactly best regards | kind regards | regards |
+//!   thank you | thanks | cheers | sincerely | warmly (no bare "best",
+//!   "wishes", "yours", or "warm regards");
+//! - "thank you" renders as "Thanks" (not "Thank you");
+//! - when a closing has no signature, the addressee's name is used to sign;
+//! - a greeting/body with no recognised closing yields no sign-off block;
+//! - the addressee name is case-sensitive (one or two capitalized words) and
+//!   its trailing punctuation is stripped;
+//! - `send` and a leading `please` are accepted as the intent verb/prefix;
+//! - no tone or polish gating here; the caller (`engine.rs`) gates EN/auto.
 
 use std::sync::OnceLock;
 

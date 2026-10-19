@@ -1,12 +1,14 @@
-// Port of BetterWispr VoiceCommands.swift plus deviations:
-// - Token-walk engine (like `text.rs`) instead of one left-to-right regex
-//   alternation. The `regex` crate has no look-around, so context rules
-//   (noun-marker guard, `@handle`/`#number` attachment, `%` on a preceding
-//   number, domain join) are decided by scanning whitespace-separated tokens.
-// - Deliberate deviation: there is NO capitalization pass after `. ! ?`
-//   sentence boundaries (BetterWispr re-capitalizes). Adding one would break
-//   the existing tests and is out of P0 scope.
 //! Offline spoken-command, list, and backtrack passes (P2). No LLM.
+//!
+//! Port of BetterWispr `VoiceCommands.swift` plus deviations:
+//!
+//! - token-walk engine (like `text.rs`) instead of one left-to-right regex
+//!   alternation: the `regex` crate has no look-around, so context rules
+//!   (noun-marker guard, `@handle`/`#number` attachment, `%` on a preceding
+//!   number, domain join) are decided by scanning whitespace-separated tokens;
+//! - deliberate deviation: there is NO capitalization pass after `. ! ?`
+//!   sentence boundaries (BetterWispr re-capitalizes). Adding one would break
+//!   the existing tests and is out of P0 scope.
 
 use regex::Regex;
 
@@ -117,8 +119,7 @@ fn normalize(tok: &str) -> String {
 }
 
 /// True when `phrase`, normalized, is one of the spoken-command phrases.
-/// Wired into the vocabulary/hotword filter in P0d; exposed now for reuse.
-#[allow(dead_code)]
+/// Used by the vocabulary command-fix pass (`text::is_command_replacement`).
 pub fn is_spoken_command(phrase: &str) -> bool {
     let norm: Vec<String> = phrase.split_whitespace().map(normalize).collect();
     if norm.is_empty() || norm.iter().any(|s| s.is_empty()) {
@@ -538,13 +539,6 @@ fn rewrite_i_mean(text: &str) -> String {
     out.join(" ")
 }
 
-/// Full P2 offline pass, before user dictionary + cleanup.
-pub fn apply_offline_format(text: &str) -> String {
-    let spoken = apply_spoken_commands(text);
-    let back = apply_backtrack(&spoken);
-    apply_lists(&back)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,7 +629,10 @@ mod tests {
 
     #[test]
     fn pipeline_spoken_then_list() {
-        let out = apply_offline_format("one milk comma two eggs period");
+        // The engine wires these three in order (commands → backtrack → lists).
+        let out = apply_lists(&apply_backtrack(&apply_spoken_commands(
+            "one milk comma two eggs period",
+        )));
         assert_eq!(out, "1. milk,\n2. eggs.");
     }
 

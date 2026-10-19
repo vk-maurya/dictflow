@@ -3,14 +3,14 @@
 //! Ports of SpeakType's pure-logic passes so behavior matches macOS:
 //!
 //! - `DictionaryService` (trigger → replacement snippet/vocab rules)
-//! - `WhisperService` filler-word "Auto Edit"
 //! - `SmartTrailingPunctuation` (don't punctuate emails/URLs/numbers)
 //!
 //! Plus WAV loading and linear resampling to the 16 kHz mono both engines need.
-
-// Port of BetterWispr VocabularyProcessor.swift plus deviations: manual Unicode
-// boundary checks in the match loop instead of regex look-around, and a single
-// alternation compiled over every trigger instead of one regex per entry.
+//!
+//! Vocabulary deviates from BetterWispr `VocabularyProcessor.swift`: manual
+//! Unicode boundary checks in the match loop instead of regex look-around, and a
+//! single alternation compiled over every trigger instead of one regex per
+//! entry. Filler-word removal now lives in `clean.rs` (P0c).
 
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -92,22 +92,11 @@ pub fn word_count(text: &str) -> u32 {
     text.split_whitespace().filter(|t| !t.is_empty()).count() as u32
 }
 
-/// Thin wrapper kept for existing call sites (`engine.rs`). Now delegates to the
-/// single-regex two-phase engine, so semantics are: longest-trigger-first, one
-/// pass (no cascade), Unicode-aware word boundaries, case-insensitive, spaces
-/// matching any whitespace run, and literal replacements.
-pub fn apply_dictionary(text: &str, entries: &mut [DictionaryEntry]) -> (String, u32) {
-    apply_vocabulary(text, entries)
-}
-
-/// True when a replacement is command-shaped — empty, or made up only of
-/// punctuation/symbols/whitespace (`?`, `%`, `\n`, `#`, `@`, `.`) — rather than
-/// a spoken word such as `FigJam`.
-// Wired into the two-phase engine order in a separate change; public API (P0d).
-#[allow(dead_code)]
+/// True when a replacement is a spoken-command phrase (`question mark`, `at the
+/// rate`, …), i.e. the corrected text must be fed through the command engine
+/// rather than inserted literally. Delegates to the command table.
 pub fn is_command_replacement(replacement: &str) -> bool {
-    // TODO(P0b): delegate to crate::format::is_spoken_command
-    replacement.chars().all(|c| !c.is_alphanumeric())
+    crate::format::is_spoken_command(replacement)
 }
 
 /// Post-cleanup vocabulary pass. Every enabled, non-empty trigger compiles into
@@ -123,10 +112,8 @@ pub fn apply_vocabulary(text: &str, entries: &mut [DictionaryEntry]) -> (String,
 }
 
 /// Pre-command pass (BetterWispr `correctedCommands`). Identical machinery, but
-/// only entries whose replacement is command-shaped (see
+/// only entries whose replacement is a spoken-command phrase (see
 /// [`is_command_replacement`]) fire, and `usage` is never touched.
-// Wired into the two-phase engine order in a separate change; public API (P0d).
-#[allow(dead_code)]
 pub fn apply_command_fixes(text: &str, entries: &[DictionaryEntry]) -> (String, u32) {
     let (out, hits, _) = run_vocabulary(text, entries, |e| is_command_replacement(&e.replacement));
     (out, hits)
@@ -239,27 +226,11 @@ fn boundaries_ok(text: &str, start: usize, end: usize) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Auto Edit (filler-word removal, SpeakType `applyAutoEdit`)
+// Auto Edit (punctuation tidy)
+//
+// Filler-word removal now lives in `clean.rs` (P0c), which supersedes the old
+// token-based `remove_fillers` pass.
 // ---------------------------------------------------------------------------
-
-/// Drop filler words ("um", "uh", …). Token-based so no look-around is needed
-/// (the `regex` crate doesn't support it); lone punctuation tokens survive for
-/// the tidy pass.
-pub fn remove_fillers(text: &str) -> String {
-    // The `regex` crate has no look-around, so instead of SpeakType's single
-    // lookahead pattern we filter whitespace-separated tokens: a token whose
-    // punctuation-stripped core is a filler word is dropped ("Um," → dropped,
-    // "hum" and "uh-huh" survive, exactly like the original pattern).
-    let filler = Regex::new(r"(?i)^(uh+|um+|umm+|uhm+|erm+|hmm+)$")
-        .expect("filler pattern compiles");
-    text.split_whitespace()
-        .filter(|tok| {
-            let core = tok.trim_matches(|c: char| c.is_ascii_punctuation());
-            core.is_empty() || !filler.is_match(core)
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
 
 /// Attach stray spaces before punctuation. Preserve newlines (P2 lists /
 /// spoken “new line”); collapse other whitespace runs.
@@ -396,15 +367,15 @@ mod tests {
     fn dictionary_replaces_whole_words_case_insensitively() {
         let mut entries = vec![DictionaryEntry::new("1", "my email", "a@b.com")];
         assert_eq!(
-            apply_dictionary("contact MY EMAIL please", &mut entries).0,
+            apply_vocabulary("contact MY EMAIL please", &mut entries).0,
             "contact a@b.com please"
         );
         assert_eq!(entries[0].usage, 1);
         // Whole-word: no match inside longer words.
         let mut entries = vec![DictionaryEntry::new("1", "fig", "FigJam")];
-        assert_eq!(apply_dictionary("a figment", &mut entries).0, "a figment");
+        assert_eq!(apply_vocabulary("a figment", &mut entries).0, "a figment");
         let mut entries = vec![DictionaryEntry::new("1", "my email", "a@b.com")];
-        let (out, hits) = apply_dictionary("contact MY EMAIL please", &mut entries);
+        let (out, hits) = apply_vocabulary("contact MY EMAIL please", &mut entries);
         assert_eq!(out, "contact a@b.com please");
         assert_eq!(hits, 1);
     }
@@ -520,20 +491,20 @@ mod tests {
 
     #[test]
     fn command_fixes_only_command_replacements_and_skip_usage() {
-        assert!(is_command_replacement("%"));
-        assert!(is_command_replacement(""));
-        assert!(is_command_replacement("\n"));
-        assert!(is_command_replacement("#"));
-        assert!(is_command_replacement("@."));
+        assert!(is_command_replacement("question mark"));
+        assert!(is_command_replacement("at the rate"));
+        assert!(is_command_replacement("new line"));
+        assert!(!is_command_replacement("%"));
+        assert!(!is_command_replacement(""));
         assert!(!is_command_replacement("FigJam"));
         assert!(!is_command_replacement("a@b.com"));
 
         let entries = vec![
-            DictionaryEntry::new("1", "percent", "%"),
+            DictionaryEntry::new("1", "kocia mark", "question mark"),
             DictionaryEntry::new("2", "fig", "FigJam"),
         ];
-        let (out, hits) = apply_command_fixes("50 percent fig", &entries);
-        assert_eq!(out, "50 % fig");
+        let (out, hits) = apply_command_fixes("what is kocia mark fig", &entries);
+        assert_eq!(out, "what is question mark fig");
         assert_eq!(hits, 1);
         // `&[DictionaryEntry]`: usage is untouched by the command pass.
         assert_eq!(entries[0].usage, 0);
@@ -541,10 +512,8 @@ mod tests {
     }
 
     #[test]
-    fn fillers_removed_tidy_kept_separate() {
-        assert_eq!(remove_fillers("Um, let's go"), "let's go");
-        assert_eq!(remove_fillers("well uh yeah"), "well yeah");
-        assert_eq!(remove_fillers("the hum of uh-huh"), "the hum of uh-huh");
+    fn tidy_punctuation_tightens_spacing() {
+        // Filler-word removal moved to `clean.rs`; this keeps the tidy pass pinned.
         assert_eq!(tidy_punctuation("hello , world !"), "hello, world!");
     }
 

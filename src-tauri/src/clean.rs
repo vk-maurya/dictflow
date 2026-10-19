@@ -1,25 +1,22 @@
-// Port of BetterWispr TranscriptCleaner.swift plus deviations:
-//
-// - the English gate is a V1 settings-only check (`language == "en"` or
-//   `"auto"`) with **no `whatlang` auto-detection** — that is a later task
-//   (P1d). Non-English input is returned `trim()`-only, untouched.
-// - the token IR keeps `word` + `trailing` (punctuation + whitespace) so
-//   re-joining a token list is lossless; punctuation is never dropped, only
-//   *carried* onto the previous surviving token.
-// - `drop_repairs` is a conservative edit-episode parser: every cue needs a
-//   repeated anchor (`last repeated word before the cue`) before anything is
-//   deleted, so the default is a no-op rather than a wrong deletion.
-// - `destutter` protects number words / year pairs and protects emphasis
-//   chains like `more and more and more` (`X and X and …`), while still
-//   collapsing `and then and then we`.
-//
-// Pure functions: `&str -> String`, no I/O, no clocks, no locks, no `unwrap`
-// on user text, saturating counters.
-//
-// P0c adds the module + `mod clean;` only; the engine call-site swap lands in a
-// follow-up, so nothing outside this module calls it yet. Silence the "never
-// used" diagnostic until then rather than scattering per-item attributes.
-#![allow(dead_code)]
+//! Transcript cleanup (P0c): fillers, conversational repairs, destutter.
+//!
+//! Port of BetterWispr `TranscriptCleaner.swift` plus deviations:
+//!
+//! - the English gate is a V1 settings-only check (`language == "en"` or
+//!   `"auto"`) with **no `whatlang` auto-detection** — that is a later task
+//!   (P1d). Non-English input is returned `trim()`-only, untouched.
+//! - the token IR keeps `word` + `trailing` (punctuation + whitespace) so
+//!   re-joining a token list is lossless; punctuation is never dropped, only
+//!   *carried* onto the previous surviving token.
+//! - `drop_repairs` is a conservative edit-episode parser: every cue needs a
+//!   repeated anchor (`last repeated word before the cue`) before anything is
+//!   deleted, so the default is a no-op rather than a wrong deletion.
+//! - `destutter` protects number words / year pairs and protects emphasis
+//!   chains like `more and more and more` (`X and X and …`), while still
+//!   collapsing `and then and then we`.
+//!
+//! Pure functions: `&str -> String`, no I/O, no clocks, no locks, no `unwrap`
+//! on user text, saturating counters.
 
 use regex::Regex;
 

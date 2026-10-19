@@ -9,7 +9,9 @@ use std::sync::mpsc;
 
 use anyhow::Context;
 
+use crate::clean;
 use crate::devices;
+use crate::email;
 use crate::format;
 use crate::models::{self, EngineKind};
 use crate::numbers;
@@ -291,6 +293,63 @@ pub(crate) struct TranscriptResult {
     pub dict_hits: u32,
 }
 
+/// Result of the rules-only chain (`rules_pipeline`).
+struct RulesOut {
+    text: String,
+    /// Vocabulary hits (entries whose `usage` was bumped) — drives the save.
+    hits: u32,
+    /// True when the transcript became an email layout: the LLM polish stage
+    /// is skipped so the layout survives.
+    is_email: bool,
+}
+
+/// Rules-only chain applied to the raw transcript, before the optional LLM
+/// polish (docs/TEXT_PIPELINE_PLAN.md §3):
+///   command fixes → spoken numbers → spoken commands → backtrack → lists →
+///   email (short-circuit) | clean → vocabulary → tidy.
+/// `cleanup == "off"` skips both `clean.rs` and the tidy pass.
+fn rules_pipeline(
+    raw_text: &str,
+    language: &str,
+    cleanup: &str,
+    dictionary: &mut [text::DictionaryEntry],
+) -> RulesOut {
+    // Command fixes first: a dictionary entry whose replacement is a spoken
+    // command phrase is expanded so the command pass can act on it. Hits are
+    // discarded — command fixes never bump `usage`, so there is nothing to save.
+    let (cmd_fixed, _) = text::apply_command_fixes(raw_text, dictionary);
+    let with_numbers = numbers::apply_spoken_numbers(&cmd_fixed);
+    let commands = format::apply_spoken_commands(&with_numbers);
+    // `apply_backtrack` still owns the "scratch that / never mind / remove that"
+    // clause delete; `clean.rs` covers the conversational repair cues.
+    let commanded = format::apply_lists(&format::apply_backtrack(&commands));
+
+    if language == "en" || language == "auto" {
+        if let Some(mail) = email::compose_email(&commanded) {
+            return RulesOut {
+                text: mail,
+                hits: 0,
+                is_email: true,
+            };
+        }
+    }
+
+    let cleaned = match cleanup {
+        "light" | "medium" | "full" | "high" => clean::clean(&commanded, language),
+        _ => commanded,
+    };
+    let (vocab, hits) = text::apply_vocabulary(&cleaned, dictionary);
+    let text = match cleanup {
+        "full" | "high" => text::tidy_punctuation(&vocab),
+        _ => vocab,
+    };
+    RulesOut {
+        text,
+        hits,
+        is_email: false,
+    }
+}
+
 /// Heavy work: runs inside `spawn_blocking` so the async runtime stays free.
 pub(crate) fn run_transcription(
     input: &TranscribeInput,
@@ -331,28 +390,25 @@ pub(crate) fn run_transcription(
     };
     let raw_text = raw.trim().to_owned();
 
-    // P0a: spoken numbers → digits first, so later passes (spoken commands,
-    // dictionary) already see digits — "issue hash forty two" → "…#42".
+    // P0 text pipeline (docs/TEXT_PIPELINE_PLAN.md §3), rules-only (no LLM).
     // `raw_text` is deliberately left untouched for history.
-    let with_numbers = numbers::apply_spoken_numbers(&raw_text);
-
-    // P2: spoken commands → backtrack → lists, then dictionary + cleanup.
-    let formatted = format::apply_offline_format(&with_numbers);
     let mut dictionary = input.dictionary.clone();
-    let (mut out, dict_hits) = text::apply_dictionary(&formatted, &mut dictionary);
-    if dict_hits > 0 {
+    let rules = rules_pipeline(
+        &raw_text,
+        &input.language,
+        &input.cleanup,
+        &mut dictionary,
+    );
+    let mut out = rules.text;
+    if rules.hits > 0 {
         text::sort_dictionary(&mut dictionary);
         let _ = text::save_dictionary(&input.data_dir, &dictionary);
     }
-    match input.cleanup.as_str() {
-        "light" | "medium" => out = text::remove_fillers(&out),
-        "full" | "high" => out = text::tidy_punctuation(&text::remove_fillers(&out)),
-        _ => {}
-    }
     out = text::smart_trailing_punctuation(&out);
-    let want_llm = input.polish.llm_enabled
-        || input.cleanup == "medium"
-        || input.cleanup == "high";
+    let want_llm = !rules.is_email
+        && (input.polish.llm_enabled
+            || input.cleanup == "medium"
+            || input.cleanup == "high");
     if want_llm && input.polish.llm_backend != "off" {
         let preset = match input.cleanup.as_str() {
             "high" => "professional",
@@ -381,7 +437,85 @@ pub(crate) fn run_transcription(
         text: out,
         raw_text,
         duration_secs,
-        dict_hits,
+        dict_hits: rules.hits,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, from: &str, to: &str) -> text::DictionaryEntry {
+        text::DictionaryEntry::new(id, from, to)
+    }
+
+    #[test]
+    fn rules_numbers_before_commands() {
+        let mut d = Vec::new();
+        let out = rules_pipeline("issue hash forty two", "en", "light", &mut d);
+        assert_eq!(out.text, "issue #42");
+        assert_eq!(out.hits, 0);
+        assert!(!out.is_email);
+    }
+
+    #[test]
+    fn rules_command_fix_precedes_command_pass() {
+        // A dictionary entry whose replacement is a spoken command is expanded
+        // first, so the command engine turns it into punctuation.
+        let mut d = vec![entry("1", "kocia mark", "question mark")];
+        let out = rules_pipeline("are you there kocia mark", "en", "light", &mut d);
+        assert_eq!(out.text, "are you there?");
+        // Command fixes never bump usage.
+        assert_eq!(d[0].usage, 0);
+    }
+
+    #[test]
+    fn rules_cleanup_then_vocabulary() {
+        let mut d = vec![entry("1", "my email", "a@b.com")];
+        let out = rules_pipeline("contact my um email please", "en", "light", &mut d);
+        assert_eq!(out.text, "contact a@b.com please");
+        assert_eq!(out.hits, 1);
+        assert_eq!(d[0].usage, 1);
+    }
+
+    #[test]
+    fn rules_backtrack_cues_survive_cleanup() {
+        let mut d = Vec::new();
+        let out = rules_pipeline("hello world scratch that goodbye", "en", "light", &mut d);
+        assert_eq!(out.text, "goodbye");
+    }
+
+    #[test]
+    fn rules_email_short_circuits_and_is_language_gated() {
+        let mut d = Vec::new();
+        let out = rules_pipeline(
+            "draft an email to Sarah telling her that I will be late tomorrow, cheers, Sarah",
+            "en",
+            "light",
+            &mut d,
+        );
+        assert!(out.is_email);
+        assert_eq!(
+            out.text,
+            "Hi Sarah,\n\nI will be late tomorrow.\n\nCheers,\nSarah"
+        );
+
+        // Non-English never builds an email layout.
+        let mut d = Vec::new();
+        let out = rules_pipeline(
+            "write an email to Sarah saying hi, best regards, Sarah",
+            "de",
+            "light",
+            &mut d,
+        );
+        assert!(!out.is_email);
+    }
+
+    #[test]
+    fn rules_cleanup_off_leaves_text_alone() {
+        let mut d = Vec::new();
+        let out = rules_pipeline("um, hello", "en", "off", &mut d);
+        assert_eq!(out.text, "um, hello");
+    }
 }
 
