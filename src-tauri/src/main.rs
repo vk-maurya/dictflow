@@ -11,6 +11,7 @@
 // spoken commands / backtrack / lists → dictionary → auto-edit → paste.
 
 mod audio;
+mod clean;
 mod commands;
 mod devices;
 mod dictation;
