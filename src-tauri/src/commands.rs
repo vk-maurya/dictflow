@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
 
 use crate::audio::{default_input_name, resolve_capture_device, start_recording, stop_and_save_wav};
-use crate::devices;
 use crate::dictation::{last_text, spawn_record_ticker};
 use crate::engine::{polish_cfg, resolve_binary};
 use     crate::hotkey::{
@@ -603,11 +602,16 @@ pub(crate) async fn test_audio_api(app: tauri::AppHandle) -> Result<String, Stri
             return Err(e.to_string());
         }
     };
-    if let Some(why) = devices::blank_audio(&samples, 16_000) {
-        let _ = std::fs::remove_file(&wav);
-        return Err(why.message().to_owned());
-    }
-    let bytes = std::fs::read(&wav).map_err(|e| e.to_string())?;
+    // Same Silero gate as dictation: a noisy-but-speechless 1.5 s clip is
+    // refused here too. Uploads the trimmed clip, not the raw recording.
+    let stt_samples = match crate::vad::gate_and_trim(&samples, 16_000, &dir) {
+        Ok(t) => t,
+        Err(why) => {
+            let _ = std::fs::remove_file(&wav);
+            return Err(why.message().to_owned());
+        }
+    };
+    let bytes = crate::vad::encode_wav_bytes_16k(&stt_samples).map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(&wav);
     let base = cfg.audio_api_base.clone();
     let key = cfg.audio_api_key.clone();
