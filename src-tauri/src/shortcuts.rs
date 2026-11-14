@@ -1,7 +1,8 @@
 //! Parse user-facing shortcut strings (`Shift+Alt+Z`) without Tauri types.
 //!
-//! Utility shortcuts (paste-last / copy-last) always need a modifier so we
-//! never steal bare typing. `Ctrl+Alt+Space` is reserved for the talk combo.
+//! Utility shortcuts (paste-last / copy-last / refine-selection) always need a
+//! modifier so we never steal bare typing. `Ctrl+Alt+Space` is reserved for
+//! the talk combo.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShortcutSpec {
@@ -18,6 +19,16 @@ pub fn default_paste_last() -> String {
 
 pub fn default_copy_last() -> String {
     "Shift+Alt+X".to_owned()
+}
+
+pub fn default_refine_selection() -> String {
+    "Alt+1".to_owned()
+}
+
+/// Empty and "Off" both mean the refine shortcut is not registered.
+pub fn is_refine_off(raw: &str) -> bool {
+    let t = raw.trim();
+    t.is_empty() || t.eq_ignore_ascii_case("off")
 }
 
 /// Split on `+`, case-insensitive. Keys: A–Z, 0–9, Space, Escape, F1–F12.
@@ -169,9 +180,26 @@ mod tests {
     fn defaults_parse() {
         assert!(parse_shortcut(&default_paste_last()).is_ok());
         assert!(parse_shortcut(&default_copy_last()).is_ok());
+        assert!(parse_shortcut(&default_refine_selection()).is_ok());
         let a = parse_shortcut(&default_paste_last()).unwrap();
         let b = parse_shortcut(&default_copy_last()).unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn option_1_parses_as_alt_1() {
+        for raw in ["Option+1", "option+1", "alt+1", "Alt+1"] {
+            let s = parse_shortcut(raw).unwrap();
+            assert!(s.alt && !s.ctrl && !s.shift && !s.meta, "{raw}");
+            assert_eq!(s.key, "1");
+            assert_eq!(format_shortcut(&s), "Alt+1");
+            assert!(is_safe_utility(&s));
+            assert!(!is_talk_combo(&s));
+        }
+        assert!(is_refine_off("Off"));
+        assert!(is_refine_off("off"));
+        assert!(is_refine_off(""));
+        assert!(!is_refine_off("Alt+1"));
     }
 
     #[test]

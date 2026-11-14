@@ -2,13 +2,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::sync::{atomic::AtomicBool, Arc, Mutex};
 
 use tauri_plugin_global_shortcut::Shortcut;
 
 use crate::engine::Transcriber;
 use crate::focus;
 use crate::models;
+use crate::s1_runtime::S1Runtime;
 use crate::settings::{
     default_overlay_edge, default_overlay_offset, normalize_talk_key, HistoryItem, NewHistory,
     Settings, HISTORY_LIMIT,
@@ -38,10 +39,15 @@ pub(crate) struct AppState {
     /// Lifetime usage; never cleared with history.
     pub stats: UsageStats,
     pub downloading: HashMap<String, Arc<AtomicBool>>,
-    /// Currently registered paste-last / copy-last shortcuts (so we can swap).
+    /// Currently registered paste-last / copy-last / refine shortcuts (so we can swap).
     pub utility_shortcuts: Vec<Shortcut>,
+    /// True from the moment a refine shortcut is accepted until paste finishes.
+    pub refine_busy: AtomicBool,
+    /// True while the overlay should say Refining. Copy itself stays quiet.
+    pub refining: bool,
     pub data_dir: PathBuf,
     pub transcriber: Transcriber,
+    pub s1_runtime: S1Runtime,
     /// Last non-DictFlow foreground focus handle (HWND on Windows, PID on macOS).
     /// Overlay clicks must not steal the caret; we restore this before paste.
     pub paste_target: Option<focus::FocusHandle>,
@@ -60,16 +66,28 @@ impl AppState {
             if let Ok(s) = serde_json::from_slice::<Settings>(&bytes) {
                 if models::find(&s.model_id).is_some() {
                     self.settings = s;
+                    let mut migrated = false;
                     let native = normalize_talk_key(&self.settings.hotkey_key);
                     if native != self.settings.hotkey_key {
                         self.settings.hotkey_key = native;
-                        self.save_settings();
+                        migrated = true;
+                    }
+                    if self.settings.llm_backend == "s1_mini"
+                        && self.settings.llm_enabled
+                        && self.settings.language != "en"
+                    {
+                        self.settings.language = "en".to_owned();
+                        migrated = true;
                     }
                     // P1 first cut defaulted to top-left. Move that unset pose
                     // to center-bottom so existing installs match the new default.
                     if self.settings.overlay_edge == "top" && self.settings.overlay_offset == 0 {
                         self.settings.overlay_edge = default_overlay_edge();
                         self.settings.overlay_offset = default_overlay_offset();
+                        migrated = true;
+                    }
+                    if migrated {
+                        self.save_settings();
                     }
                     return;
                 }
@@ -208,8 +226,11 @@ mod tests {
             stats: UsageStats::default(),
             downloading: HashMap::new(),
             utility_shortcuts: Vec::new(),
+            refine_busy: AtomicBool::new(false),
+            refining: false,
             data_dir: dir,
             transcriber: Transcriber::spawn(std::env::temp_dir()),
+            s1_runtime: S1Runtime::new(),
             paste_target: None,
         }
     }
@@ -280,6 +301,19 @@ mod tests {
         assert_eq!(s.stats.lifetime_words, 3);
         s.seed_stats_from_history();
         assert_eq!(s.stats.lifetime_dictations, 1, "must not double-count");
+        let _ = std::fs::remove_dir_all(&s.data_dir);
+    }
+
+    #[test]
+    fn enabled_s1_settings_migrate_to_english() {
+        let mut s = test_state();
+        s.settings.llm_backend = "s1_mini".into();
+        s.settings.llm_enabled = true;
+        s.settings.language = "auto".into();
+        s.save_settings();
+        s.settings = Settings::default();
+        s.load_settings();
+        assert_eq!(s.settings.language, "en");
         let _ = std::fs::remove_dir_all(&s.data_dir);
     }
 }

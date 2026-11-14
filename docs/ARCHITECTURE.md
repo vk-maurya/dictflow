@@ -14,6 +14,27 @@ talk key / mic button / tray
   → history (JSON) → clipboard + Ctrl+V (SendInput) → clipboard restore
 ```
 
+Selecting text in another app and pressing the refine shortcut (default
+Option+1 / Alt+1) is a separate path: synthetic copy, the text-cleanup model
+already configured under Models, then paste over the selection. It does not
+record audio and does not write history.
+
+One saved model serves both paths. Each path has its own switch in
+`settings.json`. Saving a model (`llm_backend` other than `off`) does not
+turn either path on by itself.
+
+| Key | Purpose | How it behaves |
+|-----|---------|----------------|
+| `llm_backend` | Which cleanup model is available | `off`, `s1_mini`, `local`, `openai_compat`, `openrouter`, or `anthropic`. `off` means neither path can call a model. |
+| `llm_enabled` | Voice-to-text model cleanup | Default `false` ("Polish after every dictation" in Models → Text cleanup). `false` skips the model after dictation. `true` runs it after every dictation. For every backend except S1-mini, Settings → Cleanup values `medium` and `high` also run the model even when this is `false`. S1-mini runs on dictation only when this is `true`. |
+| `cleanup` | Local voice-to-text rules, no model required | `off` skips them. `light` removes fillers. `full` (default) removes fillers and tidies punctuation. `medium` and `high` do that and also request the model, as above. |
+| `refine_selection_key` | Grammar fix for selected text | Default `Alt+1` (Option+1 on macOS). Runs only when that shortcut is pressed. `Off` disables it. Independent of `llm_enabled`: a model can refine a selection while dictation stays rules-only, and dictation can use the model while this shortcut is `Off`. |
+
+There is no per-take override. To skip model cleanup on voice-to-text, leave
+`llm_enabled` false and set `cleanup` to `off`, `light`, or `full`. To skip
+grammar refine, set `refine_selection_key` to `Off`, or do not press the
+shortcut. A refine that already pasted is not undone from inside DictFlow.
+
 Heavy work never blocks the async runtime: capture, transcription, and the
 hotkey poller each own a thread; only `Send + Sync` handles cross into Tauri
 state (`Arc<Mutex<…>>`, `Arc<AtomicBool>`, `mpsc::Sender`).
@@ -27,7 +48,8 @@ state (`Arc<Mutex<…>>`, `Arc<AtomicBool>`, `mpsc::Sender`).
 | `text.rs` | Pure offline text passes: dictionary, fillers, tidy, smart punctuation, WAV I/O + resampling |
 | `stats.rs` | Lifetime usage ledger (`stats.json`); survives History clear-all |
 | `session.rs` | 19-minute warn / optional 20-minute cap policy |
-| `shortcuts.rs` | Parse/validate paste-last and copy-last shortcut strings |
+| `shortcuts.rs` | Parse/validate paste-last, copy-last, and refine-selection shortcut strings |
+| `refine.rs` | Selected-text refine: capture result, cleanup-model call, shortcut orchestration |
 | `devices.rs` | Mic pick + fallback + peak/RMS (no cpal) |
 | `overlay.rs` | Pill dock snap + copy-chip window |
 | `onboarding.rs` | First-run wizard step machine |
@@ -56,6 +78,7 @@ logs/              # tauri-plugin-log file target
 ## Events (backend → UI)
 
 `dictflow://recording(bool)` · `dictflow://transcribing(bool)` ·
+`dictflow://refining(bool)` · `dictflow://refine-notice{message,error}` ·
 `dictflow://download(string)` · `dictflow://download-progress{model_id,file,received,total}` ·
 `dictflow://history-updated` · `dictflow://level{peak,rms}` · `dictflow://committed{text}` ·
 `dictflow://session-warn` · `dictflow://device-fallback{from,to}`

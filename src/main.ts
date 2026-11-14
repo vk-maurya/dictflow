@@ -5,6 +5,7 @@ import logoUrl from "../assets/logo-512.png";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { attachConsole, error as logError } from "@tauri-apps/plugin-log";
 import { enable as autostartEnable, disable as autostartDisable, isEnabled as autostartIsEnabled } from "@tauri-apps/plugin-autostart";
+import { mockEnabled, mockState } from "./mockPreview";
 
 // ---------------------------------------------------------------------------
 // Types (mirror src-tauri)
@@ -54,6 +55,17 @@ interface ModelStatus {
   active: boolean;
   downloading: boolean;
 }
+interface TextModelStatus {
+  id: string;
+  name: string;
+  size_label: string;
+  languages: string;
+  downloaded: boolean;
+  runtime_ready: boolean;
+  downloading: boolean;
+  active: boolean;
+  attribution: string;
+}
 interface HistoryItem {
   text: string;
   date_unix: number;
@@ -87,8 +99,12 @@ interface Settings {
   overlay_enabled: boolean;
   overlay_edge: string;
   overlay_offset: number;
+  overlay_free: boolean;
+  overlay_x: number;
+  overlay_y: number;
   paste_last_key: string;
   copy_last_key: string;
+  refine_selection_key: string;
   onboarded: boolean;
   session_cap: boolean;
   audio_backend: string;
@@ -102,6 +118,9 @@ interface Settings {
   llm_preset: string;
   llm_custom_prompt: string;
   llm_enabled: boolean;
+  s1_styling?: string;
+  s1_structure?: string;
+  s1_context?: string;
 }
 interface ProviderStatus {
   audio_key_masked: string;
@@ -114,6 +133,8 @@ interface ProviderStatus {
 
 const DEFAULT_PROCESS_PROMPT =
   "You are a transcript editor. Clean and lightly rewrite speech-to-text: fix spelling, ASR errors, grammar, and punctuation. Return only the cleaned text.";
+
+const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 
 const AUDIO_HOSTS: { id: string; label: string; base: string; model: string }[] = [
   { id: "openai", label: "OpenAI", base: "https://api.openai.com/v1", model: "whisper-1" },
@@ -205,6 +226,7 @@ interface Status {
   version: string;
   recommended_model: string;
   transcribing: boolean;
+  refining?: boolean;
   speech_source?: string;
   speech_model?: string;
   speech_model_name?: string;
@@ -253,6 +275,7 @@ interface PermStatus {
 let view: View = "home";
 let status: Status | null = null;
 let models: ModelStatus[] = [];
+let textModel: TextModelStatus | null = null;
 let history: HistoryItem[] = [];
 let usage: UsageStats | null = null;
 let dict: DictionaryEntry[] = [];
@@ -261,6 +284,7 @@ let statsPeriod: StatsPeriod = "today";
 let recordStartedAt: number | null = null;
 let recordTick: number | null = null;
 let transcribing = false;
+let refining = false;
 let lastResult: string | null = null;
 let modelFilter: "all" | Engine = "all";
 let historyQuery = "";
@@ -386,6 +410,20 @@ const UTILITY_KEYS: [string, string][] = isMac
       ["Ctrl+Alt+X", "Ctrl + Alt + X"],
       ["Ctrl+Shift+Z", "Ctrl + Shift + Z"],
       ["Ctrl+Shift+X", "Ctrl + Shift + X"],
+    ];
+
+const REFINE_KEYS: [string, string][] = isMac
+  ? [
+      ["Off", "Off"],
+      ["Alt+1", "Option + 1"],
+      ["Shift+Alt+1", "Shift + Option + 1"],
+      ["Ctrl+Alt+1", "Ctrl + Option + 1"],
+    ]
+  : [
+      ["Off", "Off"],
+      ["Alt+1", "Alt + 1"],
+      ["Shift+Alt+1", "Shift + Alt + 1"],
+      ["Ctrl+Alt+1", "Ctrl + Alt + 1"],
     ];
 
 const OVERLAY_EDGES: [string, string][] = [
@@ -619,6 +657,7 @@ function toast(msg: string, kind: "info" | "success" | "error" = "info", actionL
 }
 
 async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T | null> {
+  if (mockEnabled()) return null;
   try {
     return await invoke<T>(cmd, args);
   } catch (e) {
@@ -636,17 +675,22 @@ async function refreshStatus(): Promise<void> {
   const s = await call<Status>("get_status");
   if (s) {
     status = s;
+    if (typeof s.refining === "boolean") refining = s.refining;
     paintStatusBits();
   }
 }
 
 async function refreshModels(): Promise<void> {
-  const m = await call<ModelStatus[]>("get_models");
+  const [m, t] = await Promise.all([
+    call<ModelStatus[]>("get_models"),
+    call<TextModelStatus>("get_text_model"),
+  ]);
   if (m) {
     models = m;
-    if (view === "models" || view === "onboard") renderView();
-    paintStatusBits();
   }
+  if (t) textModel = t;
+  if ((m || t) && (view === "models" || view === "onboard")) renderView();
+  if (m || t) paintStatusBits();
 }
 
 async function refreshHistory(): Promise<void> {
@@ -746,6 +790,19 @@ async function pickAudioDevice(name: string | null): Promise<void> {
   }
 }
 
+function refineKeyLabel(key: string | undefined): string {
+  if (!key || key === "Off") return "Off";
+  return isMac ? key.replaceAll("Alt", "Option") : key;
+}
+
+function refineKeyOptions(current: string | undefined): [string, string][] {
+  const list: [string, string][] = REFINE_KEYS.map(([v, l]) => [v, l]);
+  if (current && !list.some(([v]) => v === current)) {
+    list.push([current, refineKeyLabel(current)]);
+  }
+  return list;
+}
+
 function hotkeySelectOptions(current: string | undefined): [string, string][] {
   const list: [string, string][] = HOTKEYS.map(([v, l]) => [v, l]);
   if (current && !list.some(([v]) => v === current)) {
@@ -813,9 +870,11 @@ function paintStatusBits(): void {
     const key = talkKey();
     ms.textContent = status.recording
       ? `Recording — ${talkHold() ? `release ${key}` : `press ${key} again`} to finish`
-      : transcribing
-        ? "Transcribing"
-        : `Idle — ${talkHold() ? `hold ${key}` : `press ${key}`} to talk`;
+      : refining
+        ? "Refining selection"
+        : transcribing
+          ? "Transcribing"
+          : `Idle — ${talkHold() ? `hold ${key}` : `press ${key}`} to talk`;
   }
   const mb = document.getElementById("mic-btn") as HTMLButtonElement | null;
   if (mb) mb.classList.toggle("recording", status.recording);
@@ -986,7 +1045,8 @@ function viewDictate(): string {
       ${using}
       • Esc cancels this take
       • Paste last <code>${esc(settings?.paste_last_key ?? "Shift+Alt+Z")}</code>
-      • Copy last <code>${esc(settings?.copy_last_key ?? "Shift+Alt+X")}</code></p>
+      • Copy last <code>${esc(settings?.copy_last_key ?? "Shift+Alt+X")}</code>
+      • Refine selection <code>${esc(refineKeyLabel(settings?.refine_selection_key))}</code></p>
       <div class="level-meter" id="level-meter" ${status?.recording ? "" : "hidden"}><div id="level-fill" style="width:${Math.round(Math.min(livePeak, 1) * 100)}%"></div></div>
       ${status?.recording ? `<div class="row" style="justify-content:center;margin-top:12px"><button class="danger-ghost small" id="cancel-rec">Cancel (Esc)</button></div>` : ""}
       <div class="row" style="justify-content:center;margin-top:12px">
@@ -1043,14 +1103,16 @@ function viewModels(): string {
   const pane = `
     <div class="filter-tabs">
       <button class="${modelsPane === "audio" ? "active" : ""}" id="pane-audio">Audio</button>
-      <button class="${modelsPane === "llm" ? "active" : ""}" id="pane-llm">LLM</button>
+      <button class="${modelsPane === "llm" ? "active" : ""}" id="pane-llm">Text cleanup</button>
     </div>`;
   if (modelsPane === "llm") {
     const s = settings;
     const be = s?.llm_backend ?? "off";
     const bases = [
       ["off", "Off — rules only"],
-      ["local", "Local (Ollama / LM Studio / llama.cpp)"],
+      ["s1_mini", "S1-mini — managed on-device cleanup"],
+      ["local", "External local server (Ollama / LM Studio)"],
+      ["openrouter", "OpenRouter"],
       ["openai_compat", "OpenAI-compatible API"],
       ["anthropic", "Anthropic-compatible API"],
     ];
@@ -1062,33 +1124,84 @@ function viewModels(): string {
       ["bullets", "Bullets"],
       ["custom", "Custom"],
     ];
-    const showConn = be !== "off";
+    const isS1 = be === "s1_mini";
+    const isOpenRouter = be === "openrouter";
+    const showConn = be !== "off" && !isS1;
+    const s1 = textModel;
+    const s1Progress = dlBars["s1-mini"];
+    const s1Ready = !!s1?.downloaded && !!s1?.runtime_ready;
+    const styling = s?.s1_styling ?? "semi-formal";
+    const structure = s?.s1_structure ?? "prose";
+    const context = s?.s1_context ?? "general";
     return `
       <h1>AI Models</h1>
-      <p class="page-sub">Optional rewrite after local rules. Default is off — nothing leaves this PC. If the API errors, the rules text is pasted instead.</p>
+      <p class="page-sub">Audio models create raw text first. Text cleanup then fixes fillers, spelling, grammar, and punctuation before display and paste.</p>
       ${pane}
-      <div class="card provider-card"><h3>LLM backend</h3>
-        <p class="provider-note">Keys are stored in the ${isMac ? "macOS Keychain" : "Windows Credential Manager"}, never in a settings export or a file on disk. A localhost server can use an empty key.</p>
+      <div class="card provider-card"><h3>Text cleanup</h3>
+        <p class="provider-note">S1-mini runs entirely on this computer after Parakeet or Whisper. Remote providers remain optional. Any cleanup failure falls back to DictFlow's local rules.</p>
+        <p class="provider-note">${
+          !s?.refine_selection_key || s.refine_selection_key === "Off"
+            ? "Refine selection is off. Choose a shortcut in Settings to rewrite selected text with this model."
+            : `Press <code>${esc(refineKeyLabel(s.refine_selection_key))}</code> to refine selected text with this model. This runs even when Polish after every dictation is off.`
+        }</p>
         <div class="radio-list">
           ${bases.map(([v, l]) => `<label class="check"><input type="radio" name="llm-be" value="${v}" ${be === v ? "checked" : ""}> ${l}</label>`).join("")}
         </div>
+        ${isS1 ? `
+          <div class="model-card${s1?.active ? " active" : ""}">
+            <div class="model-top">
+              <div><div class="model-name">${esc(s1?.name ?? "S1-mini by Superwhisper")}</div>
+              <div class="muted" style="font-size:12px">${esc(s1?.languages ?? "English-only")} • ${esc(s1?.size_label ?? "462 MB model + local runtime")}</div></div>
+              <span class="badge s1">Text cleanup</span>
+            </div>
+            <div class="essence">Removes fillers and false starts, then fixes spelling, capitalization, punctuation, numbers, dates, and email formatting.</div>
+            ${s1Progress ? `<div class="progress"><div id="dlbar-s1-mini" style="width:${s1Progress.pct ?? 0}%"></div></div><div class="dl-file" id="dlfile-s1-mini">${esc(s1Progress.file)}${s1Progress.pct != null ? ` — ${s1Progress.pct}%` : ""}</div>` : ""}
+            <div class="row">
+              ${s1?.downloading ? `<button class="ghost small" data-cancel-dl="s1-mini">Cancel</button>` : !s1Ready ? `<button class="small" id="s1-install">Install model and runtime</button>` : `<span class="muted" style="font-size:12px">Ready on this device</span><button class="ghost small" id="s1-remove">Remove</button>`}
+            </div>
+          </div>
+          <div class="provider-grid">
+            <label class="field">Writing style<select id="s1-styling">
+              ${[["casual","Casual"],["semi-casual","Semi-casual"],["semi-formal","Semi-formal"],["formal","Formal"]].map(([v,l]) => `<option value="${v}" ${styling === v ? "selected" : ""}>${l}</option>`).join("")}
+            </select></label>
+            <label class="field">Structure<select id="s1-structure">
+              ${[["prose","Prose"],["lists","Lists when appropriate"]].map(([v,l]) => `<option value="${v}" ${structure === v ? "selected" : ""}>${l}</option>`).join("")}
+            </select></label>
+            <label class="field">Context<select id="s1-context">
+              ${[["general","General"],["email","Email"]].map(([v,l]) => `<option value="${v}" ${context === v ? "selected" : ""}>${l}</option>`).join("")}
+            </select></label>
+          </div>
+          <div class="set-row">
+            <div><b>Clean every English dictation</b><div class="desc">Enabling S1-mini selects English; Parakeet/API transcripts are also language-checked before cleanup.</div></div>
+            <input type="checkbox" id="llm-on" ${s?.llm_enabled ? "checked" : ""} ${s1Ready ? "" : "disabled"}>
+          </div>
+          <p class="provider-note">${esc(s1?.attribution ?? "S1-mini by Superwhisper; Apache 2.0 plus naming clause")}. The runtime listens on loopback only.</p>
+        ` : ""}
         ${
           showConn
-            ? `<div class="provider-grid">
-          <label class="field">Base URL<input type="text" id="llm-base" value="${esc(s?.llm_api_base ?? "")}" placeholder="http://127.0.0.1:11434/v1"></label>
-          <label class="field">Model<input type="text" id="llm-model" value="${esc(s?.llm_api_model ?? "")}" placeholder="gpt-4o-mini"></label>
-          <label class="field">API key<input type="password" id="llm-key" autocomplete="off" placeholder="${esc(provider?.llm_key_masked || "optional on localhost")}"></label>
+            ? `<p class="provider-note">${isOpenRouter
+              ? `OpenRouter sends cleanup to <code>${OPENROUTER_BASE}</code>. Create a key at openrouter.ai/keys. ${isMac ? "The key stays in DictFlow's private data folder on this Mac." : "The key is stored in Windows Credential Manager."} Model IDs include the provider, such as <code>openai/gpt-4o-mini</code>. A model id ending in <code>:free</code> is often rate-limited and returns HTTP 429.`
+              : `${isMac ? "Keys stay in DictFlow's private data folder on this Mac." : "Keys are stored in Windows Credential Manager."} They are kept out of the settings file.`}</p><div class="provider-grid">
+          ${isOpenRouter ? "" : `<label class="field">Base URL<input type="text" id="llm-base" value="${esc(s?.llm_api_base ?? "")}" placeholder="http://127.0.0.1:11434/v1"></label>`}
+          <label class="field">Model<input type="text" id="llm-model" value="${esc(s?.llm_api_model ?? "")}" placeholder="${isOpenRouter ? "cohere/north-mini-code:free" : "gpt-4o-mini"}" list="${isOpenRouter ? "openrouter-models" : ""}"></label>
+          ${isOpenRouter ? `<datalist id="openrouter-models">
+            <option value="cohere/north-mini-code:free"></option>
+            <option value="dots-studio/dots-3-note-preview:free"></option>
+            <option value="openai/gpt-4o-mini"></option>
+            <option value="openai/gpt-4.1-mini"></option>
+          </datalist>` : ""}
+          <label class="field">API key<input type="password" id="llm-key" autocomplete="off" placeholder="${esc(provider?.llm_key_masked || (isOpenRouter ? "required" : "optional on localhost"))}"></label>
         </div>`
             : ""
         }
-        <div class="provider-grid">
+        ${showConn ? `<div class="provider-grid">
           <label class="field">Preset<select id="llm-preset">${presets.map(([v, l]) => `<option value="${v}" ${s?.llm_preset === v ? "selected" : ""}>${l}</option>`).join("")}</select></label>
           <label class="field span-all"><span class="field-head">Process prompt
             <button type="button" class="ghost small" id="llm-prompt-reset">Reset to default</button></span>
             <textarea id="llm-custom" rows="4" placeholder="${esc(DEFAULT_PROCESS_PROMPT)}">${esc(processPromptFor(s?.llm_preset ?? "clean", s?.llm_custom_prompt ?? ""))}</textarea>
-            <span class="field-hint">The model cleans and rewrites the transcript (spelling, ASR slips, punctuation). Reset restores the Clean preset from the app.</span>
+            <span class="field-hint">This prompt is sent with every cleanup. If the model host rejects it, DictFlow pastes local cleanup and shows why. Reset restores the Clean preset.</span>
           </label>
-        </div>
+        </div>` : ""}
         ${
           showConn
             ? `<div class="set-row">
@@ -1096,11 +1209,12 @@ function viewModels(): string {
           <input type="checkbox" id="llm-on" ${s?.llm_enabled ? "checked" : ""}>
         </div>
         <div class="row">
-          <button class="small" id="llm-save">Save LLM</button>
+          <button class="small" id="llm-save">Save cleanup</button>
           <button class="ghost small" id="llm-test">Test connection</button>
         </div>`
             : `<div class="row">
-          <button class="small" id="llm-save">Save LLM</button>
+          <button class="small" id="llm-save">Save cleanup</button>
+          ${isS1 && s1Ready ? `<button class="ghost small" id="llm-test">Test S1-mini</button>` : ""}
         </div>`
         }
       </div>`;
@@ -1120,7 +1234,7 @@ function viewModels(): string {
       </div>
       ${
         audioApi
-          ? `<p class="provider-note">The API key is stored in the ${isMac ? "macOS Keychain" : "Windows Credential Manager"}. Use the <code>/v1</code> root (Groq: <code>https://api.groq.com/openai/v1</code>), not the full <code>/audio/transcriptions</code> path. Test records 1.5 seconds from <b>${esc(micName)}</b> and POSTs only if the clip has speech.</p>
+          ? `<p class="provider-note">${isMac ? "The API key stays in DictFlow's private data folder on this Mac." : "The API key is stored in Windows Credential Manager."} Use the <code>/v1</code> root (Groq: <code>https://api.groq.com/openai/v1</code>), not the full <code>/audio/transcriptions</code> path. Test records 1.5 seconds from <b>${esc(micName)}</b> and POSTs only if the clip has speech.</p>
       <div class="provider-grid">
         <label class="field">Host<select id="audio-host">${AUDIO_HOSTS.map((h) => `<option value="${h.id}" ${audioHostId(s?.audio_api_base ?? "") === h.id ? "selected" : ""}>${h.label}</option>`).join("")}</select></label>
         <label class="field">Base URL<input type="text" id="audio-base" value="${esc(s?.audio_api_base ?? "")}" placeholder="https://api.groq.com/openai/v1"></label>
@@ -1500,7 +1614,9 @@ function viewSettings(): string {
   const langOpts = LANGUAGES.map(
     ([v, l]) => `<option value="${v}" ${settings!.language === v ? "selected" : ""}>${l}</option>`
   ).join("");
-  const llmReady = settings.llm_backend !== "off";
+  const llmReady =
+    settings.llm_backend !== "off" &&
+    (settings.llm_backend !== "s1_mini" || settings.llm_enabled);
   const cleanupOpts = CLEANUPS.map(
     ([v, l]) => `<option value="${v}" ${settings!.cleanup === v ? "selected" : ""}>${l}</option>`
   ).join("") +
@@ -1527,6 +1643,12 @@ function viewSettings(): string {
   const copyOpts = UTILITY_KEYS.map(
     ([v, l]) => `<option value="${v}" ${settings!.copy_last_key === v ? "selected" : ""}>${l}</option>`
   ).join("");
+  const refineOpts = refineKeyOptions(settings!.refine_selection_key)
+    .map(
+      ([v, l]) =>
+        `<option value="${v}" ${settings!.refine_selection_key === v ? "selected" : ""}>${l}</option>`
+    )
+    .join("");
   return `
     <h1>Settings</h1>
     <p class="page-sub">Everything stays on this PC. No accounts, no telemetry.</p>
@@ -1557,14 +1679,16 @@ function viewSettings(): string {
         <select id="set-mic">${micOpts}</select></div>
     </div>
     <div class="card"><h3>Overlay &amp; shortcuts</h3>
-      <div class="set-row"><div><b>Floating pill</b><div class="desc">Always-on-top Flow-style meter above the Dock / taskbar. Click to start or stop. Drag to dock an edge.</div></div>
+      <div class="set-row"><div><b>Floating pill</b><div class="desc">Always-on-top meter. Click to start or stop. Drag it anywhere on the screen.</div></div>
         <input type="checkbox" id="set-overlay" ${settings.overlay_enabled ? "checked" : ""}></div>
-      <div class="set-row"><div><b>Dock edge</b><div class="desc">Where the pill sits. Dragging also updates this.</div></div>
+      <div class="set-row"><div><b>Dock edge</b><div class="desc">Optional. Choosing an edge parks the pill there. Dragging it again leaves it where you drop it.</div></div>
         <select id="set-edge">${edgeOpts}</select></div>
       <div class="set-row"><div><b>Paste last</b><div class="desc">Wispr default is Shift+Alt+Z. Pastes the newest transcript into the focused app.</div></div>
         <select id="set-paste-last">${pasteOpts}</select></div>
       <div class="set-row"><div><b>Copy last</b><div class="desc">Wispr default is Shift+Alt+X. Copies without pasting.</div></div>
         <select id="set-copy-last">${copyOpts}</select></div>
+      <div class="set-row"><div><b>Refine selection</b><div class="desc">Select text in any app, then press this shortcut. DictFlow rewrites it with the model from Models → Text cleanup and pastes over the selection. Default is ${isMac ? "Option+1" : "Alt+1"}.</div></div>
+        <select id="set-refine">${refineOpts}</select></div>
       <div class="set-row"><div><b>20-minute cap</b><div class="desc">Always warns at 19 minutes. Turn this on to auto-finish (keep) the take at 20, matching Wispr. Off = unlimited.</div></div>
         <input type="checkbox" id="set-cap" ${settings.session_cap ? "checked" : ""}></div>
     </div>
@@ -1860,22 +1984,31 @@ function bindView(): void {
       (document.getElementById("llm-preset") as HTMLSelectElement | null)?.value ?? settings.llm_preset,
       (document.getElementById("llm-custom") as HTMLTextAreaElement | null)?.value ?? settings.llm_custom_prompt,
     );
+    const enabled = (document.getElementById("llm-on") as HTMLInputElement | null)?.checked ?? settings.llm_enabled;
     const res = await call<Settings>("set_settings", {
       settings: {
         ...settings,
+        language: be === "s1_mini" && enabled ? "en" : settings.language,
         llm_backend: be,
-        llm_api_base: (document.getElementById("llm-base") as HTMLInputElement | null)?.value ?? settings.llm_api_base,
+        llm_api_base: be === "openrouter"
+          ? OPENROUTER_BASE
+          : (document.getElementById("llm-base") as HTMLInputElement | null)?.value ?? settings.llm_api_base,
         llm_api_model: (document.getElementById("llm-model") as HTMLInputElement | null)?.value ?? settings.llm_api_model,
         llm_preset: resolved.preset,
         llm_custom_prompt: resolved.custom,
-        llm_enabled: (document.getElementById("llm-on") as HTMLInputElement | null)?.checked ?? settings.llm_enabled,
+        llm_enabled: enabled,
+        s1_styling: (document.getElementById("s1-styling") as HTMLSelectElement | null)?.value ?? settings.s1_styling ?? "semi-formal",
+        s1_structure: (document.getElementById("s1-structure") as HTMLSelectElement | null)?.value ?? settings.s1_structure ?? "prose",
+        s1_context: (document.getElementById("s1-context") as HTMLSelectElement | null)?.value ?? settings.s1_context ?? "general",
       },
     });
-    if (res) settings = res;
+    if (!res) return;
+    settings = res;
     const key = (document.getElementById("llm-key") as HTMLInputElement | null)?.value ?? "";
     if (key.trim()) await call("set_provider_secrets", { audioApiKey: null, llmApiKey: key });
     await refreshProvider();
-    toast("LLM settings saved", "success");
+    await refreshModels();
+    toast("Text cleanup settings saved", "success");
     renderView();
   };
   document.getElementById("audio-save")?.addEventListener("click", () => saveAudioApi().catch(() => undefined));
@@ -1892,6 +2025,21 @@ function bindView(): void {
     }
   });
   document.getElementById("llm-save")?.addEventListener("click", () => saveLlm().catch(() => undefined));
+  document.getElementById("s1-install")?.addEventListener("click", async () => {
+    dlBars["s1-mini"] = { file: "starting secure download…", pct: null };
+    renderView();
+    const msg = await call<string>("download_text_model");
+    delete dlBars["s1-mini"];
+    await refreshModels();
+    if (msg !== null) toast(msg, "success");
+  });
+  document.getElementById("s1-remove")?.addEventListener("click", async () => {
+    if (!window.confirm("Remove S1-mini and its local llama.cpp runtime?")) return;
+    const msg = await call<string>("delete_text_model");
+    if (msg !== null) toast(msg, "success");
+    await refreshSettings();
+    await refreshModels();
+  });
   document.querySelectorAll("input[name=audio-be], input[name=llm-be]").forEach((el) => {
     el.addEventListener("change", () => {
       if (!settings) return;
@@ -1909,6 +2057,7 @@ function bindView(): void {
       const lc = document.getElementById("llm-custom") as HTMLTextAreaElement | null;
       const lo = document.getElementById("llm-on") as HTMLInputElement | null;
       if (lb) settings.llm_api_base = lb.value;
+      if (llmBe === "openrouter") settings.llm_api_base = OPENROUTER_BASE;
       if (lm) settings.llm_api_model = lm.value;
       if (lp && lc) {
         const resolved = resolveSavedPrompt(lp.value, lc.value);
@@ -1916,6 +2065,12 @@ function bindView(): void {
         settings.llm_custom_prompt = resolved.custom;
       }
       if (lo) settings.llm_enabled = lo.checked;
+      const ss = document.getElementById("s1-styling") as HTMLSelectElement | null;
+      const st = document.getElementById("s1-structure") as HTMLSelectElement | null;
+      const sc = document.getElementById("s1-context") as HTMLSelectElement | null;
+      if (ss) settings.s1_styling = ss.value;
+      if (st) settings.s1_structure = st.value;
+      if (sc) settings.s1_context = sc.value;
       renderView();
     });
   });
@@ -2112,6 +2267,7 @@ function bindView(): void {
   const sedge = document.getElementById("set-edge") as HTMLSelectElement | null;
   const spl = document.getElementById("set-paste-last") as HTMLSelectElement | null;
   const scl = document.getElementById("set-copy-last") as HTMLSelectElement | null;
+  const srf = document.getElementById("set-refine") as HTMLSelectElement | null;
   const scap = document.getElementById("set-cap") as HTMLInputElement | null;
   const saveSettings = async () => {
     if (!settings || !sm || !sl || !sp || !sc || !st || !sk || !smo) return;
@@ -2129,8 +2285,12 @@ function bindView(): void {
       audio_device: smic?.value ? smic.value : null,
       overlay_enabled: sov?.checked ?? settings.overlay_enabled,
       overlay_edge: sedge?.value ?? settings.overlay_edge,
+      overlay_free: (sedge?.value ?? settings.overlay_edge) !== settings.overlay_edge
+        ? false
+        : settings.overlay_free,
       paste_last_key: spl?.value ?? settings.paste_last_key,
       copy_last_key: scl?.value ?? settings.copy_last_key,
+      refine_selection_key: srf?.value ?? settings.refine_selection_key ?? "Alt+1",
       session_cap: scap?.checked ?? settings.session_cap,
     };
     const res = await call<Settings>("set_settings", { settings: next });
@@ -2153,6 +2313,7 @@ function bindView(): void {
   sedge?.addEventListener("change", saveSettings);
   spl?.addEventListener("change", saveSettings);
   scl?.addEventListener("change", saveSettings);
+  srf?.addEventListener("change", saveSettings);
   scap?.addEventListener("change", saveSettings);
 
   const onHotkey = document.getElementById("on-hotkey") as HTMLSelectElement | null;
@@ -2216,6 +2377,23 @@ function bindView(): void {
 // ---------------------------------------------------------------------------
 
 async function boot(): Promise<void> {
+  if (mockEnabled()) {
+    const demo = mockState();
+    status = demo.status;
+    models = demo.models;
+    history = demo.history;
+    usage = demo.usage;
+    dict = demo.dict;
+    settings = demo.settings;
+    provider = demo.provider;
+    audioDevices = demo.audioDevices;
+    perms = demo.perms;
+    lastResult = demo.lastResult;
+    if (demo.view) view = demo.view as View;
+    if (view === "stats") statsPeriod = "7d";
+    render();
+    return;
+  }
   attachConsole().catch(() => undefined);
   document.addEventListener("contextmenu", (e) => {
     const t = e.target as HTMLElement | null;
@@ -2234,6 +2412,13 @@ async function boot(): Promise<void> {
   await listen<boolean>("dictflow://transcribing", (e) => {
     transcribing = e.payload;
     paintStatusBits();
+  });
+  await listen<boolean>("dictflow://refining", (e) => {
+    refining = e.payload;
+    paintStatusBits();
+  });
+  await listen<{ message: string; error: boolean }>("dictflow://refine-notice", (e) => {
+    toast(e.payload.message, e.payload.error ? "error" : "info");
   });
   await listen<string>("dictflow://download", (e) => toast(e.payload, "info"));
   await listen<DlProgress>("dictflow://download-progress", (e) => {
@@ -2263,6 +2448,9 @@ async function boot(): Promise<void> {
   await listen<{ text: string; chip_ms?: number }>("dictflow://committed", (e) => {
     lastResult = e.payload.text;
     if (view === "dictate") renderView();
+  });
+  await listen<string>("dictflow://cleanup-fallback", (e) => {
+    toast(e.payload, "info");
   });
   await listen("dictflow://session-warn", () => {
     toast("19 minutes — still recording. Esc cancels, talk key finishes.", "info");

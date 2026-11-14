@@ -106,11 +106,66 @@ const ORDINALS: &[&str] = &[
     "ninth", "tenth",
 ];
 
+fn token_core(word: &str) -> String {
+    word.trim_matches(|c: char| c.is_ascii_punctuation())
+        .to_ascii_lowercase()
+}
+
 fn marker_index(word: &str, family: &[&str]) -> Option<usize> {
-    let core = word
-        .trim_matches(|c: char| c.is_ascii_punctuation())
-        .to_ascii_lowercase();
+    let core = token_core(word);
     family.iter().position(|m| *m == core)
+}
+
+fn is_list_cue(word: &str) -> bool {
+    matches!(
+        token_core(word).as_str(),
+        "thing" | "point" | "pointer" | "item" | "change" | "is"
+    )
+}
+
+fn is_list_glue(word: &str) -> bool {
+    matches!(
+        token_core(word).as_str(),
+        "and" | "the" | "then" | "so" | "uh" | "um" | "yeah"
+    )
+}
+
+fn trim_list_item(text: &str) -> String {
+    let mut toks: Vec<&str> = text.split_whitespace().collect();
+    while toks.first().is_some_and(|tok| is_list_glue(tok)) {
+        toks.remove(0);
+    }
+    while toks.last().is_some_and(|tok| is_list_glue(tok)) {
+        toks.pop();
+    }
+    toks.join(" ")
+}
+
+fn finish_clause(text: &str) -> String {
+    let text = text.trim();
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut out = first.to_uppercase().collect::<String>();
+    out.extend(chars);
+    if !out.ends_with(['.', '!', '?']) {
+        out.push('.');
+    }
+    out
+}
+
+fn ordinal_at(word: &str) -> Option<usize> {
+    let core = token_core(word);
+    ORDINALS
+        .iter()
+        .position(|marker| *marker == core)
+        .or(match core.as_str() {
+            "firstly" => Some(0),
+            "secondly" => Some(1),
+            "thirdly" => Some(2),
+            _ => None,
+        })
 }
 
 /// Numbered / bulleted lists when the utterance *starts* with a marker
@@ -126,6 +181,9 @@ pub fn apply_lists(text: &str) -> String {
     if let Some(out) = try_bullet_list(trimmed) {
         return out;
     }
+    if let Some(out) = try_spoken_points(trimmed) {
+        return out;
+    }
     text.to_owned()
 }
 
@@ -137,11 +195,17 @@ fn try_marker_list(text: &str, family: &[&str]) -> Option<String> {
     let mut items: Vec<String> = Vec::new();
     let mut expected = 0usize;
     let mut cur = String::new();
+    let mut skip_cues = 0u8;
     for tok in &toks {
+        if skip_cues > 0 && is_list_cue(tok) {
+            skip_cues -= 1;
+            continue;
+        }
+        skip_cues = 0;
         if let Some(idx) = marker_index(tok, family) {
             if idx == expected {
                 if expected > 0 {
-                    let item = cur.trim().to_owned();
+                    let item = trim_list_item(&cur);
                     if item.is_empty() {
                         return None;
                     }
@@ -149,6 +213,7 @@ fn try_marker_list(text: &str, family: &[&str]) -> Option<String> {
                     cur.clear();
                 }
                 expected += 1;
+                skip_cues = 3;
                 continue;
             }
         }
@@ -158,7 +223,11 @@ fn try_marker_list(text: &str, family: &[&str]) -> Option<String> {
         cur.push_str(tok);
     }
     if !cur.trim().is_empty() {
-        items.push(cur.trim().to_owned());
+        let item = trim_list_item(&cur);
+        if item.is_empty() {
+            return None;
+        }
+        items.push(item);
     }
     if items.len() < 2 || expected < 2 {
         return None;
@@ -171,6 +240,95 @@ fn try_marker_list(text: &str, family: &[&str]) -> Option<String> {
             .collect::<Vec<_>>()
             .join("\n"),
     )
+}
+
+struct SpokenHit {
+    tok_idx: usize,
+    ord: usize,
+    explicit: bool,
+}
+
+/// "…first thing is A. Second, B. Third, C." after a lead-in sentence.
+/// Bare ordinals ("the first time… the second day") stay prose unless one
+/// marker is an explicit list cue.
+fn try_spoken_points(text: &str) -> Option<String> {
+    let toks: Vec<&str> = text.split_whitespace().collect();
+    if toks.len() < 4 {
+        return None;
+    }
+    let mut hits = Vec::new();
+    for (i, tok) in toks.iter().enumerate() {
+        let Some(ord) = ordinal_at(tok) else {
+            continue;
+        };
+        let word = token_core(tok);
+        let next_cue = toks.get(i + 1).is_some_and(|next| is_list_cue(next));
+        let explicit = next_cue || matches!(word.as_str(), "firstly" | "secondly" | "thirdly");
+        hits.push(SpokenHit {
+            tok_idx: i,
+            ord,
+            explicit,
+        });
+    }
+    let start = hits.iter().position(|hit| hit.ord == 0)?;
+    if hits[start].tok_idx == 0 {
+        return None;
+    }
+    let mut seq = vec![start];
+    let mut expect = 1usize;
+    for (idx, hit) in hits.iter().enumerate().skip(start + 1) {
+        if hit.ord == expect {
+            seq.push(idx);
+            expect += 1;
+        } else if hit.ord > expect {
+            break;
+        }
+    }
+    if seq.len() < 2 || !seq.iter().any(|&idx| hits[idx].explicit) {
+        return None;
+    }
+
+    let mut preamble_toks = toks[..hits[seq[0]].tok_idx].to_vec();
+    while preamble_toks.last().is_some_and(|tok| is_list_glue(tok)) {
+        preamble_toks.pop();
+    }
+    let preamble = preamble_toks.join(" ");
+
+    let mut items = Vec::new();
+    for (n, &hit_idx) in seq.iter().enumerate() {
+        let hit = &hits[hit_idx];
+        let mut content_at = hit.tok_idx + 1;
+        let mut skipped = 0u8;
+        while skipped < 3 && content_at < toks.len() && is_list_cue(toks[content_at]) {
+            content_at += 1;
+            skipped += 1;
+        }
+        let end = if n + 1 < seq.len() {
+            hits[seq[n + 1]].tok_idx
+        } else {
+            toks.len()
+        };
+        if content_at >= end {
+            return None;
+        }
+        let item = trim_list_item(&toks[content_at..end].join(" "));
+        if item.is_empty() {
+            return None;
+        }
+        items.push(finish_clause(&item));
+    }
+
+    let list = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| format!("{}. {item}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if preamble.is_empty() {
+        Some(list)
+    } else {
+        Some(format!("{}\n\n{list}", finish_clause(&preamble)))
+    }
 }
 
 fn try_bullet_list(text: &str) -> Option<String> {
@@ -318,6 +476,32 @@ mod tests {
         assert_eq!(
             apply_lists("first wash dishes second take out trash"),
             "1. wash dishes\n2. take out trash"
+        );
+    }
+
+    #[test]
+    fn list_strips_spoken_point_cues() {
+        assert_eq!(
+            apply_lists("first thing is buy milk second thing is call mom"),
+            "1. buy milk\n2. call mom"
+        );
+    }
+
+    #[test]
+    fn spoken_points_after_a_lead_in_become_a_list() {
+        assert_eq!(
+            apply_lists(
+                "We need to create a multiple pointer. So first thing is when we click it will automatically fix the grammar. Second, if we are talking some pointer, it will automatically fix the pointer. Third, however wherever we need to make the changes. So yeah."
+            ),
+            "We need to create a multiple pointer.\n\n1. When we click it will automatically fix the grammar.\n2. If we are talking some pointer, it will automatically fix the pointer.\n3. However wherever we need to make the changes."
+        );
+    }
+
+    #[test]
+    fn bare_ordinals_in_prose_stay_prose() {
+        assert_eq!(
+            apply_lists("The first time I tried, the second day was better."),
+            "The first time I tried, the second day was better."
         );
     }
 

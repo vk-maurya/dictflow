@@ -34,6 +34,7 @@
         "visibleOnAllWorkspaces": true,
         "skipTaskbar": true,
         "resizable": false,
+        "minimizable": false,
         "shadow": false,
         "focus": false
       }

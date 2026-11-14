@@ -1,7 +1,7 @@
 //! Dictation session: start/stop, live meter, transcribe, paste.
 
 use std::path::Path;
-use std::sync::{Mutex, atomic::Ordering};
+use std::sync::{atomic::Ordering, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -51,7 +51,11 @@ pub(crate) fn set_transcribing(app: &tauri::AppHandle, on: bool) {
     let _ = app.emit("dictflow://transcribing", on);
 }
 
-pub(crate) fn emit_device_fallback(app: &tauri::AppHandle, preferred: Option<&str>, choice: &devices::DeviceChoice) {
+pub(crate) fn emit_device_fallback(
+    app: &tauri::AppHandle,
+    preferred: Option<&str>,
+    choice: &devices::DeviceChoice,
+) {
     if choice.fell_back {
         let _ = app.emit(
             "dictflow://device-fallback",
@@ -93,12 +97,15 @@ pub(crate) fn spawn_record_ticker(app: tauri::AppHandle) {
                 (level, bins, elapsed, err, cap)
             };
             let (level, bins, elapsed, stream_err, cap) = snap;
-            let _ = app.emit("dictflow://level", LevelEvent {
-                peak: level.peak,
-                rms: level.rms,
-                bins,
-                elapsed,
-            });
+            let _ = app.emit(
+                "dictflow://level",
+                LevelEvent {
+                    peak: level.peak,
+                    rms: level.rms,
+                    bins,
+                    elapsed,
+                },
+            );
             if stream_err {
                 let st: State<'_, Mutex<AppState>> = app.state();
                 if let Ok(mut guard) = st.lock() {
@@ -162,7 +169,11 @@ pub(crate) fn cancel_dictation(
 }
 
 pub(crate) fn last_text(state: &AppState) -> Option<String> {
-    state.history.first().map(|h| h.text.clone()).filter(|t| !t.is_empty())
+    state
+        .history
+        .first()
+        .map(|h| h.text.clone())
+        .filter(|t| !t.is_empty())
 }
 
 #[tauri::command]
@@ -171,6 +182,9 @@ pub(crate) async fn toggle_recording(
     state: State<'_, Mutex<AppState>>,
 ) -> Result<String, String> {
     remember_paste_target(&app);
+    if state.lock().unwrap().transcribing {
+        return Err("a transcription is already in progress".to_owned());
+    }
     if !state.lock().unwrap().recording {
         let mut s = state.lock().unwrap();
         let preferred = s.settings.audio_device.clone();
@@ -191,12 +205,12 @@ pub(crate) async fn stop_transcribe(
     app: &tauri::AppHandle,
     state: State<'_, Mutex<AppState>>,
 ) -> Result<String, String> {
-
     // Snapshot everything the heavy work needs, then release the lock.
     let (input, parakeet, duration_secs, history_model, audio, cleanup) = {
         let mut s = state.lock().unwrap();
         s.hotkey_owned = false;
         let (wav, duration_secs) = stop_and_save_wav(&mut s).map_err(|e| e.to_string())?;
+        s.transcribing = true;
         let model_id = s.settings.model_id.clone();
         let history_model = active_speech_id(&s.settings);
         let cleanup = s.settings.cleanup.clone();
@@ -210,8 +224,16 @@ pub(crate) async fn stop_transcribe(
             data_dir: s.data_dir.clone(),
             dictionary: text::load_dictionary(&s.data_dir),
             polish: polish_cfg(&s.settings, &s.data_dir),
+            s1_runtime: s.s1_runtime.clone(),
         };
-        (input, s.transcriber.clone(), duration_secs, history_model, audio, cleanup)
+        (
+            input,
+            s.transcriber.clone(),
+            duration_secs,
+            history_model,
+            audio,
+            cleanup,
+        )
     };
     set_transcribing(app, true);
     let _ = app.emit("dictflow://recording", false);
@@ -231,7 +253,14 @@ pub(crate) async fn stop_transcribe(
         return Err(e.clone());
     }
     let result = result.unwrap();
+    if let Some(note) = &result.cleanup_note {
+        let _ = app.emit("dictflow://cleanup-fallback", note.clone());
+    }
     let text = result.text.clone();
+    if text.is_empty() {
+        let _ = std::fs::remove_file(&wav_for_cleanup);
+        return Ok("nothing to paste after cleanup".to_owned());
+    }
 
     let (auto_paste, saved_target) = {
         let mut s = state.lock().unwrap();
@@ -250,7 +279,10 @@ pub(crate) async fn stop_transcribe(
     let _ = app.emit("dictflow://committed", committed(text.clone()));
 
     if !auto_paste {
-        return Ok(format!("transcribed (auto-paste off): {}", truncate(&text, 160)));
+        return Ok(format!(
+            "transcribed (auto-paste off): {}",
+            truncate(&text, 160)
+        ));
     }
     // Pasting must not kill the transcription if the foreground app rejects keys.
     match paste_text(app, &text, paste_target_for(app, saved_target)) {
@@ -274,19 +306,27 @@ pub(crate) async fn transcribe_file(
     if !Path::new(&path).is_file() {
         return Err("file not found".to_owned());
     }
-    // Copy into our recordings folder: playback keeps working if the original
-    // moves, and the webview can load it back by file name.
     let owned = {
-        let s = state.lock().unwrap();
+        let mut s = state.lock().unwrap();
+        if s.recording || s.transcribing {
+            return Err("finish the current recording or transcription first".to_owned());
+        }
         let dir = s.data_dir.join("recordings");
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        s.transcribing = true;
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
         dir.join(format!("file-{stamp}.wav"))
     };
-    std::fs::copy(&path, &owned).map_err(|e| format!("copy audio file: {e}"))?;
+    let _ = app.emit("dictflow://transcribing", true);
+    // Copy into our recordings folder: playback keeps working if the original
+    // moves, and the webview can load it back by file name.
+    if let Err(error) = std::fs::copy(&path, &owned) {
+        set_transcribing(&app, false);
+        return Err(format!("copy audio file: {error}"));
+    }
     let (input, parakeet) = {
         let s = state.lock().unwrap();
         let input = TranscribeInput {
@@ -298,10 +338,10 @@ pub(crate) async fn transcribe_file(
             data_dir: s.data_dir.clone(),
             dictionary: text::load_dictionary(&s.data_dir),
             polish: polish_cfg(&s.settings, &s.data_dir),
+            s1_runtime: s.s1_runtime.clone(),
         };
         (input, s.transcriber.clone())
     };
-    set_transcribing(&app, true);
     let result = tokio::task::spawn_blocking(move || run_transcription(&input, &parakeet)).await;
     set_transcribing(&app, false);
     let result = result
@@ -314,6 +354,13 @@ pub(crate) async fn transcribe_file(
         return Err(e.clone());
     }
     let result = result.unwrap();
+    if let Some(note) = &result.cleanup_note {
+        let _ = app.emit("dictflow://cleanup-fallback", note.clone());
+    }
+    if result.text.is_empty() {
+        let _ = std::fs::remove_file(&owned);
+        return Ok("nothing to save after cleanup".to_owned());
+    }
     {
         let mut s = state.lock().unwrap();
         let model = active_speech_id(&s.settings);
@@ -360,8 +407,11 @@ mod tests {
             stats: UsageStats::default(),
             downloading: HashMap::new(),
             utility_shortcuts: Vec::new(),
+            refine_busy: std::sync::atomic::AtomicBool::new(false),
+            refining: false,
             data_dir: dir,
             transcriber: Transcriber::spawn(std::env::temp_dir()),
+            s1_runtime: crate::s1_runtime::S1Runtime::new(),
             paste_target: None,
         }
     }
@@ -386,4 +436,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&s.data_dir);
     }
 }
-

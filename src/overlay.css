@@ -57,6 +57,7 @@ html:active, body:active { cursor: grabbing; }
 }
 
 #pill.transcribing,
+#pill.refining,
 #pill.copychip {
   width: 168px;
   height: 44px;
@@ -66,24 +67,56 @@ html:active, body:active { cursor: grabbing; }
   justify-content: center;
 }
 
-.idle-bars {
+.idle-mark {
   display: none;
   align-items: center;
   justify-content: center;
-  gap: 3px;
-  height: 12px;
+  width: 100%;
+  height: 100%;
 }
-#pill.idle .idle-bars { display: flex; }
-.idle-bars span {
-  width: 3px;
-  border-radius: 2px;
+#pill.idle .idle-mark { display: flex; }
+.idle-mark span {
+  width: 2px;
+  height: 10px;
+  border-radius: 1px;
   background: rgba(255, 255, 255, 0.92);
 }
-.idle-bars span:nth-child(1),
-.idle-bars span:nth-child(5) { height: 50%; }
-.idle-bars span:nth-child(2),
-.idle-bars span:nth-child(4) { height: 85%; }
-.idle-bars span:nth-child(3) { height: 100%; }
+#pill.vertical.idle {
+  width: 24px;
+  height: 58px;
+  padding: 10px 0;
+}
+#pill.vertical .idle-mark span {
+  width: 10px;
+  height: 2px;
+}
+#pill.vertical.recording {
+  width: 44px;
+  height: 250px;
+  padding: 12px 0 10px;
+  flex-direction: column;
+}
+#pill.vertical.recording #wave {
+  width: 22px;
+  height: auto;
+  flex: 1;
+  min-height: 0;
+}
+#pill.vertical .time {
+  min-width: 0;
+  text-align: center;
+}
+#pill.vertical.transcribing,
+#pill.vertical.refining,
+#pill.vertical.copychip {
+  width: 44px;
+  height: 168px;
+  padding: 14px 0;
+  flex-direction: column;
+}
+#pill.vertical .status {
+  writing-mode: vertical-rl;
+}
 
 .dot {
   display: none;
@@ -130,4 +163,5 @@ html:active, body:active { cursor: grabbing; }
   white-space: nowrap;
 }
 #pill.transcribing .status,
+#pill.refining .status,
 #pill.copychip .status { display: block; }
