@@ -33,6 +33,13 @@ const NOISE_GATE = 0.02;
 const PRESENCE_FULL = 0.08;
 const MIN_BAR = 2;
 const DRAG_PX = 12;
+/// Must match `src/overlay.css` phase footprints. The pill is centered in the
+/// overlay window, so the backend gate knows where the pill sits on screen.
+const HIT_SIZE: Record<Phase, { w: number; h: number }> = {
+  idle: { w: 58, h: 24 },
+  recording: { w: 250, h: 44 },
+  transcribing: { w: 168, h: 44 },
+};
 
 type Press = {
   sx: number;
@@ -71,6 +78,7 @@ function setPhase(next: Phase): void {
   phase = next;
   pill()?.classList.remove("idle", "recording", "transcribing", "copychip");
   pill()?.classList.add(next);
+  reportHitRect();
   if (next === "recording") {
     bins.fill(0);
     setTime(0);
@@ -82,6 +90,33 @@ function setPhase(next: Phase): void {
     raf = 0;
   }
   if (next === "idle") bins.fill(0);
+}
+
+/// Tell the backend exactly which window-relative rect the pill covers once
+/// its size transition settles, so hover-gated click-through matches the
+/// visible pill. The target footprint is known statically; a measured
+/// confirmation lands after the morph transition in case CSS drifted.
+function reportHitRect(): void {
+  const el = pill();
+  if (!el) return;
+  const target: Phase = phase;
+  const { w, h } = HIT_SIZE[target];
+  void invoke("set_overlay_hit_rect", {
+    x: Math.round((document.body.clientWidth - w) / 2),
+    y: Math.round((document.body.clientHeight - h) / 2),
+    w,
+    h,
+  }).catch(() => undefined);
+  window.setTimeout(() => {
+    if (phase !== target) return; // a newer morph already reported
+    const r = el.getBoundingClientRect();
+    void invoke("set_overlay_hit_rect", {
+      x: Math.round(r.left),
+      y: Math.round(r.top),
+      w: Math.round(r.width),
+      h: Math.round(r.height),
+    }).catch(() => undefined);
+  }, 340);
 }
 
 function applyStatus(s: AppStatus): void {
@@ -251,9 +286,12 @@ async function snapAfterDrag(): Promise<void> {
 }
 
 async function boot(): Promise<void> {
-  await win.setIgnoreCursorEvents(false).catch(() => undefined);
+  // Clickability is owned by the backend hover gate (`hover.rs`): the whole
+  // window is click-through except the pill's reported hit rect. Do not
+  // force it clickable here.
   document.addEventListener("contextmenu", (e) => e.preventDefault());
   setPhase("idle");
+  reportHitRect(); // boot's setPhase early-returns (already idle)
 
   const host = pill();
   if (host) {
@@ -263,6 +301,8 @@ async function boot(): Promise<void> {
       press = { sx: e.screenX, sy: e.screenY, originX: 0, originY: 0, ready: false };
       dragged = false;
       host.setPointerCapture(e.pointerId);
+      // Keep the backend hover gate from flipping to pass-through mid-drag.
+      void invoke("set_overlay_drag", { active: true }).catch(() => undefined);
       void captureOrigin();
     });
     host.addEventListener("pointermove", onPointerMove);
@@ -278,10 +318,18 @@ async function boot(): Promise<void> {
       const hadPress = press !== null;
       resetPress();
       if (wasDrag) {
-        void snapAfterDrag();
+        void snapAfterDrag().finally(() =>
+          invoke("set_overlay_drag", { active: false }).catch(() => undefined),
+        );
         return;
       }
-      if (hadPress) void toggleFromOverlay();
+      if (hadPress) {
+        void toggleFromOverlay().finally(() =>
+          invoke("set_overlay_drag", { active: false }).catch(() => undefined),
+        );
+        return;
+      }
+      void invoke("set_overlay_drag", { active: false }).catch(() => undefined);
     };
     host.addEventListener("pointerup", onRelease);
     host.addEventListener("pointercancel", onRelease);

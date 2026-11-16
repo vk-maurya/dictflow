@@ -20,6 +20,7 @@ mod engine;
 mod focus;
 mod format;
 mod hotkey;
+mod hover;
 mod models;
 mod numbers;
 mod onboarding;
@@ -182,6 +183,7 @@ pub fn run() {
             crate::hotkey::apply_utility_shortcuts(app.handle());
             crate::tray::apply_overlay_visibility(app.handle());
             crate::focus::spawn_overlay_space_follow(app.handle());
+            crate::hover::spawn_hover_follow(app.handle().clone());
             let onboarded = app
                 .state::<Mutex<AppState>>()
                 .lock()
@@ -398,6 +400,8 @@ pub fn run() {
             paste_last,
             snap_overlay,
             set_overlay_pose,
+            set_overlay_hit_rect,
+            set_overlay_drag,
             onboard_step,
             copy_chip_open,
             transcribe_file,
