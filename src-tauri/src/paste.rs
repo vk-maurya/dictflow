@@ -315,7 +315,23 @@ mod windows {
     }
 
     pub(crate) fn inject_copy() -> anyhow::Result<()> {
+        // The refine hotkey includes Alt, so the physical Alt key is often
+        // still held when this runs. A leftover Alt turns the copy into
+        // Ctrl+Alt+C, which most targets ignore (and can drop the focused app
+        // into its menu bar). Clear stuck modifiers, then send plain Ctrl+C.
+        clear_stuck_modifiers();
+        std::thread::sleep(Duration::from_millis(80));
         chord('c').context("copy")
+    }
+
+    fn clear_stuck_modifiers() {
+        use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+        let Ok(mut enigo) = Enigo::new(&Settings::default()) else {
+            return;
+        };
+        for key in [Key::Alt, Key::Shift, Key::Meta, Key::Control] {
+            let _ = enigo.key(key, Direction::Release);
+        }
     }
 
     pub(crate) fn paste_text(

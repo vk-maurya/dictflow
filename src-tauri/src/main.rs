@@ -149,6 +149,7 @@ pub fn run() {
                             }
                         });
                     } else if refine.as_ref() == Some(shortcut) {
+                        log::info!("refine shortcut triggered");
                         crate::refine::start(app.clone());
                     }
                 })
