@@ -211,6 +211,7 @@ export function mockState() {
       refine_selection_key: "Alt+1",
       onboarded: true,
       session_cap: false,
+      segment_dictation: true,
       audio_backend: "local",
       audio_api_base: "",
       audio_api_model: "",

@@ -107,6 +107,10 @@ pub(crate) struct Settings {
     /// Hard-stop the take at 20 minutes. Default off (warn only at 19).
     #[serde(default)]
     pub session_cap: bool,
+    /// Cut the take at natural pauses and transcribe each piece while you keep
+    /// talking, so a long dictation does not wait on one big decode.
+    #[serde(default = "default_true")]
+    pub segment_dictation: bool,
     #[serde(default = "default_audio_backend")]
     pub audio_backend: String,
     #[serde(default)]
@@ -210,6 +214,7 @@ impl Default for Settings {
             refine_selection_key: shortcuts::default_refine_selection(),
             onboarded: false,
             session_cap: false,
+            segment_dictation: true,
             audio_backend: default_audio_backend(),
             audio_api_base: String::new(),
             audio_api_model: default_audio_model(),
@@ -420,6 +425,10 @@ mod tests {
         }"#;
         let s: Settings = serde_json::from_str(json).expect("legacy settings");
         assert!(s.onboarded, "missing onboarded must default true");
+        assert!(
+            s.segment_dictation,
+            "legacy settings get segmented dictation"
+        );
         assert_eq!(s.paste_last_key, "Shift+Alt+Z");
         assert_eq!(s.refine_selection_key, "Alt+1");
         assert!(s.overlay_enabled);
@@ -432,6 +441,26 @@ mod tests {
         assert_eq!(s.s1_styling, "semi-formal");
         assert_eq!(s.s1_structure, "prose");
         assert_eq!(s.s1_context, "general");
+    }
+
+    #[test]
+    fn segment_dictation_defaults_on_and_respects_explicit_off() {
+        assert!(Settings::default().segment_dictation);
+        let with = |flag: bool| {
+            let mut v = serde_json::to_value(Settings::default()).unwrap();
+            v["segment_dictation"] = serde_json::Value::Bool(flag);
+            serde_json::from_value::<Settings>(v).expect("settings with explicit flag")
+        };
+        let off = with(false);
+        assert!(!off.segment_dictation);
+        assert!(with(true).segment_dictation);
+        // A file written before the field existed loads as on.
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("segment_dictation");
+        let legacy: Settings = serde_json::from_value(v).unwrap();
+        assert!(legacy.segment_dictation);
+        let round: Settings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!round.segment_dictation);
     }
 
     #[test]

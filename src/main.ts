@@ -109,6 +109,7 @@ interface Settings {
   refine_selection_key: string;
   onboarded: boolean;
   session_cap: boolean;
+  segment_dictation: boolean;
   audio_backend: string;
   audio_api_base: string;
   audio_api_model: string;
@@ -1694,6 +1695,8 @@ function viewSettings(): string {
         <select id="set-refine">${refineOpts}</select></div>
       <div class="set-row"><div><b>20-minute cap</b><div class="desc">Always warns at 19 minutes. Turn this on to auto-finish (keep) the take at 20, matching Wispr. Off = unlimited.</div></div>
         <input type="checkbox" id="set-cap" ${settings.session_cap ? "checked" : ""}></div>
+      <div class="set-row"><div><b>Transcribe while you talk</b><div class="desc">Cuts long dictation at natural pauses and transcribes each piece in the background, so the text appears sooner after you stop. Nothing is skipped. Turn off to transcribe the whole take at once.</div></div>
+        <input type="checkbox" id="set-segment" ${settings.segment_dictation !== false ? "checked" : ""}></div>
     </div>
     <div class="card"><h3>Storage & engine</h3>
       <div class="set-row"><div><b>Data folder</b><div class="desc"><code>${esc(status?.data_dir ?? "")}</code></div></div></div>
@@ -2273,6 +2276,7 @@ function bindView(): void {
   const scl = document.getElementById("set-copy-last") as HTMLSelectElement | null;
   const srf = document.getElementById("set-refine") as HTMLSelectElement | null;
   const scap = document.getElementById("set-cap") as HTMLInputElement | null;
+  const sseg = document.getElementById("set-segment") as HTMLInputElement | null;
   const saveSettings = async () => {
     if (!settings || !sm || !sl || !sp || !sc || !st || !sk || !smo) return;
     const pickLocal = sm.value && sm.value !== "__online__";
@@ -2296,6 +2300,7 @@ function bindView(): void {
       copy_last_key: scl?.value ?? settings.copy_last_key,
       refine_selection_key: srf?.value ?? settings.refine_selection_key ?? "Alt+1",
       session_cap: scap?.checked ?? settings.session_cap,
+      segment_dictation: sseg?.checked ?? settings.segment_dictation,
     };
     const res = await call<Settings>("set_settings", { settings: next });
     if (res) {
@@ -2319,6 +2324,7 @@ function bindView(): void {
   scl?.addEventListener("change", saveSettings);
   srf?.addEventListener("change", saveSettings);
   scap?.addEventListener("change", saveSettings);
+  sseg?.addEventListener("change", saveSettings);
 
   const onHotkey = document.getElementById("on-hotkey") as HTMLSelectElement | null;
   const onMode = document.getElementById("on-mode") as HTMLSelectElement | null;

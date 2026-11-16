@@ -1,17 +1,22 @@
 //! Dictation session: start/stop, live meter, transcribe, paste.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{atomic::Ordering, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{Emitter, Manager, State};
 
-use crate::audio::{start_recording, stop_and_save_wav};
+use crate::audio::{finish_recording, start_recording, stop_and_save_wav};
 use crate::devices;
-use crate::engine::{polish_cfg, run_transcription, TranscribeInput};
+use crate::engine::{
+    polish_cfg, run_file_transcription, run_segmented, run_transcription, segment_stt, SttSettings,
+    TranscribeInput,
+};
 use crate::overlay;
 use crate::paste::{paste_target_for, paste_text, remember_paste_target};
+use crate::segment_jobs::{next_take_id, SegmentSession};
+use crate::segmenter::{find_vad_model, make_source};
 use crate::session;
 use crate::settings::{active_speech_id, truncate, NewHistory};
 use crate::state::AppState;
@@ -70,6 +75,7 @@ pub(crate) fn emit_device_fallback(
 /// Live peak/RMS + 19-minute warn / optional 20-minute cap. Not used for the
 /// 1.5 s Setup mic test.
 pub(crate) fn spawn_record_ticker(app: tauri::AppHandle) {
+    spawn_segmenter(app.clone());
     tauri::async_runtime::spawn(async move {
         let mut warned = false;
         loop {
@@ -142,6 +148,132 @@ pub(crate) fn spawn_record_ticker(app: tauri::AppHandle) {
     });
 }
 
+/// Bundled Silero VAD model file name.
+const VAD_MODEL_FILE: &str = "silero_vad.onnx";
+
+/// Segmenting starts this long after recording begins. Takes shorter than the
+/// first segment never need it, and the 1.5 s Setup mic test never builds a VAD.
+const SEGMENT_START_DELAY: Duration = Duration::from_millis(2000);
+
+/// Find a verified Silero model, or `None` (the energy detector takes over).
+pub(crate) fn resolve_vad_model(app: &tauri::AppHandle, data_dir: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(res) = app.path().resource_dir() {
+        candidates.push(res.join("resources").join(VAD_MODEL_FILE));
+        candidates.push(res.join(VAD_MODEL_FILE));
+    }
+    candidates.push(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(VAD_MODEL_FILE),
+    );
+    candidates.push(data_dir.join("models").join(VAD_MODEL_FILE));
+    find_vad_model(&candidates)
+}
+
+/// Inputs for building a segment session outside the state lock.
+struct SegmentBuild {
+    rate: u32,
+    stt: SttSettings,
+    transcriber: crate::engine::Transcriber,
+    data_dir: PathBuf,
+}
+
+/// While recording: cut the take at pauses and hand each piece to a background
+/// worker, so most of the audio is already transcribed when the user stops.
+fn spawn_segmenter(app: tauri::AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut take_started: Option<std::time::Instant> = None;
+        let mut vad_model: Option<Option<PathBuf>> = None;
+        loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let build: Option<SegmentBuild> = {
+                let st = app.state::<Mutex<AppState>>();
+                let Ok(mut s) = st.lock() else {
+                    break;
+                };
+                if !s.recording || !s.settings.segment_dictation {
+                    break;
+                }
+                let Some(rec) = s.active.as_ref() else {
+                    break;
+                };
+                let (started, rate) = (rec.started_at, rec.sample_rate);
+                let has_session = rec.segments.is_some();
+                let old_enough = started.elapsed() >= SEGMENT_START_DELAY;
+                match take_started {
+                    None => take_started = Some(started),
+                    // A newer take replaced the one this task started on.
+                    Some(t) if t != started => break,
+                    Some(_) => {}
+                }
+                if has_session {
+                    if let Some(rec) = s.active.as_mut() {
+                        let samples = rec.samples.clone();
+                        let all = samples.lock().unwrap();
+                        if let Some(session) = rec.segments.as_mut() {
+                            session.poll(&all);
+                        }
+                    }
+                    None
+                } else if !old_enough {
+                    None
+                } else {
+                    Some(SegmentBuild {
+                        rate,
+                        stt: SttSettings::from_settings(&s.settings, &s.data_dir),
+                        transcriber: s.transcriber.clone(),
+                        data_dir: s.data_dir.clone(),
+                    })
+                }
+            };
+            if let Some(SegmentBuild {
+                rate,
+                stt,
+                transcriber,
+                data_dir,
+            }) = build
+            {
+                {
+                    let model = vad_model
+                        .get_or_insert_with(|| resolve_vad_model(&app, &data_dir))
+                        .clone();
+                    let cfg = stt.segment_cfg();
+                    let built = tokio::task::spawn_blocking(move || {
+                        let (source, label) = make_source(rate, model.as_deref());
+                        let stt_fn = segment_stt(stt, transcriber, next_take_id());
+                        SegmentSession::new(rate, cfg, source, label, stt_fn)
+                    })
+                    .await;
+                    let Ok(session) = built else {
+                        break;
+                    };
+                    let st = app.state::<Mutex<AppState>>();
+                    let Ok(mut s) = st.lock() else {
+                        break;
+                    };
+                    let recording = s.recording;
+                    match s.active.as_mut() {
+                        Some(rec) if Some(rec.started_at) == take_started && recording => {
+                            log::info!(
+                                "dictation segmenting on ({}, min {:.0}s, hard {:.0}s)",
+                                session.source_label(),
+                                cfg.min_secs,
+                                cfg.hard_secs
+                            );
+                            rec.segments = Some(session);
+                        }
+                        _ => {
+                            session.cancel();
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Discard the live recording without transcribing, filing, or pasting
 /// (SpeakType's cancel path: modifier-combo pressed mid-take).
 pub(crate) fn cancel_recording(state: &mut AppState) -> anyhow::Result<()> {
@@ -206,10 +338,11 @@ pub(crate) async fn stop_transcribe(
     state: State<'_, Mutex<AppState>>,
 ) -> Result<String, String> {
     // Snapshot everything the heavy work needs, then release the lock.
-    let (input, parakeet, duration_secs, history_model, audio, cleanup) = {
+    let (input, parakeet, duration_secs, history_model, audio, cleanup, segments) = {
         let mut s = state.lock().unwrap();
         s.hotkey_owned = false;
-        let (wav, duration_secs) = stop_and_save_wav(&mut s).map_err(|e| e.to_string())?;
+        let take = finish_recording(&mut s).map_err(|e| e.to_string())?;
+        let (wav, duration_secs, segments) = (take.wav_path, take.duration_secs, take.segments);
         s.transcribing = true;
         let model_id = s.settings.model_id.clone();
         let history_model = active_speech_id(&s.settings);
@@ -233,15 +366,20 @@ pub(crate) async fn stop_transcribe(
             history_model,
             audio,
             cleanup,
+            segments,
         )
     };
     set_transcribing(app, true);
     let _ = app.emit("dictflow://recording", false);
 
     // STT + post-processing can take seconds (model load, inference) — keep it
-    // off the async runtime.
+    // off the async runtime. A segmented take only has its tail left to decode.
     let wav_for_cleanup = input.wav_path.clone();
-    let result = tokio::task::spawn_blocking(move || run_transcription(&input, &parakeet)).await;
+    let result = tokio::task::spawn_blocking(move || match segments {
+        Some(finished) => run_segmented(&input, &parakeet, finished, duration_secs),
+        None => run_transcription(&input, &parakeet),
+    })
+    .await;
     set_transcribing(app, false);
     let result = result
         .map_err(|e| format!("transcription task failed: {e}"))
@@ -327,8 +465,12 @@ pub(crate) async fn transcribe_file(
         set_transcribing(&app, false);
         return Err(format!("copy audio file: {error}"));
     }
-    let (input, parakeet) = {
+    let (input, parakeet, segment_cfg, data_dir) = {
         let s = state.lock().unwrap();
+        let segment_cfg = s
+            .settings
+            .segment_dictation
+            .then(|| SttSettings::from_settings(&s.settings, &s.data_dir).segment_cfg());
         let input = TranscribeInput {
             wav_path: owned.clone(),
             model_id: s.settings.model_id.clone(),
@@ -340,9 +482,17 @@ pub(crate) async fn transcribe_file(
             polish: polish_cfg(&s.settings, &s.data_dir),
             s1_runtime: s.s1_runtime.clone(),
         };
-        (input, s.transcriber.clone())
+        (
+            input,
+            s.transcriber.clone(),
+            segment_cfg,
+            s.data_dir.clone(),
+        )
     };
-    let result = tokio::task::spawn_blocking(move || run_transcription(&input, &parakeet)).await;
+    let segmenting = segment_cfg.map(|cfg| (cfg, resolve_vad_model(&app, &data_dir)));
+    let result =
+        tokio::task::spawn_blocking(move || run_file_transcription(&input, &parakeet, segmenting))
+            .await;
     set_transcribing(&app, false);
     let result = result
         .map_err(|e| format!("transcription task failed: {e}"))
@@ -433,6 +583,116 @@ mod tests {
         assert!(cancel_recording(&mut s).is_err());
         assert_eq!(s.stats.lifetime_dictations, 1);
         assert_eq!(s.history.len(), 1);
+        let _ = std::fs::remove_dir_all(&s.data_dir);
+    }
+
+    // ---- chunked dictation (group D) ----
+
+    use crate::segment_jobs::SttFn;
+    use crate::state::ActiveRecording;
+    use crate::segmenter::{EnergyPauseSource, PauseSource, SegmentCfg};
+    use std::sync::{atomic::AtomicBool, Arc};
+
+    const TEST_RATE: u32 = 16_000;
+
+    /// Speech-like tone, a digital-silence pause, then more tone.
+    fn talk_pause_talk() -> Vec<f32> {
+        let tone = |secs: f32| -> Vec<f32> {
+            (0..(TEST_RATE as f32 * secs) as usize)
+                .map(|i| (i as f32 * 0.1).sin() * 0.3)
+                .collect()
+        };
+        let mut v = tone(1.6);
+        v.extend(std::iter::repeat_n(0.0, (TEST_RATE as f32 * 0.7) as usize));
+        v.extend(tone(1.6));
+        v
+    }
+
+    fn recording_with_session(samples: Vec<f32>) -> ActiveRecording {
+        let cfg = SegmentCfg {
+            min_secs: 1.0,
+            hard_secs: 3.0,
+            pause_at_min_ms: 300.0,
+            pause_at_hard_ms: 150.0,
+        };
+        let stt: SttFn = Arc::new(|_, _| Ok("hello".to_owned()));
+        let source: Box<dyn PauseSource> = Box::new(EnergyPauseSource::new());
+        let mut session = SegmentSession::new(TEST_RATE, cfg, source, "energy", stt);
+        session.poll(&samples);
+        ActiveRecording {
+            samples: Arc::new(Mutex::new(samples)),
+            sample_rate: TEST_RATE,
+            stop: Arc::new(AtomicBool::new(false)),
+            done: Arc::new(AtomicBool::new(true)),
+            started_at: std::time::Instant::now(),
+            stream_error: Arc::new(AtomicBool::new(false)),
+            segments: Some(session),
+        }
+    }
+
+    fn wav_files(state: &AppState) -> usize {
+        std::fs::read_dir(state.data_dir.join("recordings"))
+            .map(|d| d.filter_map(|e| e.ok()).count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn cancel_with_active_segment_session_clears_state_and_file() {
+        let mut s = test_state();
+        s.recording = true;
+        s.active = Some(recording_with_session(talk_pause_talk()));
+        cancel_recording(&mut s).expect("cancel");
+        assert!(s.active.is_none());
+        assert!(!s.recording);
+        assert_eq!(wav_files(&s), 0, "cancelled take must not leave a wav");
+        assert!(s.history.is_empty());
+        let _ = std::fs::remove_dir_all(&s.data_dir);
+    }
+
+    #[test]
+    fn finish_recording_hands_back_segments_and_wav() {
+        let mut s = test_state();
+        s.recording = true;
+        let samples = talk_pause_talk();
+        let total = samples.len();
+        s.active = Some(recording_with_session(samples));
+        let take = finish_recording(&mut s).expect("finish");
+        assert!(s.active.is_none());
+        assert!(!s.recording);
+        assert!(take.wav_path.exists());
+        assert!(take.duration_secs >= 0.0);
+        let finished = take.segments.expect("a pause inside the take must cut it");
+        assert_eq!(finished.cuts.len(), 1);
+        assert_eq!(finished.source_label, "energy");
+        assert!(finished.cuts[0].index > 0 && finished.cuts[0].index < total);
+        assert_eq!(finished.tail_16k.len(), total - finished.cuts[0].index);
+        let results = finished.worker.finish();
+        assert_eq!(results.len(), 1, "only the pre-cut piece was queued");
+        let _ = std::fs::remove_dir_all(&s.data_dir);
+    }
+
+    #[test]
+    fn stop_and_save_wav_discards_segment_work_but_keeps_the_file() {
+        let mut s = test_state();
+        s.recording = true;
+        s.active = Some(recording_with_session(talk_pause_talk()));
+        let (wav, _) = stop_and_save_wav(&mut s).expect("stop");
+        assert!(wav.exists());
+        assert!(s.active.is_none());
+        let _ = std::fs::remove_dir_all(&s.data_dir);
+    }
+
+    #[test]
+    fn short_take_without_a_cut_has_no_segments() {
+        let mut s = test_state();
+        s.recording = true;
+        let samples: Vec<f32> = (0..TEST_RATE as usize / 2)
+            .map(|i| (i as f32 * 0.1).sin() * 0.3)
+            .collect();
+        s.active = Some(recording_with_session(samples));
+        let take = finish_recording(&mut s).expect("finish");
+        assert!(take.segments.is_none());
+        assert!(take.wav_path.exists());
         let _ = std::fs::remove_dir_all(&s.data_dir);
     }
 }

@@ -34,6 +34,8 @@ mod polish;
 mod prompts;
 mod refine;
 mod s1_runtime;
+mod segment_jobs;
+mod segmenter;
 mod session;
 mod settings;
 mod shortcuts;

@@ -17,6 +17,7 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::devices;
+use crate::segment_jobs::FinishedSegments;
 use crate::state::{ActiveRecording, AppState};
 use crate::text;
 
@@ -233,12 +234,31 @@ pub(crate) fn start_recording(state: &mut AppState) -> anyhow::Result<devices::D
         done,
         started_at: std::time::Instant::now(),
         stream_error,
+        segments: None,
     });
     Ok(choice)
 }
 
+/// A stopped recording: the saved WAV plus, when the take was segmented while
+/// recording, the background worker and the tail that still needs decoding.
+pub(crate) struct FinishedTake {
+    pub wav_path: PathBuf,
+    pub duration_secs: f64,
+    pub segments: Option<FinishedSegments>,
+}
+
+/// Stop and save, discarding any segmentation work (mic tests, cancelled takes).
 pub(crate) fn stop_and_save_wav(state: &mut AppState) -> anyhow::Result<(PathBuf, f64)> {
-    let rec = state.active.take().context("not recording")?;
+    let take = finish_recording(state)?;
+    if let Some(finished) = take.segments {
+        finished.worker.cancel();
+    }
+    Ok((take.wav_path, take.duration_secs))
+}
+
+pub(crate) fn finish_recording(state: &mut AppState) -> anyhow::Result<FinishedTake> {
+    let mut rec = state.active.take().context("not recording")?;
+    let session = rec.segments.take();
     state.recording = false;
     let duration_secs = rec.started_at.elapsed().as_secs_f64();
     rec.stop.store(true, Ordering::SeqCst);
@@ -280,7 +300,12 @@ pub(crate) fn stop_and_save_wav(state: &mut AppState) -> anyhow::Result<(PathBuf
         .unwrap_or(0);
     let wav_path = dir.join(format!("rec-{stamp}.wav"));
     text::write_wav_mono_16k(&wav_path, &samples, rec.sample_rate)?;
-    Ok((wav_path, duration_secs))
+    let segments = session.and_then(|s| s.finish(&samples));
+    Ok(FinishedTake {
+        wav_path,
+        duration_secs,
+        segments,
+    })
 }
 
 // ---------------------------------------------------------------------------
