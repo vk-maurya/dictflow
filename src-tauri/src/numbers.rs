@@ -480,6 +480,103 @@ fn push_verbatim(out: &mut Vec<Tok>, sep: &str, chunk: &str) {
     });
 }
 
+/// `one, two, three, four` → `1, 2, 3, 4`.
+///
+/// A comma-separated run of ≥3 lone small number words is an enumeration, not
+/// one composed quantity, so every word in it becomes a digit. Two items stay
+/// with the state machine (`twenty, two` → `22`, the spoken-hyphen case), and
+/// requiring the commas keeps the year/digit-run heuristic for a bare
+/// `one two three four` intact.
+fn rewrite_enumerations(toks: &mut [Tok]) {
+    // An item is a lone small number word (units/teens/tens; `zero` too).
+    // Hyphen-split halves ("twenty" in `twenty-one`) are excluded by the
+    // comma rule below, so quantities never match.
+    let value = |t: &Tok| match t.lex {
+        Some(Kind::Zero) => Some(0u64),
+        Some(Kind::Unit(v)) | Some(Kind::Teen(v)) | Some(Kind::Tens(v)) => Some(v),
+        _ => None,
+    };
+    fn core(t: &Tok) -> &str {
+        t.word.trim_matches(|c: char| c.is_ascii_punctuation())
+    }
+    // A connector sits between items: a standalone comma chunk, or the words
+    // `and`/`or` (either may carry a trailing comma: `four, and twelve`).
+    let is_comma_chunk = |t: &Tok| t.lex.is_none() && core(t).is_empty() && t.word.contains(',');
+    let is_and = |t: &Tok| matches!(t.lex, Some(Kind::And)) && core(t).eq_ignore_ascii_case("and");
+    let is_or = |t: &Tok| t.lex.is_none() && core(t).eq_ignore_ascii_case("or");
+    let is_connector = |t: &Tok| is_comma_chunk(t) || is_and(t) || is_or(t);
+
+    let n = toks.len();
+    let mut items: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if value(&toks[i]).is_none() {
+            i += 1;
+            continue;
+        }
+        // Walk the maximal run of items linked by connectors: the item before
+        // a link must carry the comma, so `one two` (bare pair, year heuristic)
+        // never links.
+        items.clear();
+        items.push(i);
+        let mut j = i + 1;
+        while j < n {
+            if value(&toks[j]).is_some() {
+                // An item that opens a composed quantity (`two hundred`,
+                // `three thousand`) is not an enumeration member.
+                if toks
+                    .get(j + 1)
+                    .is_some_and(|t| matches!(t.lex, Some(Kind::Hundred) | Some(Kind::Scale(_))))
+                {
+                    break;
+                }
+                if !toks[*items.last().unwrap()].word.ends_with(',') {
+                    break;
+                }
+                items.push(j);
+                j += 1;
+            } else if is_connector(&toks[j]) {
+                let Some(k) = (j + 1..n).find(|&k| value(&toks[k]).is_some()) else {
+                    break;
+                };
+                if !(j + 1..k).all(|m| is_connector(&toks[m]))
+                    || !toks[*items.last().unwrap()].word.ends_with(',')
+                    || toks
+                        .get(k + 1)
+                        .is_some_and(|t| matches!(t.lex, Some(Kind::Hundred) | Some(Kind::Scale(_))))
+                {
+                    break;
+                }
+                items.push(k);
+                j = k + 1;
+            } else {
+                break;
+            }
+        }
+        if items.len() >= 3 {
+            for &idx in &items {
+                let v = value(&toks[idx]).unwrap();
+                let word = &toks[idx].word;
+                let lead_len = word.len()
+                    - word.trim_start_matches(|c: char| c.is_ascii_punctuation())
+                        .len();
+                let trail_start = word.trim_end_matches(|c: char| c.is_ascii_punctuation())
+                    .len();
+                let word = format!(
+                    "{}{v}{}",
+                    &word[..lead_len],
+                    &word[trail_start..]
+                );
+                toks[idx].word = word;
+                toks[idx].lex = None; // the main loop passes digits through verbatim
+            }
+            i = items[items.len() - 1] + 1;
+        } else {
+            i += 1;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -489,7 +586,9 @@ fn push_verbatim(out: &mut Vec<Tok>, sep: &str, chunk: &str) {
 /// Runs as the first rule pass so later passes (spoken commands, dictionary)
 /// see digits — `issue hash forty two` → `issue hash 42`.
 pub fn apply_spoken_numbers(text: &str) -> String {
-    let toks = tokenize(text);
+    let mut toks = tokenize(text);
+    rewrite_enumerations(&mut toks);
+    let toks = toks;
     let mut out = String::new();
     let mut rd = Reading::default();
     let mut rd_start = 0usize;
@@ -627,6 +726,26 @@ mod tests {
             ("ten point five percent", "10.5%"),
             ("fifty percent of users agree", "50% of users agree"),
             ("TEN PERCENT", "10%"),
+        ]);
+    }
+
+    #[test]
+    fn enumerations_become_digits() {
+        check(&[
+            ("one, two, three, four", "1, 2, 3, 4"),
+            (
+                "it's one, two, three, four, and twelve",
+                "it's 1, 2, 3, 4, and 12",
+            ),
+            ("pick one, two, or three", "pick 1, 2, or 3"),
+            ("eleven, twelve, thirteen", "11, 12, 13"),
+            ("(zero, one, two)", "(0, 1, 2)"),
+            // No commas → the year/digit-run heuristic keeps them as words.
+            ("one two three four", "one two three four"),
+            // Non-number words break the run.
+            ("I have one apple and two friends", "I have one apple and two friends"),
+            // A quantity after the run is not part of it.
+            ("one, two hundred dollars", "one, two hundred dollars"),
         ]);
     }
 
