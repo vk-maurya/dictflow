@@ -4,9 +4,10 @@
 //! tray menu, a Windows tray double-click, a second app launch, or the macOS
 //! Dock (`RunEvent::Reopen`).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 use crate::dictation::toggle_recording;
 use crate::focus;
@@ -62,8 +63,37 @@ pub(crate) fn on_main_window_event(window: &tauri::Window, event: &tauri::Window
             hide_main_to_tray(window.app_handle());
             apply_overlay_visibility(window.app_handle());
         }
+        // The yellow button often reports the resize or the focus loss before
+        // is_minimized() is true. Looking only at that instant leaves the
+        // window miniaturized, so the mark stays inside it.
+        tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Focused(false) => {
+            schedule_park_if_minimized(window.app_handle());
+        }
         _ => {}
     }
+}
+
+static PARK_CHECK_PENDING: AtomicBool = AtomicBool::new(false);
+
+fn schedule_park_if_minimized(app: &tauri::AppHandle) {
+    if PARK_CHECK_PENDING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(280)).await;
+        PARK_CHECK_PENDING.store(false, Ordering::Release);
+        let app_for_main = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            let Some(window) = app_for_main.get_webview_window("main") else {
+                return;
+            };
+            if window.is_minimized().unwrap_or(false) {
+                hide_main_to_tray(&app_for_main);
+                apply_overlay_visibility(&app_for_main);
+            }
+        });
+    });
 }
 
 #[cfg(target_os = "macos")]
@@ -160,6 +190,10 @@ fn apply_overlay_visibility_inner(app: &tauri::AppHandle) {
         return;
     }
     focus::make_non_activating(&win);
+    // If the strip was miniaturized with the main window, pull it back out
+    // and keep the yellow button from taking it again.
+    let _ = win.unminimize();
+    let _ = win.set_minimizable(false);
     // Use the bit-only toggle (not tauri's) — tao's full restyle would strip
     // the chrome/layered patches `make_non_activating` just applied.
     crate::hover::invalidate();
@@ -168,25 +202,34 @@ fn apply_overlay_visibility_inner(app: &tauri::AppHandle) {
     let _ = win.set_visible_on_all_workspaces(true);
     let _ = win.set_shadow(false);
     let _ = win.set_background_color(Some(tauri::window::Color(0, 0, 0, 0)));
-    let _ = win.set_size(tauri::LogicalSize::new(
-        overlay::PILL_W as f64,
-        overlay::PILL_H as f64,
-    ));
+    let edge = overlay::DockEdge::parse(&settings.overlay_edge).unwrap_or(overlay::DockEdge::Bottom);
+    let (frame_w, frame_h) = overlay::orientation_size(edge);
+    let _ = win.set_size(tauri::LogicalSize::new(frame_w as f64, frame_h as f64));
     if let Ok(Some(m)) = win.current_monitor() {
         let scale = m.scale_factor();
         let size = m.size();
         let origin = m.position();
         let screen_w = (size.width as f64 / scale).round() as i32;
         let screen_h = (size.height as f64 / scale).round() as i32;
-        let edge = overlay::DockEdge::parse(&settings.overlay_edge).unwrap_or(overlay::DockEdge::Bottom);
-        let (x, y) = overlay::pose_to_xy(
-            edge,
-            settings.overlay_offset,
-            screen_w,
-            screen_h,
-            overlay::PILL_W,
-            overlay::PILL_H,
-        );
+        let (x, y) = if settings.overlay_free {
+            overlay::place_free(
+                settings.overlay_x,
+                settings.overlay_y,
+                screen_w,
+                screen_h,
+                frame_w,
+                frame_h,
+            )
+        } else {
+            overlay::pose_to_xy(
+                edge,
+                settings.overlay_offset,
+                screen_w,
+                screen_h,
+                frame_w,
+                frame_h,
+            )
+        };
         let _ = win.set_position(tauri::LogicalPosition::new(
             origin.x as f64 / scale + f64::from(x),
             origin.y as f64 / scale + f64::from(y),
@@ -199,6 +242,7 @@ fn apply_overlay_visibility_inner(app: &tauri::AppHandle) {
     // on Windows this also makes everything around the pill click-through
     // from the first frame.
     crate::hover::sync_idle_region(&win);
+    let _ = app.emit("dictflow://overlay-edge", settings.overlay_edge);
 }
 
 #[cfg(test)]

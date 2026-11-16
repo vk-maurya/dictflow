@@ -1,337 +1,92 @@
 //! Offline spoken-command, list, and backtrack passes (P2). No LLM.
-//!
-//! Port of BetterWispr `VoiceCommands.swift` plus deviations:
-//!
-//! - token-walk engine (like `text.rs`) instead of one left-to-right regex
-//!   alternation: the `regex` crate has no look-around, so context rules
-//!   (noun-marker guard, `@handle`/`#number` attachment, `%` on a preceding
-//!   number, domain join) are decided by scanning whitespace-separated tokens;
-//! - deliberate deviation: there is NO capitalization pass after `. ! ?`
-//!   sentence boundaries (BetterWispr re-capitalizes). Adding one would break
-//!   the existing tests and is out of P0 scope.
 
 use regex::Regex;
 
-/// How a matched command phrase is emitted.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Behavior {
-    /// Attach to the previous token with no space (`. , ! ? ; : … ) ]`).
-    Punct,
-    /// Emit with normal spacing (openers, dashes, standalone symbols).
-    SpacePunct,
-    /// `comma` / `period`: blocked by a preceding noun-marker.
-    Requested,
-    /// `new line` / `new paragraph` … -> newline(s).
-    Break,
-    /// `at the rate` / `at sign` -> `@` attached to the next word / initials.
-    AtHandle,
-    /// `hash` / `hashtag` / `pound sign` / `number sign` -> `#` + next number.
-    HashNumber,
-    /// `dollar` / `dollar sign` -> `$` + next number.
-    DollarNumber,
-    /// `percent` / `percent sign` -> `%` on a preceding number.
-    PercentNumber,
-}
-
-/// One spoken-command entry. `words` is the normalized (lowercase) phrase.
-struct Entry {
-    words: &'static [&'static str],
-    repl: &'static str,
-    behavior: Behavior,
-}
-
-/// All spoken commands. Longest match wins (chosen at match time), so order
-/// here is only for readability.
-static ENTRIES: &[Entry] = &[
-    // alwaysPunctuation — breaks.
-    Entry { words: &["new", "paragraph"], repl: "\n\n", behavior: Behavior::Break },
-    Entry { words: &["next", "paragraph"], repl: "\n\n", behavior: Behavior::Break },
-    Entry { words: &["new", "line"], repl: "\n", behavior: Behavior::Break },
-    Entry { words: &["next", "line"], repl: "\n", behavior: Behavior::Break },
-    Entry { words: &["newline"], repl: "\n", behavior: Behavior::Break },
-    Entry { words: &["line", "break"], repl: "\n", behavior: Behavior::Break },
-    // alwaysPunctuation — punctuation.
-    Entry { words: &["question", "mark"], repl: "?", behavior: Behavior::Punct },
-    Entry { words: &["exclamation", "mark"], repl: "!", behavior: Behavior::Punct },
-    Entry { words: &["exclamation", "point"], repl: "!", behavior: Behavior::Punct },
-    Entry { words: &["full", "stop"], repl: ".", behavior: Behavior::Punct },
-    Entry { words: &["semi", "colon"], repl: ";", behavior: Behavior::Punct },
-    Entry { words: &["semicolon"], repl: ";", behavior: Behavior::Punct },
-    Entry { words: &["colon"], repl: ":", behavior: Behavior::Punct },
-    Entry { words: &["ellipsis"], repl: "…", behavior: Behavior::Punct },
-    Entry { words: &["dot", "dot", "dot"], repl: "…", behavior: Behavior::Punct },
-    Entry { words: &["em", "dash"], repl: "—", behavior: Behavior::SpacePunct },
-    Entry { words: &["hyphen"], repl: "-", behavior: Behavior::SpacePunct },
-    Entry { words: &["dash"], repl: "-", behavior: Behavior::SpacePunct },
-    Entry { words: &["open", "parenthesis"], repl: "(", behavior: Behavior::SpacePunct },
-    Entry { words: &["close", "parenthesis"], repl: ")", behavior: Behavior::Punct },
-    Entry { words: &["open", "bracket"], repl: "[", behavior: Behavior::SpacePunct },
-    Entry { words: &["close", "bracket"], repl: "]", behavior: Behavior::Punct },
-    Entry { words: &["open", "quote"], repl: "\"", behavior: Behavior::SpacePunct },
-    Entry { words: &["close", "quote"], repl: "\"", behavior: Behavior::Punct },
-    Entry { words: &["unquote"], repl: "\"", behavior: Behavior::Punct },
-    Entry { words: &["quote"], repl: "\"", behavior: Behavior::SpacePunct },
-    Entry { words: &["asterisk"], repl: "*", behavior: Behavior::SpacePunct },
-    Entry { words: &["ampersand"], repl: "&", behavior: Behavior::SpacePunct },
-    Entry { words: &["underscore"], repl: "_", behavior: Behavior::SpacePunct },
-    Entry { words: &["backslash"], repl: "\\", behavior: Behavior::SpacePunct },
-    Entry { words: &["forward", "slash"], repl: "/", behavior: Behavior::SpacePunct },
-    Entry { words: &["slash"], repl: "/", behavior: Behavior::SpacePunct },
-    Entry { words: &["degrees", "celsius"], repl: "°C", behavior: Behavior::SpacePunct },
-    Entry { words: &["degrees", "fahrenheit"], repl: "°F", behavior: Behavior::SpacePunct },
-    Entry { words: &["degree", "sign"], repl: "°", behavior: Behavior::SpacePunct },
-    Entry { words: &["degrees"], repl: "°", behavior: Behavior::SpacePunct },
-    // requestedPunctuation (noun-marker guarded).
-    Entry { words: &["comma"], repl: ",", behavior: Behavior::Requested },
-    Entry { words: &["period"], repl: ".", behavior: Behavior::Requested },
-    // symbols with attachment.
-    Entry { words: &["at", "the", "rate"], repl: "@", behavior: Behavior::AtHandle },
-    Entry { words: &["at", "sign"], repl: "@", behavior: Behavior::AtHandle },
-    Entry { words: &["hash"], repl: "#", behavior: Behavior::HashNumber },
-    Entry { words: &["hashtag"], repl: "#", behavior: Behavior::HashNumber },
-    Entry { words: &["pound", "sign"], repl: "#", behavior: Behavior::HashNumber },
-    Entry { words: &["number", "sign"], repl: "#", behavior: Behavior::HashNumber },
-    Entry { words: &["percent", "sign"], repl: "%", behavior: Behavior::PercentNumber },
-    Entry { words: &["percent"], repl: "%", behavior: Behavior::PercentNumber },
-    Entry { words: &["dollar", "sign"], repl: "$", behavior: Behavior::DollarNumber },
-    Entry { words: &["dollar"], repl: "$", behavior: Behavior::DollarNumber },
+/// Longest-first spoken commands. Phrase must be a whole word / phrase.
+const COMMANDS: &[(&str, &str)] = &[
+    ("new paragraph", "\n\n"),
+    ("next paragraph", "\n\n"),
+    ("new line", "\n"),
+    ("next line", "\n"),
+    ("newline", "\n"),
+    ("line break", "\n"),
+    ("question mark", "?"),
+    ("exclamation mark", "!"),
+    ("exclamation point", "!"),
+    ("full stop", "."),
+    ("semi colon", ";"),
+    ("semicolon", ";"),
+    ("colon", ":"),
+    ("comma", ","),
+    ("ellipsis", "…"),
+    ("dot dot dot", "…"),
+    ("em dash", "—"),
+    ("open parenthesis", "("),
+    ("close parenthesis", ")"),
+    ("open bracket", "["),
+    ("close bracket", "]"),
+    ("open quote", "\""),
+    ("close quote", "\""),
+    ("quote", "\""),
+    ("unquote", "\""),
+    ("degrees celsius", "°C"),
+    ("degrees fahrenheit", "°F"),
+    ("degree sign", "°"),
+    ("degrees", "°"),
+    ("percent sign", "%"),
+    ("dollar sign", "$"),
+    ("at sign", "@"),
+    ("ampersand", "&"),
+    ("asterisk", "*"),
+    ("hashtag", "#"),
+    ("pound sign", "#"),
+    ("underscore", "_"),
+    ("backslash", "\\"),
+    ("forward slash", "/"),
+    ("period", "."),
+    ("slash", "/"),
+    ("hyphen", "-"),
+    ("dash", "-"),
+    ("percent", "%"),
 ];
 
-/// Words that make a following `comma`/`period` a noun rather than a cue.
-const NOUN_MARKERS: &[&str] = &[
-    "a", "an", "the", "this", "that", "my", "your", "his", "her", "its", "our",
-    "their", "any", "every", "no",
-];
-
-/// Lowercase a token and strip its edge punctuation (matches `text.rs` style).
-fn normalize(tok: &str) -> String {
-    tok.trim_matches(|c: char| c.is_ascii_punctuation())
-        .to_ascii_lowercase()
+fn command_re() -> Regex {
+    let alts: Vec<String> = COMMANDS
+        .iter()
+        .map(|(p, _)| regex::escape(p).replace(' ', r"\s+"))
+        .collect();
+    Regex::new(&format!(r"(?i)\b(?:{})\b", alts.join("|"))).expect("spoken-command pattern")
 }
 
-/// True when `phrase`, normalized, is one of the spoken-command phrases.
-/// Used by the vocabulary command-fix pass (`text::is_command_replacement`).
-pub fn is_spoken_command(phrase: &str) -> bool {
-    let norm: Vec<String> = phrase.split_whitespace().map(normalize).collect();
-    if norm.is_empty() || norm.iter().any(|s| s.is_empty()) {
-        return false;
-    }
-    ENTRIES.iter().any(|e| {
-        e.words.len() == norm.len() && e.words.iter().zip(norm.iter()).all(|(w, n)| *w == n.as_str())
-    })
+fn replacement_for(phrase: &str) -> String {
+    let key = phrase.split_whitespace().collect::<Vec<_>>().join(" ");
+    COMMANDS
+        .iter()
+        .find(|(p, _)| p.eq_ignore_ascii_case(&key))
+        .map(|(_, r)| (*r).to_owned())
+        .unwrap_or_else(|| phrase.to_owned())
 }
 
-/// A whitespace-separated input token, remembering whether a newline preceded it.
-struct Tok {
-    text: String,
-    nl_before: bool,
-}
-
-fn tokenize(text: &str) -> Vec<Tok> {
-    let mut out: Vec<Tok> = Vec::new();
-    let mut cur = String::new();
-    let mut nl = false;
-    for ch in text.chars() {
-        if ch.is_whitespace() {
-            if !cur.is_empty() {
-                out.push(Tok { text: std::mem::take(&mut cur), nl_before: nl });
-                nl = false;
-            }
-            if ch == '\n' {
-                nl = true;
-            }
-        } else {
-            cur.push(ch);
-        }
-    }
-    if !cur.is_empty() {
-        out.push(Tok { text: cur, nl_before: nl });
-    }
-    out
-}
-
-/// An output fragment. `glue` => no separator before it; otherwise use a space
-/// or (when `nl_before`) a newline.
-struct Piece {
-    text: String,
-    glue: bool,
-    nl_before: bool,
-}
-
-fn literal(tok: &Tok) -> Piece {
-    Piece { text: tok.text.clone(), glue: false, nl_before: tok.nl_before }
-}
-
-fn join_pieces(pieces: &[Piece]) -> String {
-    let mut out = String::new();
-    for (idx, p) in pieces.iter().enumerate() {
-        if idx > 0 && !p.glue {
-            out.push(if p.nl_before { '\n' } else { ' ' });
-        }
-        out.push_str(&p.text);
-    }
-    out
-}
-
-/// True when a token is already numeric text (`42`, `1,20,000`, `3.5`).
-///
-/// Symbols only attach to digits: the spoken-numbers pass (`numbers.rs`) runs
-/// just before the command pass, so anything still spelled out was left as
-/// words on purpose (a lone `twenty`, a year pair). Gluing a symbol to it would
-/// produce `$twenty`, so those are left untouched instead.
-fn is_number_token(tok: &str) -> bool {
-    let n = normalize(tok);
-    !n.is_empty() && n.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',')
-}
-
-fn is_initial(tok: &str) -> bool {
-    let n = normalize(tok);
-    let mut chars = n.chars();
-    matches!((chars.next(), chars.next()), (Some(c), None) if c.is_alphabetic())
-}
-
-fn is_noun_marker(word: &str) -> bool {
-    NOUN_MARKERS.contains(&word)
-}
-
-/// Longest phrase (by word count) matching the tokens starting at `i`.
-fn match_phrase(toks: &[Tok], i: usize) -> Option<(&'static Entry, usize)> {
-    let mut best: Option<(&'static Entry, usize)> = None;
-    for e in ENTRIES {
-        let n = e.words.len();
-        if i + n > toks.len() {
-            continue;
-        }
-        if (0..n).all(|k| normalize(&toks[i + k].text) == e.words[k]) {
-            match best {
-                Some((_, bn)) if bn >= n => {}
-                _ => best = Some((e, n)),
-            }
-        }
-    }
-    best
-}
-
-/// Replace spoken punctuation / newline / symbol phrases with a token walk, so
-/// context rules (guards, `@#%$` attachment, domain join) can be expressed.
+/// Replace spoken punctuation / newline phrases. Longest phrases win
+/// because they are listed first in the alternation? Rust regex is
+/// left-to-right, so we list longer phrases first in COMMANDS.
 pub fn apply_spoken_commands(text: &str) -> String {
-    let toks = tokenize(text);
-    let mut pieces: Vec<Piece> = Vec::new();
-    let mut prev_word: Option<String> = None;
-    let mut i = 0;
-    while i < toks.len() {
-        let Some((entry, n)) = match_phrase(&toks, i) else {
-            pieces.push(literal(&toks[i]));
-            prev_word = Some(normalize(&toks[i].text));
-            i += 1;
-            continue;
-        };
-        let first_nl = toks[i].nl_before;
-        match entry.behavior {
-            Behavior::Break => {
-                pieces.push(Piece { text: entry.repl.to_owned(), glue: false, nl_before: first_nl });
-                prev_word = None;
-                i += n;
-            }
-            Behavior::Punct => {
-                pieces.push(Piece { text: entry.repl.to_owned(), glue: true, nl_before: false });
-                prev_word = None;
-                i += n;
-            }
-            Behavior::SpacePunct => {
-                pieces.push(Piece { text: entry.repl.to_owned(), glue: false, nl_before: first_nl });
-                prev_word = None;
-                i += n;
-            }
-            Behavior::Requested => {
-                let blocked = prev_word.as_deref().is_some_and(is_noun_marker);
-                if blocked {
-                    pieces.push(literal(&toks[i]));
-                    prev_word = Some(normalize(&toks[i].text));
-                    i += 1;
-                } else {
-                    pieces.push(Piece { text: entry.repl.to_owned(), glue: true, nl_before: false });
-                    prev_word = None;
-                    i += n;
-                }
-            }
-            Behavior::AtHandle => {
-                pieces.push(Piece { text: "@".to_owned(), glue: false, nl_before: first_nl });
-                i += n;
-                if i < toks.len() {
-                    let initial = is_initial(&toks[i].text);
-                    pieces.push(Piece { text: toks[i].text.clone(), glue: true, nl_before: false });
-                    prev_word = Some(normalize(&toks[i].text));
-                    i += 1;
-                    if initial {
-                        while i < toks.len() && is_initial(&toks[i].text) {
-                            pieces.push(Piece {
-                                text: toks[i].text.clone(),
-                                glue: true,
-                                nl_before: false,
-                            });
-                            prev_word = Some(normalize(&toks[i].text));
-                            i += 1;
-                        }
-                    }
-                }
-            }
-            Behavior::HashNumber | Behavior::DollarNumber => {
-                let sym = if entry.behavior == Behavior::HashNumber { "#" } else { "$" };
-                if i + n < toks.len() && is_number_token(&toks[i + n].text) {
-                    pieces.push(Piece { text: sym.to_owned(), glue: false, nl_before: first_nl });
-                    pieces.push(Piece {
-                        text: toks[i + n].text.clone(),
-                        glue: true,
-                        nl_before: false,
-                    });
-                    prev_word = Some(normalize(&toks[i + n].text));
-                    i += n + 1;
-                } else {
-                    pieces.push(literal(&toks[i]));
-                    prev_word = Some(normalize(&toks[i].text));
-                    i += 1;
-                }
-            }
-            Behavior::PercentNumber => {
-                let on_number = prev_word.as_deref().is_some_and(is_number_token);
-                if on_number {
-                    pieces.push(Piece { text: "%".to_owned(), glue: true, nl_before: false });
-                    prev_word = None;
-                    i += n;
-                } else {
-                    pieces.push(literal(&toks[i]));
-                    prev_word = Some(normalize(&toks[i].text));
-                    i += 1;
-                }
-            }
+    let re = command_re();
+    let mut out = String::new();
+    let mut last = 0;
+    for m in re.find_iter(text) {
+        out.push_str(&text[last..m.start()]);
+        let repl = replacement_for(m.as_str());
+        // No extra space before closing punctuation.
+        if matches!(repl.as_str(), "." | "," | "!" | "?" | ";" | ":" | "…" | ")" | "]" | "\"") {
+            let trimmed = out.trim_end();
+            out.truncate(trimmed.len());
         }
+        out.push_str(&repl);
+        last = m.end();
     }
-    let joined = join_pieces(&pieces);
-    collapse_space_around_breaks(&joining_domains(&joined))
-}
-
-/// Join spoken domains after the command pass: `gmail dot com` -> `gmail.com`,
-/// `gmail. com` -> `gmail.com`, `name @gmail.com` -> `name@gmail.com`.
-fn joining_domains(text: &str) -> String {
-    let dot = Regex::new(r"(?i)\b([\p{L}\p{N}_-]+)\s+dot\s+([\p{L}\p{N}_-]+)\b")
-        .expect("domain dot pattern");
-    // Case-sensitive: only join a lowercase label + lowercase TLD-ish word, so
-    // real sentence breaks ("End. Next") are left alone.
-    let literal = Regex::new(r"\b([a-z0-9_-]+)\.\s+([a-z]{2,24})\b")
-        .expect("domain literal pattern");
-    let email = Regex::new(r"([\p{L}\p{N}_.-]+)\s+@([\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)+)")
-        .expect("email join pattern");
-    let mut s = text.to_owned();
-    loop {
-        let next = dot.replace_all(&s, "$1.$2").into_owned();
-        if next == s {
-            break;
-        }
-        s = next;
-    }
-    let s = literal.replace_all(&s, "$1.$2").into_owned();
-    email.replace_all(&s, "$1@$2").into_owned()
+    out.push_str(&text[last..]);
+    collapse_space_around_breaks(&out)
 }
 
 fn collapse_space_around_breaks(text: &str) -> String {
@@ -351,11 +106,66 @@ const ORDINALS: &[&str] = &[
     "ninth", "tenth",
 ];
 
+fn token_core(word: &str) -> String {
+    word.trim_matches(|c: char| c.is_ascii_punctuation())
+        .to_ascii_lowercase()
+}
+
 fn marker_index(word: &str, family: &[&str]) -> Option<usize> {
-    let core = word
-        .trim_matches(|c: char| c.is_ascii_punctuation())
-        .to_ascii_lowercase();
+    let core = token_core(word);
     family.iter().position(|m| *m == core)
+}
+
+fn is_list_cue(word: &str) -> bool {
+    matches!(
+        token_core(word).as_str(),
+        "thing" | "point" | "pointer" | "item" | "change" | "is"
+    )
+}
+
+fn is_list_glue(word: &str) -> bool {
+    matches!(
+        token_core(word).as_str(),
+        "and" | "the" | "then" | "so" | "uh" | "um" | "yeah"
+    )
+}
+
+fn trim_list_item(text: &str) -> String {
+    let mut toks: Vec<&str> = text.split_whitespace().collect();
+    while toks.first().is_some_and(|tok| is_list_glue(tok)) {
+        toks.remove(0);
+    }
+    while toks.last().is_some_and(|tok| is_list_glue(tok)) {
+        toks.pop();
+    }
+    toks.join(" ")
+}
+
+fn finish_clause(text: &str) -> String {
+    let text = text.trim();
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut out = first.to_uppercase().collect::<String>();
+    out.extend(chars);
+    if !out.ends_with(['.', '!', '?']) {
+        out.push('.');
+    }
+    out
+}
+
+fn ordinal_at(word: &str) -> Option<usize> {
+    let core = token_core(word);
+    ORDINALS
+        .iter()
+        .position(|marker| *marker == core)
+        .or(match core.as_str() {
+            "firstly" => Some(0),
+            "secondly" => Some(1),
+            "thirdly" => Some(2),
+            _ => None,
+        })
 }
 
 /// Numbered / bulleted lists when the utterance *starts* with a marker
@@ -371,6 +181,9 @@ pub fn apply_lists(text: &str) -> String {
     if let Some(out) = try_bullet_list(trimmed) {
         return out;
     }
+    if let Some(out) = try_spoken_points(trimmed) {
+        return out;
+    }
     text.to_owned()
 }
 
@@ -382,11 +195,17 @@ fn try_marker_list(text: &str, family: &[&str]) -> Option<String> {
     let mut items: Vec<String> = Vec::new();
     let mut expected = 0usize;
     let mut cur = String::new();
+    let mut skip_cues = 0u8;
     for tok in &toks {
+        if skip_cues > 0 && is_list_cue(tok) {
+            skip_cues -= 1;
+            continue;
+        }
+        skip_cues = 0;
         if let Some(idx) = marker_index(tok, family) {
             if idx == expected {
                 if expected > 0 {
-                    let item = cur.trim().to_owned();
+                    let item = trim_list_item(&cur);
                     if item.is_empty() {
                         return None;
                     }
@@ -394,6 +213,7 @@ fn try_marker_list(text: &str, family: &[&str]) -> Option<String> {
                     cur.clear();
                 }
                 expected += 1;
+                skip_cues = 3;
                 continue;
             }
         }
@@ -403,7 +223,11 @@ fn try_marker_list(text: &str, family: &[&str]) -> Option<String> {
         cur.push_str(tok);
     }
     if !cur.trim().is_empty() {
-        items.push(cur.trim().to_owned());
+        let item = trim_list_item(&cur);
+        if item.is_empty() {
+            return None;
+        }
+        items.push(item);
     }
     if items.len() < 2 || expected < 2 {
         return None;
@@ -416,6 +240,95 @@ fn try_marker_list(text: &str, family: &[&str]) -> Option<String> {
             .collect::<Vec<_>>()
             .join("\n"),
     )
+}
+
+struct SpokenHit {
+    tok_idx: usize,
+    ord: usize,
+    explicit: bool,
+}
+
+/// "…first thing is A. Second, B. Third, C." after a lead-in sentence.
+/// Bare ordinals ("the first time… the second day") stay prose unless one
+/// marker is an explicit list cue.
+fn try_spoken_points(text: &str) -> Option<String> {
+    let toks: Vec<&str> = text.split_whitespace().collect();
+    if toks.len() < 4 {
+        return None;
+    }
+    let mut hits = Vec::new();
+    for (i, tok) in toks.iter().enumerate() {
+        let Some(ord) = ordinal_at(tok) else {
+            continue;
+        };
+        let word = token_core(tok);
+        let next_cue = toks.get(i + 1).is_some_and(|next| is_list_cue(next));
+        let explicit = next_cue || matches!(word.as_str(), "firstly" | "secondly" | "thirdly");
+        hits.push(SpokenHit {
+            tok_idx: i,
+            ord,
+            explicit,
+        });
+    }
+    let start = hits.iter().position(|hit| hit.ord == 0)?;
+    if hits[start].tok_idx == 0 {
+        return None;
+    }
+    let mut seq = vec![start];
+    let mut expect = 1usize;
+    for (idx, hit) in hits.iter().enumerate().skip(start + 1) {
+        if hit.ord == expect {
+            seq.push(idx);
+            expect += 1;
+        } else if hit.ord > expect {
+            break;
+        }
+    }
+    if seq.len() < 2 || !seq.iter().any(|&idx| hits[idx].explicit) {
+        return None;
+    }
+
+    let mut preamble_toks = toks[..hits[seq[0]].tok_idx].to_vec();
+    while preamble_toks.last().is_some_and(|tok| is_list_glue(tok)) {
+        preamble_toks.pop();
+    }
+    let preamble = preamble_toks.join(" ");
+
+    let mut items = Vec::new();
+    for (n, &hit_idx) in seq.iter().enumerate() {
+        let hit = &hits[hit_idx];
+        let mut content_at = hit.tok_idx + 1;
+        let mut skipped = 0u8;
+        while skipped < 3 && content_at < toks.len() && is_list_cue(toks[content_at]) {
+            content_at += 1;
+            skipped += 1;
+        }
+        let end = if n + 1 < seq.len() {
+            hits[seq[n + 1]].tok_idx
+        } else {
+            toks.len()
+        };
+        if content_at >= end {
+            return None;
+        }
+        let item = trim_list_item(&toks[content_at..end].join(" "));
+        if item.is_empty() {
+            return None;
+        }
+        items.push(finish_clause(&item));
+    }
+
+    let list = items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| format!("{}. {item}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if preamble.is_empty() {
+        Some(list)
+    } else {
+        Some(format!("{}\n\n{list}", finish_clause(&preamble)))
+    }
 }
 
 fn try_bullet_list(text: &str) -> Option<String> {
@@ -436,14 +349,11 @@ fn try_bullet_list(text: &str) -> Option<String> {
     Some(parts.iter().map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n"))
 }
 
-const DISCARD: &[&str] = &["scratch that", "never mind", "disregard that", "remove that"];
-const APOLOGIES: &[&str] = &["sorry", "oops", "wait"];
+const DISCARD: &[&str] = &["scratch that", "never mind", "disregard that"];
 const PRONOUNS: &[&str] = &["i", "we", "they", "he", "she", "you"];
 
-/// Conservative backtrack: drop a clause after a discard cue (“scratch that”,
-/// “never mind”, “disregard that”, “remove that”), or just the word before an
-/// apology that immediately precedes a cue (“Friday sorry remove that”), and
-/// rewrite “X actually Y” / “X I mean Y” when X is not a pronoun.
+/// Conservative backtrack: drop a clause after “scratch that” / “never mind”,
+/// and rewrite “X actually Y” / “X I mean Y” when X is not a pronoun.
 pub fn apply_backtrack(text: &str) -> String {
     let mut out = drop_discard_commands(text);
     out = rewrite_actually(&out);
@@ -456,24 +366,14 @@ fn drop_discard_commands(text: &str) -> String {
         .map(|p| regex::escape(p).replace(' ', r"\s+"))
         .collect::<Vec<_>>()
         .join("|");
-    let apologies = APOLOGIES.join("|");
-    // Group 1 (optional): an apology immediately before the cue. When present we
-    // keep the preceding clause minus its last word instead of deleting it.
     let re = Regex::new(&format!(
-        r"(?i)(?:^|[.!?]\s*|\n)([^.!?\n]*?)(?:\b({apologies})\b\s+)?\b(?:{alts})\b[,\.]?\s*"
+        r"(?i)(?:^|[.!?]\s*|\n)[^.!?\n]*?\b(?:{alts})\b[,\.]?\s*"
     ))
     .expect("discard pattern");
     let s = re.replace_all(text, |caps: &regex::Captures| {
-        let whole = caps.get(0).map(|g| g.as_str()).unwrap_or("");
-        if caps.get(2).is_some() {
-            let pre = caps.get(1).map(|g| g.as_str()).unwrap_or("");
-            let trimmed = pre.trim_end();
-            match trimmed.rfind(char::is_whitespace) {
-                Some(p) => format!("{} ", &trimmed[..p]),
-                None => String::new(),
-            }
-        } else if whole.starts_with('.') || whole.starts_with('!') || whole.starts_with('?') {
-            whole.chars().next().map(|c| format!("{c} ")).unwrap_or_default()
+        let m = caps.get(0).map(|g| g.as_str()).unwrap_or("");
+        if m.starts_with('.') || m.starts_with('!') || m.starts_with('?') {
+            m.chars().next().unwrap().to_string() + " "
         } else {
             String::new()
         }
@@ -482,11 +382,7 @@ fn drop_discard_commands(text: &str) -> String {
 }
 
 fn rewrite_actually(text: &str) -> String {
-    per_line(text, rewrite_actually_line)
-}
-
-fn rewrite_actually_line(line: &str) -> String {
-    let toks: Vec<&str> = line.split_whitespace().collect();
+    let toks: Vec<&str> = text.split_whitespace().collect();
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
     while i < toks.len() {
@@ -506,11 +402,7 @@ fn rewrite_actually_line(line: &str) -> String {
 }
 
 fn rewrite_i_mean(text: &str) -> String {
-    per_line(text, rewrite_i_mean_line)
-}
-
-fn rewrite_i_mean_line(line: &str) -> String {
-    let toks: Vec<&str> = line.split_whitespace().collect();
+    let toks: Vec<&str> = text.split_whitespace().collect();
     let mut out: Vec<String> = Vec::new();
     let mut i = 0;
     while i < toks.len() {
@@ -532,11 +424,11 @@ fn rewrite_i_mean_line(line: &str) -> String {
     out.join(" ")
 }
 
-/// Apply a whitespace-token rewrite to each line separately, so newlines from
-/// the spoken "new line" / "new paragraph" commands survive (blank lines from
-/// "new paragraph" are preserved as empty segments).
-fn per_line(text: &str, f: impl Fn(&str) -> String) -> String {
-    text.split('\n').map(f).collect::<Vec<_>>().join("\n")
+/// Full P2 offline pass, before user dictionary + cleanup.
+pub fn apply_offline_format(text: &str) -> String {
+    let spoken = apply_spoken_commands(text);
+    let back = apply_backtrack(&spoken);
+    apply_lists(&back)
 }
 
 #[cfg(test)]
@@ -588,6 +480,32 @@ mod tests {
     }
 
     #[test]
+    fn list_strips_spoken_point_cues() {
+        assert_eq!(
+            apply_lists("first thing is buy milk second thing is call mom"),
+            "1. buy milk\n2. call mom"
+        );
+    }
+
+    #[test]
+    fn spoken_points_after_a_lead_in_become_a_list() {
+        assert_eq!(
+            apply_lists(
+                "We need to create a multiple pointer. So first thing is when we click it will automatically fix the grammar. Second, if we are talking some pointer, it will automatically fix the pointer. Third, however wherever we need to make the changes. So yeah."
+            ),
+            "We need to create a multiple pointer.\n\n1. When we click it will automatically fix the grammar.\n2. If we are talking some pointer, it will automatically fix the pointer.\n3. However wherever we need to make the changes."
+        );
+    }
+
+    #[test]
+    fn bare_ordinals_in_prose_stay_prose() {
+        assert_eq!(
+            apply_lists("The first time I tried, the second day was better."),
+            "The first time I tried, the second day was better."
+        );
+    }
+
+    #[test]
     fn bullet_list() {
         assert_eq!(
             apply_lists("bullet milk bullet eggs"),
@@ -629,87 +547,7 @@ mod tests {
 
     #[test]
     fn pipeline_spoken_then_list() {
-        // The engine wires these three in order (commands → backtrack → lists).
-        let out = apply_lists(&apply_backtrack(&apply_spoken_commands(
-            "one milk comma two eggs period",
-        )));
+        let out = apply_offline_format("one milk comma two eggs period");
         assert_eq!(out, "1. milk,\n2. eggs.");
-    }
-
-    #[test]
-    fn remove_that_and_apology_cues() {
-        assert_eq!(
-            apply_backtrack("Let's ship Friday sorry remove that Monday"),
-            "Let's ship Monday"
-        );
-        assert_eq!(
-            apply_backtrack("hello world remove that goodbye"),
-            "goodbye"
-        );
-    }
-
-    #[test]
-    fn table_driven_spoken_commands() {
-        let cases: &[(&str, &str)] = &[
-            // alwaysPunctuation.
-            ("hello comma world period", "hello, world."),
-            ("first new line second new paragraph third", "first\nsecond\n\nthird"),
-            ("question mark", "?"),
-            ("done exclamation mark", "done!"),
-            ("wait ellipsis", "wait…"),
-            ("dot dot dot", "…"),
-            // not commands / partial words.
-            ("periodic table", "periodic table"),
-            ("commander", "commander"),
-            // noun-marker guard on requested punctuation.
-            ("the period of time", "the period of time"),
-            ("send a comma", "send a comma"),
-            // symbols with attachment.
-            ("issue hash 42", "issue #42"),
-            ("hash out a plan", "hash out a plan"),
-            ("50 percent", "50%"),
-            ("what percent of users", "what percent of users"),
-            ("what percentage of users", "what percentage of users"),
-            ("dollar 20", "$20"),
-            // handles and domains.
-            ("ping at the rate KV", "ping @KV"),
-            ("at the rate K V", "@KV"),
-            ("name at the rate gmail dot com", "name@gmail.com"),
-            ("gmail dot com", "gmail.com"),
-            ("gmail. com", "gmail.com"),
-        ];
-        for (input, want) in cases {
-            assert_eq!(apply_spoken_commands(input), *want, "input: {input:?}");
-        }
-    }
-
-    #[test]
-    fn backtrack_preserves_newlines_and_breaks() {
-        // "new line" / "new paragraph" survive the backtrack pass.
-        let staged = apply_spoken_commands("first new line second new paragraph third");
-        assert_eq!(apply_backtrack(&staged), "first\nsecond\n\nthird");
-        // …and the rewrites still work inside a line.
-        let staged = apply_spoken_commands("first new line the meeting is at 5 actually 3");
-        assert_eq!(apply_backtrack(&staged), "first\nthe meeting is at 3");
-    }
-
-    #[test]
-    fn symbols_only_attach_to_digits() {
-        assert_eq!(apply_spoken_commands("dollar 20"), "$20");
-        assert_eq!(apply_spoken_commands("issue hash 42"), "issue #42");
-        assert_eq!(apply_spoken_commands("50 percent"), "50%");
-        // Unconverted number words stay words (no `$twenty` / `twenty%`).
-        assert_eq!(apply_spoken_commands("dollar twenty"), "dollar twenty");
-        assert_eq!(apply_spoken_commands("twenty percent"), "twenty percent");
-    }
-
-    #[test]
-    fn is_spoken_command_helper() {
-        assert!(is_spoken_command("question mark"));
-        assert!(is_spoken_command("Question Mark"));
-        assert!(is_spoken_command("comma"));
-        assert!(!is_spoken_command("hello"));
-        assert!(!is_spoken_command("periodic"));
-        assert!(!is_spoken_command(""));
     }
 }

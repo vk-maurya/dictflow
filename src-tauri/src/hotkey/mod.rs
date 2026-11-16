@@ -1,8 +1,8 @@
 //! Platform talk keys: Windows polls `GetAsyncKeyState`; macOS uses a
 //! session CGEventTap (SpeakType-style, Accessibility — not HID / Input Monitoring).
 //!
-//! Utility shortcuts (paste-last / copy-last) are registered through the
-//! shared Tauri global-shortcut plugin on both OSes.
+//! Utility shortcuts (paste-last / copy-last / refine-selection) are registered
+//! through the shared Tauri global-shortcut plugin on both OSes.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -54,6 +54,11 @@ pub(crate) fn set_fn_mode(key: &str) {
     {
         let _ = key;
     }
+}
+
+pub(crate) fn restore_globe_action() {
+    #[cfg(target_os = "macos")]
+    macos::restore_globe_action();
 }
 
 /// After TCC is granted, try again to attach CGEventTap / Fn tap.
@@ -212,21 +217,49 @@ pub(crate) fn validate_utility_key(raw: &str, other: &str) -> Result<shortcuts::
     Ok(spec)
 }
 
+pub(crate) fn validate_refine_key(raw: &str, others: &[&str]) -> Result<String, String> {
+    if shortcuts::is_refine_off(raw) {
+        return Ok("Off".to_owned());
+    }
+    let spec = shortcuts::parse_shortcut(raw)?;
+    if !shortcuts::is_safe_utility(&spec) {
+        return Err(format!("{raw} needs a modifier so it does not steal typing"));
+    }
+    if shortcuts::is_talk_combo(&spec) {
+        return Err("that combo is reserved for the talk key".to_owned());
+    }
+    let formatted = shortcuts::format_shortcut(&spec);
+    for other in others {
+        if formatted.eq_ignore_ascii_case(other.trim()) {
+            return Err("refine selection must differ from paste-last and copy-last".to_owned());
+        }
+    }
+    Ok(formatted)
+}
+
 pub(crate) fn apply_utility_shortcuts(app: &tauri::AppHandle) {
-    let (paste_raw, copy_raw, old) = {
+    let (paste_raw, copy_raw, refine_raw, old) = {
         let st = app.state::<Mutex<AppState>>();
         let Ok(mut s) = st.lock() else {
             return;
         };
         let old = std::mem::take(&mut s.utility_shortcuts);
-        (s.settings.paste_last_key.clone(), s.settings.copy_last_key.clone(), old)
+        (
+            s.settings.paste_last_key.clone(),
+            s.settings.copy_last_key.clone(),
+            s.settings.refine_selection_key.clone(),
+            old,
+        )
     };
     let gs = app.global_shortcut();
     for sc in old {
         let _ = gs.unregister(sc);
     }
     let mut next = Vec::new();
-    for raw in [paste_raw, copy_raw] {
+    for raw in [paste_raw, copy_raw, refine_raw] {
+        if shortcuts::is_refine_off(&raw) {
+            continue;
+        }
         match shortcuts::parse_shortcut(&raw).and_then(|s| spec_to_shortcut(&s)) {
             Ok(sc) => {
                 if let Err(e) = gs.register(sc) {
@@ -267,5 +300,20 @@ mod tests {
             assert_eq!(normalize_talk_key("Fn"), "RightCtrl");
             assert_eq!(default_talk_key(), "RightCtrl");
         }
+    }
+
+    #[test]
+    fn refine_key_accepts_option_1_and_rejects_collisions() {
+        let others = ["Shift+Alt+Z", "Shift+Alt+X"];
+        assert_eq!(validate_refine_key("Option+1", &others).unwrap(), "Alt+1");
+        assert_eq!(validate_refine_key("alt+1", &others).unwrap(), "Alt+1");
+        assert_eq!(validate_refine_key("Off", &others).unwrap(), "Off");
+        assert!(validate_refine_key("Shift+Alt+Z", &others).is_err());
+        assert!(validate_refine_key("Shift+Alt+X", &others).is_err());
+        assert!(validate_refine_key("Ctrl+Alt+Space", &others).is_err());
+        assert!(validate_refine_key("1", &others).is_err());
+        let spec = shortcuts::parse_shortcut("Alt+1").unwrap();
+        let sc = spec_to_shortcut(&spec).unwrap();
+        assert_eq!(sc, Shortcut::new(Some(Modifiers::ALT), Code::Digit1));
     }
 }

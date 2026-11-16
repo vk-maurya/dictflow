@@ -9,13 +9,11 @@ use std::sync::mpsc;
 
 use anyhow::Context;
 
-use crate::clean;
 use crate::devices;
-use crate::email;
 use crate::format;
 use crate::models::{self, EngineKind};
-use crate::numbers;
 use crate::polish;
+use crate::s1_runtime::S1Runtime;
 use crate::settings::Settings;
 use crate::text;
 
@@ -74,7 +72,11 @@ impl Transcriber {
     }
 
     /// Blocking decode on the transcriber thread. Call from `spawn_blocking`.
-    pub(crate) fn transcribe(&self, model_id: &str, samples_16k: Vec<f32>) -> Result<String, String> {
+    pub(crate) fn transcribe(
+        &self,
+        model_id: &str,
+        samples_16k: Vec<f32>,
+    ) -> Result<String, String> {
         let (rep_tx, rep_rx) = mpsc::channel();
         self.tx
             .send(EngineJob::Transcribe {
@@ -102,8 +104,7 @@ fn ensure_parakeet<'a>(
 ) -> Result<&'a sherpa_onnx::OfflineRecognizer, String> {
     let needs_load = !matches!(loaded, Some((id, _)) if id == model_id);
     if needs_load {
-        let entry = models::find(model_id)
-            .ok_or_else(|| format!("unknown model: {model_id}"))?;
+        let entry = models::find(model_id).ok_or_else(|| format!("unknown model: {model_id}"))?;
         if entry.engine != EngineKind::Parakeet {
             return Err(format!("{model_id} is not a Parakeet model"));
         }
@@ -184,6 +185,7 @@ pub(crate) struct TranscribeInput {
     pub data_dir: PathBuf,
     pub dictionary: Vec<text::DictionaryEntry>,
     pub polish: PolishCfg,
+    pub s1_runtime: S1Runtime,
 }
 
 #[derive(Clone)]
@@ -201,6 +203,9 @@ pub(crate) struct PolishCfg {
     pub llm_preset: String,
     pub llm_custom_prompt: String,
     pub llm_enabled: bool,
+    pub s1_styling: String,
+    pub s1_structure: String,
+    pub s1_context: String,
 }
 
 pub(crate) fn polish_cfg(settings: &Settings, data_dir: &Path) -> PolishCfg {
@@ -210,11 +215,7 @@ pub(crate) fn polish_cfg(settings: &Settings, data_dir: &Path) -> PolishCfg {
     } else {
         settings.audio_api_base.clone()
     };
-    let llm_base = if settings.llm_api_base.trim().is_empty() {
-        polish::default_base(&settings.llm_backend).to_owned()
-    } else {
-        settings.llm_api_base.clone()
-    };
+    let llm_base = polish::canonical_llm_base(&settings.llm_backend, &settings.llm_api_base);
     PolishCfg {
         audio_backend: settings.audio_backend.clone(),
         audio_api_base: audio_base,
@@ -229,6 +230,9 @@ pub(crate) fn polish_cfg(settings: &Settings, data_dir: &Path) -> PolishCfg {
         llm_preset: settings.llm_preset.clone(),
         llm_custom_prompt: settings.llm_custom_prompt.clone(),
         llm_enabled: settings.llm_enabled,
+        s1_styling: settings.s1_styling.clone(),
+        s1_structure: settings.s1_structure.clone(),
+        s1_context: settings.s1_context.clone(),
     }
 }
 
@@ -291,63 +295,42 @@ pub(crate) struct TranscriptResult {
     pub raw_text: String,
     pub duration_secs: f64,
     pub dict_hits: u32,
+    /// Shown when model cleanup was requested and local rules were used instead.
+    pub cleanup_note: Option<String>,
 }
 
-/// Result of the rules-only chain (`rules_pipeline`).
-struct RulesOut {
-    text: String,
-    /// Vocabulary hits (entries whose `usage` was bumped) — drives the save.
-    hits: u32,
-    /// True when the transcript became an email layout: the LLM polish stage
-    /// is skipped so the layout survives.
-    is_email: bool,
+pub(crate) fn polish_preset<'a>(cleanup: &str, preset: &'a str, custom: &str) -> &'a str {
+    if preset == "custom" && !custom.trim().is_empty() {
+        return "custom";
+    }
+    match cleanup {
+        "high" => "professional",
+        "medium" => "clean",
+        _ => preset,
+    }
 }
 
-/// Rules-only chain applied to the raw transcript, before the optional LLM
-/// polish (docs/TEXT_PIPELINE_PLAN.md §3):
-///   command fixes → spoken numbers → spoken commands → backtrack → lists →
-///   email (short-circuit) | clean → vocabulary → tidy.
-/// `cleanup == "off"` skips both `clean.rs` and the tidy pass.
-fn rules_pipeline(
-    raw_text: &str,
-    language: &str,
-    cleanup: &str,
-    dictionary: &mut [text::DictionaryEntry],
-) -> RulesOut {
-    // Command fixes first: a dictionary entry whose replacement is a spoken
-    // command phrase is expanded so the command pass can act on it. Hits are
-    // discarded — command fixes never bump `usage`, so there is nothing to save.
-    let (cmd_fixed, _) = text::apply_command_fixes(raw_text, dictionary);
-    let with_numbers = numbers::apply_spoken_numbers(&cmd_fixed);
-    let commands = format::apply_spoken_commands(&with_numbers);
-    // `apply_backtrack` still owns the "scratch that / never mind / remove that"
-    // clause delete; `clean.rs` covers the conversational repair cues.
-    let commanded = format::apply_lists(&format::apply_backtrack(&commands));
-
-    if language == "en" || language == "auto" {
-        if let Some(mail) = email::compose_email(&commanded) {
-            return RulesOut {
-                text: mail,
-                hits: 0,
-                is_email: true,
-            };
-        }
+fn cleanup_failure_note(err: &anyhow::Error) -> String {
+    let raw = format!("{err:#}").replace('\n', " ");
+    if raw.contains("429") {
+        return "The cleanup model rate-limited this request (429), so your prompt did not run. Local cleanup was pasted instead. Wait a minute or switch off the free-tier model.".to_owned();
     }
+    let brief: String = raw.chars().take(160).collect();
+    format!("Text cleanup did not run, so local cleanup was pasted. {brief}")
+}
 
-    let cleaned = match cleanup {
-        "light" | "medium" | "full" | "high" => clean::clean(&commanded, language),
-        _ => commanded,
-    };
-    let (vocab, hits) = text::apply_vocabulary(&cleaned, dictionary);
-    let text = match cleanup {
-        "full" | "high" => text::tidy_punctuation(&vocab),
-        _ => vocab,
-    };
-    RulesOut {
-        text,
-        hits,
-        is_email: false,
+fn transcript_is_english(audio_backend: &str, model_id: &str, language: &str, text: &str) -> bool {
+    let whisper_forced_english = audio_backend != "openai_compat"
+        && matches!(language, "en" | "en-US" | "en-GB")
+        && models::find(model_id).is_some_and(|m| m.engine == EngineKind::Whisper);
+    if whisper_forced_english {
+        return true;
     }
+    // Parakeet and generic audio APIs do not expose a reliable language code.
+    // Skip S1 only when detection is confidently non-English; short or
+    // ambiguous phrases should not be silently denied cleanup.
+    !whatlang::detect(text)
+        .is_some_and(|info| info.lang() != whatlang::Lang::Eng && info.confidence() >= 0.80)
 }
 
 /// Heavy work: runs inside `spawn_blocking` so the async runtime stays free.
@@ -370,52 +353,93 @@ pub(crate) fn run_transcription(
             &wav,
         )?
     } else {
-    let entry = models::find(&input.model_id).context("unknown model")?;
-    match entry.engine {
-        EngineKind::Whisper => {
-            let tmp = input.data_dir.join("last_16k.wav");
-            text::write_wav_mono_16k(&tmp, &samples, 16_000)?;
-            transcribe_whisper(
-                &input.data_dir,
-                &input.model_id,
-                &input.language,
-                input.translate,
-                &tmp,
-            )?
+        let entry = models::find(&input.model_id).context("unknown model")?;
+        match entry.engine {
+            EngineKind::Whisper => {
+                let tmp = input.data_dir.join("last_16k.wav");
+                text::write_wav_mono_16k(&tmp, &samples, 16_000)?;
+                transcribe_whisper(
+                    &input.data_dir,
+                    &input.model_id,
+                    &input.language,
+                    input.translate,
+                    &tmp,
+                )?
+            }
+            EngineKind::Parakeet => parakeet
+                .transcribe(&input.model_id, samples)
+                .map_err(anyhow::Error::msg)?,
         }
-        EngineKind::Parakeet => parakeet
-            .transcribe(&input.model_id, samples)
-            .map_err(anyhow::Error::msg)?,
-    }
     };
     let raw_text = raw.trim().to_owned();
 
-    // P0 text pipeline (docs/TEXT_PIPELINE_PLAN.md §3), rules-only (no LLM).
-    // `raw_text` is deliberately left untouched for history.
+    // App-specific spoken commands run before either cleanup path.
+    let formatted = format::apply_offline_format(&raw_text);
+    let want_llm = if input.polish.llm_backend == "s1_mini" {
+        input.polish.llm_enabled
+    } else {
+        input.polish.llm_enabled || input.cleanup == "medium" || input.cleanup == "high"
+    };
+    let wants_s1 = want_llm
+        && input.polish.llm_backend == "s1_mini"
+        && transcript_is_english(
+            &input.polish.audio_backend,
+            &input.model_id,
+            &input.language,
+            &formatted,
+        );
+    let mut cleanup_note = None;
+    let normalized = if wants_s1 {
+        match input
+            .s1_runtime
+            .ensure(&input.data_dir, input.polish.llm_timeout_ms.max(15_000))
+            .and_then(|base| {
+                polish::polish_s1(
+                    &base,
+                    input.polish.llm_timeout_ms.max(15_000),
+                    &input.polish.s1_styling,
+                    &input.polish.s1_structure,
+                    &input.polish.s1_context,
+                    &formatted,
+                )
+            }) {
+            Ok(text) => Some(text),
+            Err(error) => {
+                cleanup_note = Some(
+                    "S1-mini was unavailable, so rules-only cleanup was used.".to_owned(),
+                );
+                log::warn!("S1-mini cleanup skipped: {error:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Dictionary is intentionally after S1 so user-defined names win.
     let mut dictionary = input.dictionary.clone();
-    let rules = rules_pipeline(
-        &raw_text,
-        &input.language,
-        &input.cleanup,
-        &mut dictionary,
-    );
-    let mut out = rules.text;
-    if rules.hits > 0 {
+    let (mut out, dict_hits) =
+        text::apply_dictionary(normalized.as_deref().unwrap_or(&formatted), &mut dictionary);
+    if dict_hits > 0 {
         text::sort_dictionary(&mut dictionary);
         let _ = text::save_dictionary(&input.data_dir, &dictionary);
     }
+    // S1 already handles fillers and punctuation. Rules remain the fallback.
+    if normalized.is_none() {
+        match input.cleanup.as_str() {
+            "light" | "medium" => out = text::remove_fillers(&out),
+            "full" | "high" => out = text::tidy_punctuation(&text::remove_fillers(&out)),
+            _ => {}
+        }
+    }
     out = text::smart_trailing_punctuation(&out);
-    let want_llm = !rules.is_email
-        && (input.polish.llm_enabled
-            || input.cleanup == "medium"
-            || input.cleanup == "high");
-    if want_llm && input.polish.llm_backend != "off" {
-        let preset = match input.cleanup.as_str() {
-            "high" => "professional",
-            "medium" => "clean",
-            _ => input.polish.llm_preset.as_str(),
-        };
-        if let Some(polished) = polish::polish(&polish::PolishArgs {
+    if want_llm && input.polish.llm_backend != "off" && input.polish.llm_backend != "s1_mini" {
+        let preset = polish_preset(
+            &input.cleanup,
+            &input.polish.llm_preset,
+            &input.polish.llm_custom_prompt,
+        );
+        match polish::polish(&polish::PolishArgs {
             backend: &input.polish.llm_backend,
             base_url: &input.polish.llm_api_base,
             api_key: &input.polish.llm_api_key,
@@ -426,18 +450,24 @@ pub(crate) fn run_transcription(
             timeout_ms: input.polish.llm_timeout_ms,
             text: &out,
         }) {
-            out = polished;
+            Ok(Some(polished)) => out = polished,
+            Ok(None) => {
+                cleanup_note = Some(
+                    "Text cleanup returned nothing, so local cleanup was pasted.".to_owned(),
+                );
+            }
+            Err(error) => {
+                cleanup_note = Some(cleanup_failure_note(&error));
+            }
         }
     }
     let out = out.trim().to_owned();
-    if out.is_empty() {
-        anyhow::bail!("transcription was empty");
-    }
     Ok(TranscriptResult {
         text: out,
         raw_text,
         duration_secs,
-        dict_hits: rules.hits,
+        dict_hits,
+        cleanup_note,
     })
 }
 
@@ -445,184 +475,45 @@ pub(crate) fn run_transcription(
 mod tests {
     use super::*;
 
-    fn entry(id: &str, from: &str, to: &str) -> text::DictionaryEntry {
-        text::DictionaryEntry::new(id, from, to)
-    }
-
     #[test]
-    fn rules_numbers_before_commands() {
-        let mut d = Vec::new();
-        let out = rules_pipeline("issue hash forty two", "en", "light", &mut d);
-        assert_eq!(out.text, "issue #42");
-        assert_eq!(out.hits, 0);
-        assert!(!out.is_email);
-    }
-
-    #[test]
-    fn rules_command_fix_precedes_command_pass() {
-        // A dictionary entry whose replacement is a spoken command is expanded
-        // first, so the command engine turns it into punctuation.
-        let mut d = vec![entry("1", "kocia mark", "question mark")];
-        let out = rules_pipeline("are you there kocia mark", "en", "light", &mut d);
-        assert_eq!(out.text, "are you there?");
-        // Command fixes never bump usage.
-        assert_eq!(d[0].usage, 0);
-    }
-
-    #[test]
-    fn rules_cleanup_then_vocabulary() {
-        let mut d = vec![entry("1", "my email", "a@b.com")];
-        let out = rules_pipeline("contact my um email please", "en", "light", &mut d);
-        assert_eq!(out.text, "contact a@b.com please");
-        assert_eq!(out.hits, 1);
-        assert_eq!(d[0].usage, 1);
-    }
-
-    #[test]
-    fn rules_backtrack_cues_survive_cleanup() {
-        let mut d = Vec::new();
-        let out = rules_pipeline("hello world scratch that goodbye", "en", "light", &mut d);
-        assert_eq!(out.text, "goodbye");
-    }
-
-    #[test]
-    fn rules_email_short_circuits_and_is_language_gated() {
-        let mut d = Vec::new();
-        let out = rules_pipeline(
-            "draft an email to Sarah telling her that I will be late tomorrow, cheers, Sarah",
+    fn s1_language_gate_handles_forced_and_detected_sources() {
+        assert!(transcript_is_english("local", "base.en", "en", "hi"));
+        assert!(transcript_is_english(
+            "local",
+            "parakeet-v3",
             "en",
-            "light",
-            &mut d,
-        );
-        assert!(out.is_email);
-        assert_eq!(
-            out.text,
-            "Hi Sarah,\n\nI will be late tomorrow.\n\nCheers,\nSarah"
-        );
-
-        // Non-English never builds an email layout.
-        let mut d = Vec::new();
-        let out = rules_pipeline(
-            "write an email to Sarah saying hi, best regards, Sarah",
-            "de",
-            "light",
-            &mut d,
-        );
-        assert!(!out.is_email);
+            "I am begging pardon"
+        ));
+        assert!(transcript_is_english(
+            "local",
+            "parakeet-v3",
+            "en",
+            "This is a sufficiently clear English sentence for language detection."
+        ));
+        assert!(!transcript_is_english(
+            "local",
+            "parakeet-v3",
+            "en",
+            "Esta es una oración claramente escrita en español para detectar el idioma."
+        ));
+        assert!(!transcript_is_english(
+            "openai_compat",
+            "base.en",
+            "en",
+            "Ceci est une longue phrase clairement écrite en français pour vérifier la détection de la langue."
+        ));
     }
 
     #[test]
-    fn rules_cleanup_off_leaves_text_alone() {
-        let mut d = Vec::new();
-        let out = rules_pipeline("um, hello", "en", "off", &mut d);
-        assert_eq!(out.text, "um, hello");
-    }
-
-    #[test]
-    fn rules_newlines_survive_light_and_full_cleanup() {
-        for cleanup in ["light", "full"] {
-            let mut d = Vec::new();
-            let out = rules_pipeline(
-                "first new line second new paragraph third",
-                "en",
-                cleanup,
-                &mut d,
-            );
-            assert_eq!(out.text, "first\nsecond\n\nthird", "cleanup: {cleanup}");
-        }
-    }
-
-    /// The examples published in `docs/P0_MANUAL_TEST.md`, run through the whole
-    /// rules chain with the app default cleanup (`full`). Keeps the doc honest.
-    #[test]
-    fn documented_examples_match_pipeline() {
-        let cases: &[(&str, &str)] = &[
-            ("four point five stars", "4.5 stars"),
-            ("one lakh twenty thousand", "1,20,000"),
-            ("two hundred fifty dollars", "250 dollars"),
-            ("hello comma world period", "hello, world."),
-            ("are you there question mark", "are you there?"),
-            ("done exclamation mark", "done!"),
-            ("open parenthesis hello close parenthesis", "(hello)"),
-            (
-                "first new line second new paragraph third",
-                "first\nsecond\n\nthird",
-            ),
-            ("the period of time", "the period of time"),
-            ("send a comma", "send a comma"),
-            ("ping at the rate KV", "ping @KV"),
-            (
-                "send it to name at the rate gmail dot com",
-                "send it to name@gmail.com",
-            ),
-            ("issue hash forty two", "issue #42"),
-            ("save fifty percent", "save 50%"),
-            ("what percent of users", "what percent of users"),
-            ("hash out a plan", "hash out a plan"),
-            ("dollar twenty", "dollar twenty"),
-            (
-                "Let's ship Friday sorry remove that Monday",
-                "Let's ship Monday",
-            ),
-            ("hello world scratch that goodbye", "goodbye"),
-            ("the meeting is at 5 actually 3", "the meeting is at 3"),
-            ("the color is blue I mean red", "the color is red"),
-            ("Um, let's go", "Let's go"),
-            ("well uh yeah", "well yeah"),
-            ("It was, you know, fine", "It was, fine"),
-            (
-                "and then and then we shipped it",
-                "and then we shipped it",
-            ),
-            (
-                "Drinking more and more and more",
-                "Drinking more and more and more",
-            ),
-            (
-                "I live in Delhi no sorry I live in Ahmedabad",
-                "I live in Ahmedabad",
-            ),
-            (
-                "one buy milk two call mom three send email",
-                "1. buy milk\n2. call mom\n3. send email",
-            ),
-            ("bullet milk bullet eggs", "- milk\n- eggs"),
-            (
-                "first wash dishes second take out trash",
-                "1. wash dishes\n2. take out trash",
-            ),
-            (
-                "write an email to Sarah saying I will be on holiday tomorrow, best regards, Kartik",
-                "Hi Sarah,\n\nI will be on holiday tomorrow.\n\nBest regards,\nKartik",
-            ),
-        ];
-        for (input, want) in cases {
-            let mut d: Vec<text::DictionaryEntry> = Vec::new();
-            let out = rules_pipeline(input, "en", "full", &mut d);
-            assert_eq!(out.text, *want, "input: {input:?}");
-        }
-
-        // Dictionary entries (set up in Settings → Dictionary).
-        let mut d = vec![entry("1", "my email", "a@b.com")];
-        let out = rules_pipeline("contact my email please", "en", "full", &mut d);
-        assert_eq!(out.text, "contact a@b.com please");
-
-        // A dictionary entry whose replacement is a spoken command.
-        let mut d = vec![entry("1", "kocia mark", "question mark")];
-        let out = rules_pipeline("are you there kocia mark", "en", "full", &mut d);
-        assert_eq!(out.text, "are you there?");
-
-        // Cleanup off / non-English gate.
-        let mut d = Vec::new();
+    fn custom_prompt_is_not_replaced_by_cleanup_level() {
+        assert_eq!(polish_preset("high", "custom", "Format lists"), "custom");
         assert_eq!(
-            rules_pipeline("um, hello", "en", "off", &mut d).text,
-            "um, hello"
+            polish_preset("medium", "custom", "Format lists"),
+            "custom"
         );
-        let mut d = Vec::new();
-        assert_eq!(
-            rules_pipeline("Um, hello world", "de", "full", &mut d).text,
-            "Um, hello world"
-        );
+        assert_eq!(polish_preset("high", "clean", ""), "professional");
+        assert_eq!(polish_preset("medium", "professional", ""), "clean");
+        assert_eq!(polish_preset("full", "casual", ""), "casual");
+        assert_eq!(polish_preset("high", "custom", "  "), "professional");
     }
 }
-

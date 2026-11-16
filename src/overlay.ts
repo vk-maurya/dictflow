@@ -4,18 +4,12 @@ import { listen } from "@tauri-apps/api/event";
 import { currentMonitor, getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalPosition } from "@tauri-apps/api/dpi";
 
-type Phase = "idle" | "recording" | "transcribing";
-
-interface OverlayPose {
-  x: number;
-  y: number;
-  edge: "top" | "bottom" | "left" | "right";
-  offset: number;
-}
+type Phase = "idle" | "recording" | "transcribing" | "refining";
 
 interface AppStatus {
   recording: boolean;
   transcribing: boolean;
+  refining?: boolean;
 }
 
 interface LevelPayload {
@@ -76,9 +70,14 @@ function setTime(secs: number): void {
 function setPhase(next: Phase): void {
   if (phase === next) return;
   phase = next;
-  pill()?.classList.remove("idle", "recording", "transcribing", "copychip");
+  pill()?.classList.remove("idle", "recording", "transcribing", "refining", "copychip");
   pill()?.classList.add(next);
   reportHitRect();
+  const status = document.getElementById("status");
+  if (status) {
+    if (next === "refining") status.textContent = "Refining...";
+    else if (next === "transcribing") status.textContent = "Transcribing...";
+  }
   if (next === "recording") {
     bins.fill(0);
     setTime(0);
@@ -122,6 +121,7 @@ function reportHitRect(): void {
 function applyStatus(s: AppStatus): void {
   if (s.recording) setPhase("recording");
   else if (s.transcribing) setPhase("transcribing");
+  else if (s.refining) setPhase("refining");
   else setPhase("idle");
 }
 
@@ -182,8 +182,19 @@ function drawWave(): void {
 
   const n = gated.length;
   const total = n * BAR_W + (n - 1) * BAR_GAP;
-  let x = (w - total) / 2;
+  const vertical = pill()?.classList.contains("vertical") ?? false;
   ctx.fillStyle = "rgba(255, 255, 255, 0.9)";
+  if (vertical) {
+    let y = (h - total) / 2;
+    for (let i = 0; i < n; i++) {
+      const norm = Math.min(1, gated[i] / recentPeak) * presence;
+      const bw = Math.max(MIN_BAR, norm * w);
+      roundBar(ctx, (w - bw) / 2, y, bw, BAR_W);
+      y += BAR_W + BAR_GAP;
+    }
+    return;
+  }
+  let x = (w - total) / 2;
   for (let i = 0; i < n; i++) {
     const norm = Math.min(1, gated[i] / recentPeak) * presence;
     const bh = Math.max(MIN_BAR, norm * h);
@@ -202,7 +213,7 @@ function tick(): void {
 }
 
 async function toggleFromOverlay(): Promise<void> {
-  if (phase === "transcribing" || toggling) return;
+  if (phase === "transcribing" || phase === "refining" || toggling) return;
   toggling = true;
   try {
     await invoke("toggle_recording");
@@ -262,24 +273,33 @@ function onPointerMove(e: PointerEvent): void {
   queuePlace(press.originX + dx, press.originY + dy);
 }
 
-async function snapAfterDrag(): Promise<void> {
+function applyEdge(edge: string): void {
+  pill()?.classList.toggle("vertical", edge === "left" || edge === "right");
+}
+
+async function saveFreePosition(): Promise<void> {
   try {
     const pos = await win.outerPosition();
     const mon = await currentMonitor();
     if (!mon) return;
-    const origin = mon.position;
-    const size = mon.size;
     const scale = mon.scaleFactor || 1;
-    const snapped = await invoke<OverlayPose>("snap_overlay", {
-      x: Math.round((pos.x - origin.x) / scale),
-      y: Math.round((pos.y - origin.y) / scale),
-      screenW: Math.round(size.width / scale),
-      screenH: Math.round(size.height / scale),
-    });
-    await win.setPosition(
-      new LogicalPosition(origin.x / scale + snapped.x, origin.y / scale + snapped.y),
+    const screenW = Math.round(mon.size.width / scale);
+    const screenH = Math.round(mon.size.height / scale);
+    const x = Math.round(
+      (pos.x - mon.position.x) / scale + document.documentElement.clientWidth / 2,
     );
-    await invoke("set_overlay_pose", { edge: snapped.edge, offset: snapped.offset });
+    const y = Math.round(
+      (pos.y - mon.position.y) / scale + document.documentElement.clientHeight / 2,
+    );
+    await invoke("set_overlay_pose", {
+      edge: "bottom",
+      offset: 0,
+      free: true,
+      x,
+      y,
+      screenW,
+      screenH,
+    });
   } catch {
     /* pose is best-effort */
   }
@@ -318,7 +338,7 @@ async function boot(): Promise<void> {
       const hadPress = press !== null;
       resetPress();
       if (wasDrag) {
-        void snapAfterDrag().finally(() =>
+        void saveFreePosition().finally(() =>
           invoke("set_overlay_drag", { active: false }).catch(() => undefined),
         );
         return;
@@ -335,18 +355,28 @@ async function boot(): Promise<void> {
     host.addEventListener("pointercancel", onRelease);
   }
 
+  await listen<string>("dictflow://overlay-edge", (e) => applyEdge(e.payload));
+  const saved = await invoke<{ overlay_edge?: string }>("get_settings").catch(() => null);
+  if (saved?.overlay_edge) applyEdge(saved.overlay_edge);
+
   await listen<boolean>("dictflow://recording", (e) => {
     if (e.payload) setPhase("recording");
     else if (phase === "recording") setPhase("transcribing");
   });
   await listen<boolean>("dictflow://transcribing", (e) => {
     if (e.payload) setPhase("transcribing");
-    else setPhase("idle");
+    else if (phase !== "refining") setPhase("idle");
+  });
+  await listen<boolean>("dictflow://refining", (e) => {
+    if (e.payload) setPhase("refining");
+    else if (phase === "refining") setPhase("idle");
   });
   await listen<LevelPayload>("dictflow://level", (e) => applyLevel(e.payload));
-  await listen("dictflow://committed", () => setPhase("idle"));
+  await listen("dictflow://committed", () => {
+    if (phase !== "refining") setPhase("idle");
+  });
   await listen("dictflow://history-updated", () => {
-    if (phase !== "recording") setPhase("idle");
+    if (phase !== "recording" && phase !== "refining") setPhase("idle");
   });
 
   setInterval(async () => {

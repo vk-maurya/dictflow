@@ -135,6 +135,47 @@ pub fn snap_to_edge(
     }
 }
 
+/// Wide frame on the top or bottom, tall frame on the left or right.
+pub fn orientation_size(edge: DockEdge) -> (i32, i32) {
+    if is_vertical(edge) {
+        (PILL_H, PILL_W)
+    } else {
+        (PILL_W, PILL_H)
+    }
+}
+
+pub fn is_vertical(edge: DockEdge) -> bool {
+    matches!(edge, DockEdge::Left | DockEdge::Right)
+}
+
+/// Which screen edge a point is nearest, without moving the point.
+pub fn nearest_edge(cx: i32, cy: i32, screen_w: i32, screen_h: i32) -> DockEdge {
+    let d_top = cy.max(0);
+    let d_bottom = (screen_h - cy).max(0);
+    let d_left = cx.max(0);
+    let d_right = (screen_w - cx).max(0);
+    let nearest = d_top.min(d_bottom).min(d_left).min(d_right);
+    if nearest == d_left {
+        DockEdge::Left
+    } else if nearest == d_right {
+        DockEdge::Right
+    } else if nearest == d_top {
+        DockEdge::Top
+    } else {
+        DockEdge::Bottom
+    }
+}
+
+/// Place a window so its center stays at `(cx, cy)`, kept on the screen.
+pub fn place_free(cx: i32, cy: i32, screen_w: i32, screen_h: i32, w: i32, h: i32) -> (i32, i32) {
+    let max_x = (screen_w - w - MARGIN).max(MARGIN);
+    let max_y = (screen_h - h - MARGIN).max(MARGIN);
+    (
+        clamp(cx - w / 2, MARGIN, max_x),
+        clamp(cy - h / 2, MARGIN, max_y),
+    )
+}
+
 pub fn pose_to_xy(
     edge: DockEdge,
     offset: i32,
@@ -229,5 +270,26 @@ mod tests {
     fn window_fits_speaktype_recording_pill() {
         const { assert!(PILL_W >= 250); }
         const { assert!(PILL_H >= 44); }
+    }
+
+    #[test]
+    fn free_place_keeps_a_center_that_is_not_an_edge() {
+        let (w, h) = orientation_size(DockEdge::Bottom);
+        let (x, y) = place_free(960, 540, SW, SH, w, h);
+        assert_eq!(x, 960 - w / 2);
+        assert_eq!(y, 540 - h / 2);
+        assert!(y + h < SH - BOTTOM_MARGIN);
+    }
+
+    #[test]
+    fn nearest_edge_picks_orientation() {
+        assert_eq!(nearest_edge(40, 500, SW, SH), DockEdge::Left);
+        assert_eq!(nearest_edge(1900, 500, SW, SH), DockEdge::Right);
+        assert_eq!(nearest_edge(900, 30, SW, SH), DockEdge::Top);
+        assert_eq!(nearest_edge(900, 1000, SW, SH), DockEdge::Bottom);
+        assert!(!is_vertical(DockEdge::Bottom));
+        assert!(is_vertical(DockEdge::Left));
+        assert_eq!(orientation_size(DockEdge::Left), (PILL_H, PILL_W));
+        assert_eq!(orientation_size(DockEdge::Top), (PILL_W, PILL_H));
     }
 }
