@@ -12,6 +12,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("line break", "\n"),
     ("question mark", "?"),
     ("exclamation mark", "!"),
+    // "at the rate" is the spoken form of "@"; "at the red" is how some ASR
+    // engines (Parakeet included) mishear it. Both matter for email addresses.
+    ("at the rate", "@"),
+    ("at the red", "@"),
     ("exclamation point", "!"),
     ("full stop", "."),
     ("semi colon", ";"),
@@ -67,6 +71,15 @@ fn replacement_for(phrase: &str) -> String {
         .unwrap_or_else(|| phrase.to_owned())
 }
 
+/// True when `phrase` is a spoken-command phrase from the table (`question
+/// mark`, `at sign`, …). Used by the dictionary command-fix pass.
+pub fn is_spoken_command(phrase: &str) -> bool {
+    let key = phrase.split_whitespace().collect::<Vec<_>>().join(" ");
+    COMMANDS
+        .iter()
+        .any(|(p, _)| p.eq_ignore_ascii_case(&key))
+}
+
 /// Replace spoken punctuation / newline phrases. Longest phrases win
 /// because they are listed first in the alternation? Rust regex is
 /// left-to-right, so we list longer phrases first in COMMANDS.
@@ -93,8 +106,10 @@ fn collapse_space_around_breaks(text: &str) -> String {
     let after_open = Regex::new(r#"([\(\["])\s+"#).expect("open punct");
     let before_close = Regex::new(r#"\s+([,.;:!?…\)\]"])"#).expect("close punct");
     let around_nl = Regex::new(r"[^\S\n]*\n[^\S\n]*").expect("nl");
+    let around_at = Regex::new(r"\s*@\s*").expect("at sign");
     let s = after_open.replace_all(text, "$1");
     let s = before_close.replace_all(&s, "$1");
+    let s = around_at.replace_all(&s, "@");
     around_nl.replace_all(&s, "\n").into_owned()
 }
 
@@ -453,6 +468,20 @@ mod tests {
     fn spoken_does_not_eat_partial_words() {
         assert_eq!(apply_spoken_commands("periodic table"), "periodic table");
         assert_eq!(apply_spoken_commands("commander"), "commander");
+    }
+
+    #[test]
+    fn at_the_rate_becomes_an_email_at() {
+        assert_eq!(
+            apply_spoken_commands("ABC at the rate gmail.com"),
+            "ABC@gmail.com"
+        );
+        // The way ASR engines commonly mishear "at the rate".
+        assert_eq!(
+            apply_spoken_commands("ABC at the red gmail.com"),
+            "ABC@gmail.com"
+        );
+        assert_eq!(apply_spoken_commands("at the red light"), "@light");
     }
 
     #[test]

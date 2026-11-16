@@ -11,6 +11,7 @@
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 // ---------------------------------------------------------------------------
@@ -127,9 +128,129 @@ pub fn apply_dictionary(text: &str, entries: &mut [DictionaryEntry]) -> (String,
     (result, hits)
 }
 
-// ---------------------------------------------------------------------------
-// Auto Edit (filler-word removal, SpeakType `applyAutoEdit`)
-// ---------------------------------------------------------------------------
+/// True when a replacement is a spoken-command phrase (`question mark`, `at the
+/// rate`, …), i.e. the corrected text must be fed through the command engine
+/// rather than inserted literally. Delegates to the command table.
+pub fn is_command_replacement(replacement: &str) -> bool {
+    crate::format::is_spoken_command(replacement)
+}
+
+/// Pre-command pass (BetterWispr `correctedCommands`). Identical machinery to
+/// the vocabulary splice, but only entries whose replacement is a
+/// spoken-command phrase (see [`is_command_replacement`]) fire, and `usage` is
+/// never touched (command fixes are an expansion, not a usage event).
+pub fn apply_command_fixes(text: &str, entries: &[DictionaryEntry]) -> (String, u32) {
+    let (out, hits, _) = run_vocabulary(text, entries, |e| is_command_replacement(&e.replacement));
+    (out, hits)
+}
+
+/// One compiled alternation drives the command-fix splice. Returns the
+/// rewritten text, the number of real replacements, and the per-entry hit
+/// counts (kept for symmetry with the vocabulary pass; command fixes discard
+/// them).
+fn run_vocabulary(
+    text: &str,
+    entries: &[DictionaryEntry],
+    include: impl Fn(&DictionaryEntry) -> bool,
+) -> (String, u32, Vec<(usize, u32)>) {
+    // Enabled + non-empty + pass-filtered triggers, longest first so the
+    // leftmost-first alternation prefers `my email address` over `my email`.
+    let mut cands: Vec<usize> = (0..entries.len())
+        .filter(|&i| {
+            let e = &entries[i];
+            e.enabled && include(e) && !e.trigger.trim().is_empty()
+        })
+        .collect();
+    cands.sort_by(|&a, &b| {
+        let la = entries[a].trigger.trim().chars().count();
+        let lb = entries[b].trigger.trim().chars().count();
+        lb.cmp(&la)
+    });
+    if cands.is_empty() {
+        return (text.to_owned(), 0, Vec::new());
+    }
+
+    let mut alts = Vec::with_capacity(cands.len());
+    let mut lookup: HashMap<String, (usize, bool)> = HashMap::new();
+    for &i in &cands {
+        let trigger = entries[i].trigger.trim();
+        // Space in a trigger matches a whitespace run; everything else literal.
+        alts.push(regex::escape(trigger).replace(' ', r"\s+"));
+        lookup
+            .entry(normalize_key(trigger))
+            .or_insert((i, entries[i].whole_word));
+    }
+    let Ok(re) = Regex::new(&format!("(?i)(?:{})", alts.join("|"))) else {
+        return (text.to_owned(), 0, Vec::new());
+    };
+
+    // The `regex` crate has no look-around, so whole-word matches are verified
+    // by inspecting the characters flanking the match after the fact.
+    let mut found: Vec<(usize, usize, usize)> = Vec::new();
+    for m in re.find_iter(text) {
+        let (start, end) = (m.start(), m.end());
+        let Some(&(idx, whole_word)) = lookup.get(&normalize_key(m.as_str())) else {
+            continue;
+        };
+        if whole_word && !boundaries_ok(text, start, end) {
+            continue;
+        }
+        found.push((start, end, idx));
+    }
+
+    // Splice in reverse index order so earlier byte ranges stay valid, and never
+    // through regex templates (they would interpret `$` and `\`).
+    let mut result = text.to_owned();
+    let mut hits: u32 = 0;
+    let mut deltas: HashMap<usize, u32> = HashMap::new();
+    for &(start, end, idx) in found.iter().rev() {
+        let replacement = entries[idx].replacement.as_str();
+        if replacement == &text[start..end] {
+            continue;
+        }
+        hits = hits.saturating_add(1);
+        let count = deltas.entry(idx).or_insert(0);
+        *count = count.saturating_add(1);
+        result.replace_range(start..end, replacement);
+    }
+
+    let mut per_entry: Vec<(usize, u32)> = deltas.into_iter().collect();
+    per_entry.sort_unstable_by_key(|&(idx, _)| idx);
+    (result, hits, per_entry)
+}
+
+/// Lowercase + collapse whitespace runs to one space, so a trigger and the text
+/// it matched (which may contain a `\s+` run) map to the same lookup key.
+fn normalize_key(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_ws = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if !in_ws {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else {
+            in_ws = false;
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
+}
+
+/// Unicode word character (`[\p{L}\p{M}\p{N}_]` approximation).
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// A whole-word match must not be flanked by a word character. `whole_word`
+/// entries whose first/last character is itself non-word (e.g. `c++`) still get
+/// both flanks checked, per the two-phase spec.
+fn boundaries_ok(text: &str, start: usize, end: usize) -> bool {
+    let before = text[..start].chars().next_back();
+    let after = text[end..].chars().next();
+    !before.is_some_and(is_word_char) && !after.is_some_and(is_word_char)
+}
 
 /// Drop filler words ("um", "uh", …). Token-based so no look-around is needed
 /// (the `regex` crate doesn't support it); lone punctuation tokens survive for

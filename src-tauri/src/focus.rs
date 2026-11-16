@@ -59,6 +59,37 @@ pub fn make_non_activating(win: &tauri::WebviewWindow) {
     platform::make_non_activating_impl(win);
 }
 
+/// Click-through toggle for the hover gate (`hover.rs`).
+///
+/// This deliberately bypasses tauri/tao's `set_ignore_cursor_events`: tao
+/// recomputes the *whole* window style from its flag cache on every flip,
+/// restoring the caption/sysmenu chrome and dropping `WS_EX_LAYERED` — which
+/// visually resurrects an opaque box around the pill after the patches in
+/// `make_non_activating` are applied. On Windows we flip only the
+/// WS_EX_TRANSPARENT bit; the LAYERED bit (set by `make_non_activating`)
+/// stays on so click-through + transparency keep working together.
+///
+/// Returns false when the window/platform could not apply the change.
+pub fn set_ignore_cursor_events(win: &tauri::WebviewWindow, ignore: bool) -> bool {
+    platform::set_ignore_impl(win, ignore)
+}
+
+/// Clip the overlay to exactly the pill's footprint (`x, y, w, h` logical px,
+/// window-relative). Windows only: clips drawing AND mouse input to the
+/// rounded pill shape, so the transparent glass around the pill can never
+/// block clicks (Wispr-Flow-style cutout). Returns false when unsupported —
+/// the hover gate on such platforms keeps the old behavior.
+pub fn set_window_region(win: &tauri::WebviewWindow, x: i32, y: i32, w: i32, h: i32) -> bool {
+    platform::set_window_region_impl(win, x, y, w, h)
+}
+
+/// Repair tao-style drift on the overlay (tauri flag calls can resurrect
+/// caption chrome / drop the layered bit). True = drifted and re-patched.
+/// Cheap no-op when the style is already clean.
+pub fn assert_overlay_style(win: &tauri::WebviewWindow) -> bool {
+    platform::assert_overlay_style_impl(win)
+}
+
 /// Bring `target` back without clicking it (caret stays where it was).
 /// Returns true when we actually switched away from our own window.
 #[cfg(not(target_os = "macos"))]
@@ -101,6 +132,7 @@ mod platform {
     const WS_EX_NOACTIVATE: isize = 0x0800_0000;
     const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
     const WS_EX_LAYERED: isize = 0x0008_0000;
+    const WS_EX_TRANSPARENT: isize = 0x0000_0020;
     const SWP_NOSIZE: u32 = 0x0001;
     const SWP_NOMOVE: u32 = 0x0002;
     const SWP_NOACTIVATE: u32 = 0x0010;
@@ -147,6 +179,18 @@ mod platform {
             cy: i32,
             flags: u32,
         ) -> i32;
+        // Window regions: device-pixel coords relative to the window; used to
+        // clip the overlay to the pill shape for both drawing and input.
+        fn CreateRoundRectRgn(
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+            ellipse_w: i32,
+            ellipse_h: i32,
+        ) -> *mut c_void;
+        fn SetWindowRgn(hwnd: *mut c_void, hrgn: *mut c_void, redraw: i32) -> i32;
+        fn DeleteObject(obj: *mut c_void) -> i32;
         fn GetWindowThreadProcessId(hwnd: *mut c_void, pid: *mut u32) -> u32;
         fn AttachThreadInput(id_attach: u32, id_attach_to: u32, attach: i32) -> i32;
         fn AllowSetForegroundWindow(process_id: u32) -> i32;
@@ -225,6 +269,87 @@ mod platform {
         }
     }
 
+    /// Flip only WS_EX_TRANSPARENT so the hover gate can switch the whole
+    /// window between pass-through and input without disturbing the
+    /// chrome-stripped, layered style `make_non_activating` installed.
+    pub fn set_ignore_impl(win: &tauri::WebviewWindow, ignore: bool) -> bool {
+        let Some(h) = hwnd_of_impl(win) else { return false; };
+        let hwnd = to_ptr(h);
+        unsafe {
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let next = if ignore {
+                ex | WS_EX_TRANSPARENT
+            } else {
+                ex & !WS_EX_TRANSPARENT
+            };
+            if next != ex {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next);
+            }
+            // SetWindowLongPtrW's return value can legitimately be 0, so
+            // verify by reading the style back.
+            GetWindowLongPtrW(hwnd, GWL_EXSTYLE) == next
+        }
+    }
+
+    /// Clip the overlay to the pill's rounded shape (`x, y, w, h` logical,
+    /// window-relative). The window region limits BOTH drawing and mouse
+    /// hit-testing: outside the region the OS treats the window as if it does
+    /// not exist, so clicks fall through to the desktop/apps below with zero
+    /// toggling or flicker — the Wispr Flow pattern.
+    pub fn set_window_region_impl(win: &tauri::WebviewWindow, x: i32, y: i32, w: i32, h: i32) -> bool {
+        let Some(handle) = hwnd_of_impl(win) else { return false; };
+        let hwnd = to_ptr(handle);
+        let Ok(scale) = win.scale_factor() else { return false; };
+        let s = scale as f64;
+        // Small logical halo so the CSS border/box-shadow is not shaved off.
+        const HALO: f64 = 2.0;
+        let rx = ((x as f64 - HALO) * s).round() as i32;
+        let ry = ((y as f64 - HALO) * s).round() as i32;
+        let rw = ((w as f64 + 2.0 * HALO) * s).round() as i32;
+        let rh = ((h as f64 + 2.0 * HALO) * s).round() as i32;
+        if rw <= 0 || rh <= 0 {
+            return false;
+        }
+        // Fully rounded pill ends: corner diameter = region height.
+        let r = rh / 2;
+        unsafe {
+            let hrgn = CreateRoundRectRgn(rx, ry, rx + rw, ry + rh, r, r);
+            if hrgn.is_null() {
+                return false;
+            }
+            // The OS owns the region after a successful SetWindowRgn — do not
+            // delete it then.
+            if SetWindowRgn(hwnd, hrgn, 1) == 0 {
+                DeleteObject(hrgn);
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Style health check for the overlay: tao may recompute the full window
+    /// style later (any tauri flag call), resurrecting caption chrome and
+    /// dropping the layered bit — visible as an opaque box + title around the
+    /// pill. Detect the drift and re-run the `make_non_activating` patches.
+    /// Returns true when repairs were applied.
+    pub fn assert_overlay_style_impl(win: &tauri::WebviewWindow) -> bool {
+        let Some(h) = hwnd_of_impl(win) else { return false; };
+        let hwnd = to_ptr(h);
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            let clean = (style & (WS_CAPTION | WS_SYSMENU | WS_THICKFRAME)) == 0
+                && (ex & WS_EX_LAYERED) != 0
+                && (ex & WS_EX_NOACTIVATE) != 0
+                && (ex & WS_EX_TOOLWINDOW) != 0;
+            if clean {
+                return false;
+            }
+        }
+        make_non_activating_impl(win);
+        true
+    }
+
     pub fn restore_impl(target: FocusHandle) -> bool {
         unsafe {
             AllowSetForegroundWindow(ASFW_ANY);
@@ -290,6 +415,29 @@ mod platform {
             return;
         };
         unsafe { configure_overlay_ns_window(ptr) };
+    }
+
+    /// On macOS tauri's setter is a plain `NSWindow.setIgnoresMouseEvents`
+    /// call — it does not rewrite any other window property, so it is safe
+    /// to use for the hover gate.
+    pub fn set_ignore_impl(win: &tauri::WebviewWindow, ignore: bool) -> bool {
+        win.set_ignore_cursor_events(ignore).is_ok()
+    }
+
+    /// macOS has no SetWindowRgn equivalent; the hover gate handles it.
+    pub fn set_window_region_impl(
+        _win: &tauri::WebviewWindow,
+        _x: i32,
+        _y: i32,
+        _w: i32,
+        _h: i32,
+    ) -> bool {
+        false
+    }
+
+    /// Nothing recycles macOS styles the way tao does; never drifts.
+    pub fn assert_overlay_style_impl(_win: &tauri::WebviewWindow) -> bool {
+        false
     }
 
     unsafe fn configure_overlay_ns_window(ns_window: *mut std::ffi::c_void) {
@@ -362,6 +510,17 @@ mod platform {
     pub fn foreground_impl() -> Option<FocusHandle> { None }
     pub fn our_handles_impl(_app: &tauri::AppHandle) -> Vec<FocusHandle> { vec![] }
     pub fn make_non_activating_impl(_win: &tauri::WebviewWindow) {}
+    pub fn set_ignore_impl(_win: &tauri::WebviewWindow, _ignore: bool) -> bool { true }
+    pub fn set_window_region_impl(
+        _win: &tauri::WebviewWindow,
+        _x: i32,
+        _y: i32,
+        _w: i32,
+        _h: i32,
+    ) -> bool {
+        false
+    }
+    pub fn assert_overlay_style_impl(_win: &tauri::WebviewWindow) -> bool { false }
     pub fn restore_impl(_target: FocusHandle) -> bool { false }
 }
 

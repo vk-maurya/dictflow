@@ -1196,6 +1196,26 @@ pub(crate) fn snap_overlay(x: i32, y: i32, screen_w: i32, screen_h: i32) -> over
     overlay::snap_to_edge(x, y, screen_w, screen_h, overlay::PILL_W, overlay::PILL_H)
 }
 
+/// The overlay webview reports the pill's morphed footprint (logical px,
+/// window-relative) so the hover gate tracks the visible pill area.
+#[tauri::command]
+pub(crate) fn set_overlay_hit_rect(
+    app: tauri::AppHandle,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) {
+    crate::hover::set_hit_rect(&app, x, y, w, h);
+}
+
+/// Wheel-of-press latch: while the overlay webview holds a pointer, keep the
+/// window clickable regardless of cursor drift during a drag.
+#[tauri::command]
+pub(crate) fn set_overlay_drag(active: bool) {
+    crate::hover::set_press(active);
+}
+
 #[tauri::command]
 pub(crate) fn set_overlay_pose(
     app: tauri::AppHandle,

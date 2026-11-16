@@ -181,7 +181,16 @@ pub(crate) fn start(app: tauri::AppHandle) {
             let Ok(s) = state.lock() else {
                 return;
             };
-            gate_enter(&s.refine_busy, s.recording, s.transcribing)
+            let ok = gate_enter(&s.refine_busy, s.recording, s.transcribing);
+            if !ok {
+                log::info!(
+                    "refine skipped: busy gate (recording={}, transcribing={}, already refining={})",
+                    s.recording,
+                    s.transcribing,
+                    s.refine_busy.load(std::sync::atomic::Ordering::SeqCst)
+                );
+            }
+            ok
         };
         if !entered {
             return;
@@ -212,8 +221,23 @@ fn blocking_refine(app: tauri::AppHandle) -> Result<(), Notice> {
         .lock()
         .ok()
         .and_then(|s| s.paste_target);
-    let read = paste::capture_selection(&app).map_err(|err| Notice::error(brief(&err)))?;
+    let fg = crate::focus::foreground_handle();
+    let ours = crate::focus::our_handles(&app);
+    let focus_ours = fg.is_some_and(|h| ours.contains(&h));
+    log::info!("refine: foreground is a DictFlow window: {focus_ours}");
+    let read = paste::capture_selection(&app).map_err(|err| {
+        log::warn!("refine: selection capture failed: {err:#}");
+        Notice::error(brief(&err))
+    })?;
     let captured = interpret_copy(&read.sentinel, read.after.as_deref(), REFINE_MAX_CHARS);
+    log::info!("refine: capture = {:?}", match &captured {
+        Capture::NoSelection => "no selection".to_owned(),
+        Capture::TooLong { limit } => format!("too long (> {limit})"),
+        Capture::Text(t) => {
+            let head: String = t.chars().take(60).collect();
+            format!("{} chars: {head:?}", t.chars().count())
+        }
+    });
     let text = match captured {
         Capture::NoSelection => {
             let _ = paste::restore_clipboard(&read.snapshot);
@@ -244,8 +268,16 @@ fn blocking_refine(app: tauri::AppHandle) -> Result<(), Notice> {
     let s1 = state.s1_runtime.clone();
     drop(state);
     let rewritten = match refine_selection_text(&cfg, &data_dir, &s1, &text) {
-        Ok(value) => value,
+        Ok(value) => {
+            log::info!(
+                "refine: model ok ({} -> {} chars)",
+                text.chars().count(),
+                value.chars().count()
+            );
+            value
+        }
         Err(err) => {
+            log::warn!("refine: model failed: {err:#}");
             let _ = paste::restore_clipboard(&read.snapshot);
             return Err(Notice::error(brief(&err)));
         }

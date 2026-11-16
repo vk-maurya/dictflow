@@ -6,6 +6,11 @@ use serde::{Deserialize, Serialize};
 /// inside it (SpeakType MiniRecorder: idle 58x24, recording ~250x44).
 pub const PILL_W: i32 = 268;
 pub const PILL_H: i32 = 56;
+/// Visible idle-pill footprint (58x24) — must match `src/overlay.css`. Used
+/// as the hover gate's (`hover.rs`) boot default until the overlay webview
+/// reports the live pillar rect (`src/overlay.ts` owns the other phases).
+pub const PILL_IDLE_W: i32 = 58;
+pub const PILL_IDLE_H: i32 = 24;
 pub const MARGIN: i32 = 16;
 /// Logical pixels above the screen bottom so the pill clears the Windows
 /// taskbar (~40) and the macOS Dock (~68–80) on Retina displays.

@@ -194,7 +194,10 @@ fn apply_overlay_visibility_inner(app: &tauri::AppHandle) {
     // and keep the yellow button from taking it again.
     let _ = win.unminimize();
     let _ = win.set_minimizable(false);
-    let _ = win.set_ignore_cursor_events(false);
+    // Use the bit-only toggle (not tauri's) — tao's full restyle would strip
+    // the chrome/layered patches `make_non_activating` just applied.
+    crate::hover::invalidate();
+    focus::set_ignore_cursor_events(&win, false);
     let _ = win.set_always_on_top(true);
     let _ = win.set_visible_on_all_workspaces(true);
     let _ = win.set_shadow(false);
@@ -235,6 +238,10 @@ fn apply_overlay_visibility_inner(app: &tauri::AppHandle) {
     let _ = win.show();
     let _ = win.set_visible_on_all_workspaces(true);
     focus::make_non_activating(&win);
+    // Seed the window region to the idle pill before the webview reports —
+    // on Windows this also makes everything around the pill click-through
+    // from the first frame.
+    crate::hover::sync_idle_region(&win);
     let _ = app.emit("dictflow://overlay-edge", settings.overlay_edge);
 }
 
