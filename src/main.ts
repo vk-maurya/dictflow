@@ -102,6 +102,8 @@ interface Settings {
   overlay_free: boolean;
   overlay_x: number;
   overlay_y: number;
+  overlay_screen_w?: number;
+  overlay_screen_h?: number;
   paste_last_key: string;
   copy_last_key: string;
   refine_selection_key: string;
@@ -1301,6 +1303,7 @@ function viewSetup(): string {
       <p class="muted">Same two grants SpeakType uses. Click <b>Enable</b> — allow the macOS prompt, then toggle <b>DictFlow</b> in the Accessibility list (not Terminal). Dev builds from the terminal are wrapped as DictFlow.app so they can appear there.</p>
       ${permRow("microphone", "Microphone", "Capture your voice for dictation.", !!perms?.microphone)}
       ${permRow("accessibility", "Accessibility", "Fn talk key + paste Cmd+V. Look for DictFlow in the app list.", !!perms?.accessibility)}
+      ${isMac ? permRow("input_monitoring", "Input Monitoring", "Stops the Globe key from opening the emoji panel while DictFlow is open.", !!perms?.input_monitoring) : ""}
       ${perms?.talk_key_live ? `<p style="color:var(--green);margin:8px 0 0">Talk key is live — hold Fn to dictate.</p>` : perms?.accessibility ? `<p class="muted" style="margin:8px 0 0">Accessibility granted — attaching the talk key…</p>` : ""}
     </div>` : "";
   return `
@@ -1669,7 +1672,7 @@ function viewSettings(): string {
         <input type="checkbox" id="set-translate" ${settings.translate ? "checked" : ""}></div>
     </div>
     <div class="card"><h3>Talk key</h3>
-      <div class="set-row"><div><b>Key</b><div class="desc">${isMac ? `<b>Fn / Globe</b> is the most natural macOS choice — works like Apple's built-in dictation key. If Fn conflicts with system dictation, go to System Settings → Keyboard and set "Press Fn key to: Do Nothing". Other single-key options never interfere with typing.` : `Right Ctrl is the safest default. Left Ctrl works but Ctrl+C/S/V briefly opens then discards the mic.`}</div></div>
+      <div class="set-row"><div><b>Key</b><div class="desc">${isMac ? `<b>Fn / Globe</b> is the macOS default. While DictFlow is open it takes that key: dictation starts and the emoji panel stays closed. Quitting DictFlow puts the previous Globe action back. Allow Input Monitoring if macOS asks. Other single-key options never interfere with typing.` : `Right Ctrl is the safest default. Left Ctrl works but Ctrl+C/S/V briefly opens then discards the mic.`}</div></div>
         <select id="set-hotkey">${hotkeyOpts}</select></div>
       <div class="set-row"><div><b>Mode</b><div class="desc">${isMac ? `<b>Hold</b>: hold to record, release to stop. <b>Tap toggle</b>: tap once to start, tap again to stop. <b>Double-tap</b> (Fn only): double-tap to start continuous dictation, tap once to stop — exactly like Apple dictation.` : `Hold: press-and-hold to record, release to transcribe. Toggle: press to start, press again to stop.`}</div></div>
         <select id="set-mode">${modeOpts}</select></div>
@@ -1760,6 +1763,7 @@ function viewOnboard(): string {
       <div class="card">
         ${permRow("microphone", "Microphone", "Required to capture your voice.", !!perms?.microphone)}
         ${permRow("accessibility", "Accessibility", "Required for Fn and paste. DictFlow must appear in the Accessibility app list.", !!perms?.accessibility)}
+        ${isMac ? permRow("input_monitoring", "Input Monitoring", "Required for Fn / Globe so macOS does not open the emoji panel.", !!perms?.input_monitoring) : ""}
         ${perms?.talk_key_live ? `<p style="color:var(--green);margin:8px 0 0">Talk key is live. Continue when you are ready.</p>` : perms?.accessibility ? `<p class="muted" style="margin:8px 0 0">Accessibility granted — attaching the talk key…</p>` : ""}
       </div>`;
   } else if (onboardStep === "mictest") {

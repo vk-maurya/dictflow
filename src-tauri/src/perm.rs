@@ -1,7 +1,8 @@
 //! OS permission status and prompts.
 //!
-//! macOS: Microphone + Accessibility (SpeakType). Session-tap Fn does not
-//! need Input Monitoring. Windows has no equivalent; those fields stay granted.
+//! macOS: Microphone + Accessibility, and Input Monitoring when Fn is the
+//! talk key so the Globe key can be swallowed before the emoji panel.
+//! Windows has no equivalent; those fields stay granted.
 
 use serde::Serialize;
 use tauri::{AppHandle, Manager};

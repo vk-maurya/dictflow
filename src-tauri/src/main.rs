@@ -202,6 +202,7 @@ pub fn run() {
             crate::tray::apply_overlay_visibility(app.handle());
             crate::focus::spawn_overlay_space_follow(app.handle());
             crate::hover::spawn_hover_follow(app.handle().clone());
+            crate::focus::spawn_overlay_hover_watch(app.handle());
             let onboarded = app
                 .state::<Mutex<AppState>>()
                 .lock()
@@ -455,6 +456,9 @@ pub fn run() {
             set_overlay_pose,
             set_overlay_hit_rect,
             set_overlay_drag,
+            begin_overlay_move,
+            move_overlay_by,
+            end_overlay_move,
             onboard_step,
             copy_chip_open,
             transcribe_file,

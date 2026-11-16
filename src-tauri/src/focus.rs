@@ -24,6 +24,42 @@ pub fn foreground_handle() -> Option<FocusHandle> {
     platform::foreground_impl()
 }
 
+/// One display, in the same top-left coordinates as [`cursor_point`].
+/// `scale` is 1 when those coordinates are already points (macOS). On Windows
+/// the coordinates are physical pixels and `scale` is DPI / 96.
+#[derive(Clone, Copy, Debug)]
+pub struct DisplayRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub scale: f64,
+}
+
+pub fn cursor_point() -> Option<(i32, i32)> {
+    platform::cursor_point_impl()
+}
+
+pub fn display_at(x: i32, y: i32) -> Option<DisplayRect> {
+    platform::display_at_impl(x, y)
+}
+
+pub fn display_containing(x: i32, y: i32, displays: &[DisplayRect]) -> Option<DisplayRect> {
+    displays.iter().copied().find(|d| {
+        d.width > 0
+            && d.height > 0
+            && x >= d.x
+            && y >= d.y
+            && x < d.x.saturating_add(d.width)
+            && y < d.y.saturating_add(d.height)
+    })
+}
+
+/// Move the overlay and keep it on the desktop the user is looking at.
+pub fn present_overlay(win: &tauri::WebviewWindow, x: i32, y: i32, w: i32, h: i32) {
+    platform::present_overlay_impl(win, x, y, w, h);
+}
+
 pub fn our_handles(app: &tauri::AppHandle) -> Vec<FocusHandle> {
     platform::our_handles_impl(app)
 }
@@ -38,20 +74,75 @@ pub fn pick_paste_target(
     ours: &[FocusHandle],
 ) -> Option<FocusHandle> {
     if let Some(fg) = foreground {
-        if should_remember(fg, ours) {
+        if should_remember(fg, ours) && !is_character_palette(fg) {
             return Some(fg);
         }
     }
-    last_saved.filter(|h| should_remember(*h, ours))
+    last_saved.filter(|h| should_remember(*h, ours) && !is_character_palette(*h))
 }
 
-/// Keep the overlay on every Mission Control Space. No-op on Windows
-/// (topmost + tool window is the virtual-desktop equivalent).
-pub fn spawn_overlay_space_follow(app: &tauri::AppHandle) {
+pub fn is_character_palette(handle: FocusHandle) -> bool {
     #[cfg(target_os = "macos")]
-    platform::spawn_overlay_space_follow(app);
+    {
+        platform::is_character_palette_impl(handle)
+    }
     #[cfg(not(target_os = "macos"))]
-    let _ = app;
+    {
+        let _ = handle;
+        false
+    }
+}
+
+/// Hide the macOS emoji panel. No-op on Windows.
+pub fn dismiss_character_palette() {
+    #[cfg(target_os = "macos")]
+    platform::dismiss_character_palette_impl();
+}
+
+pub fn emoji_panel_on_screen() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        platform::emoji_panel_on_screen_impl()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Keep the dictation bar on the screen and desktop under the pointer.
+pub fn spawn_overlay_space_follow(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(280)).await;
+            let hopped = app.clone();
+            if app
+                .run_on_main_thread(move || crate::tray::follow_overlay_screen(&hopped))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+}
+
+/// Tell the overlay page when the pointer is on the pill. The webview of a window
+/// that is not active gets no hover events, so the pointer is read natively.
+pub fn spawn_overlay_hover_watch(app: &tauri::AppHandle) {
+    use tauri::Emitter;
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut hovering = false;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(70)).await;
+            let now = crate::tray::pointer_on_pill(hovering);
+            if now != hovering {
+                hovering = now;
+                let _ = app.emit_to("overlay", "dictflow://overlay-hover", now);
+            }
+        }
+    });
 }
 
 /// Make the overlay non-activating so clicks don't steal the caret.
@@ -194,6 +285,41 @@ mod platform {
         fn GetWindowThreadProcessId(hwnd: *mut c_void, pid: *mut u32) -> u32;
         fn AttachThreadInput(id_attach: u32, id_attach_to: u32, attach: i32) -> i32;
         fn AllowSetForegroundWindow(process_id: u32) -> i32;
+        fn GetCursorPos(point: *mut WinPoint) -> i32;
+        fn MonitorFromPoint(point: WinPoint, flags: u32) -> *mut c_void;
+        fn GetMonitorInfoW(monitor: *mut c_void, info: *mut MonitorInfo) -> i32;
+    }
+
+    #[link(name = "shcore")]
+    extern "system" {
+        fn GetDpiForMonitor(
+            monitor: *mut c_void,
+            kind: i32,
+            dpi_x: *mut u32,
+            dpi_y: *mut u32,
+        ) -> i32;
+    }
+
+    #[repr(C)]
+    struct MonitorInfo {
+        cb_size: u32,
+        rc_monitor: WinRect,
+        rc_work: WinRect,
+        flags: u32,
+    }
+
+    #[repr(C)]
+    struct WinPoint {
+        x: i32,
+        y: i32,
+    }
+
+    #[repr(C)]
+    struct WinRect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
     }
 
     #[link(name = "dwmapi")]
@@ -223,6 +349,81 @@ mod platform {
     pub fn foreground_impl() -> Option<FocusHandle> {
         let h = unsafe { GetForegroundWindow() } as FocusHandle;
         if h != 0 && is_live_impl(h) { Some(h) } else { None }
+    }
+
+    pub fn cursor_point_impl() -> Option<(i32, i32)> {
+        unsafe {
+            let mut cursor = WinPoint { x: 0, y: 0 };
+            if GetCursorPos(&mut cursor) != 0 {
+                return Some((cursor.x, cursor.y));
+            }
+        }
+        None
+    }
+
+    pub fn display_at_impl(x: i32, y: i32) -> Option<super::DisplayRect> {
+        unsafe {
+            let monitor = MonitorFromPoint(WinPoint { x, y }, 0);
+            if monitor.is_null() {
+                return None;
+            }
+            let mut info = MonitorInfo {
+                cb_size: std::mem::size_of::<MonitorInfo>() as u32,
+                rc_monitor: WinRect {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+                rc_work: WinRect {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+                flags: 0,
+            };
+            if GetMonitorInfoW(monitor, &mut info) == 0 {
+                return None;
+            }
+            let mut dpi_x = 96u32;
+            let mut dpi_y = 96u32;
+            let scale = if GetDpiForMonitor(monitor, 0, &mut dpi_x, &mut dpi_y) == 0 && dpi_x > 0 {
+                dpi_x as f64 / 96.0
+            } else {
+                1.0
+            };
+            let width = info.rc_monitor.right - info.rc_monitor.left;
+            let height = info.rc_monitor.bottom - info.rc_monitor.top;
+            if width <= 0 || height <= 0 {
+                return None;
+            }
+            Some(super::DisplayRect {
+                x: info.rc_monitor.left,
+                y: info.rc_monitor.top,
+                width,
+                height,
+                scale,
+            })
+        }
+    }
+
+    pub fn present_overlay_impl(win: &tauri::WebviewWindow, x: i32, y: i32, w: i32, h: i32) {
+        let Some(hwnd) = hwnd_of_impl(win) else {
+            return;
+        };
+        const SWP_SHOWWINDOW: u32 = 0x0040;
+        unsafe {
+            SetWindowPos(
+                to_ptr(hwnd),
+                to_ptr(HWND_TOPMOST),
+                x,
+                y,
+                w,
+                h,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
     }
 
     pub fn hwnd_of_impl(win: &tauri::WebviewWindow) -> Option<FocusHandle> {
@@ -405,6 +606,34 @@ mod platform {
         if pid > 0 { Some(pid as FocusHandle) } else { None }
     }
 
+    fn mouse_point() -> Option<(i32, i32)> {
+        use std::ffi::c_void;
+
+        #[repr(C)]
+        struct CgPoint {
+            x: f64,
+            y: f64,
+        }
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGEventCreate(source: *const c_void) -> *mut c_void;
+            fn CGEventGetLocation(event: *mut c_void) -> CgPoint;
+        }
+        #[link(name = "CoreFoundation", kind = "framework")]
+        extern "C" {
+            fn CFRelease(cf: *const c_void);
+        }
+        unsafe {
+            let event = CGEventCreate(std::ptr::null());
+            if event.is_null() {
+                return None;
+            }
+            let point = CGEventGetLocation(event);
+            CFRelease(event);
+            Some((point.x.round() as i32, point.y.round() as i32))
+        }
+    }
+
     pub fn our_handles_impl(_app: &tauri::AppHandle) -> Vec<FocusHandle> {
         // All DictFlow windows are in the same process.
         vec![std::process::id() as FocusHandle]
@@ -460,29 +689,364 @@ mod platform {
             let _: () = msg_send![w, setBackgroundColor: clear];
         }
         let _: () = msg_send![w, setHidesOnDeactivate: false];
+        let _: () = msg_send![w, setCanHide: false];
         let _: () = msg_send![w, setReleasedWhenClosed: false];
-        // CanJoinAllSpaces | Transient | Stationary | IgnoresCycle | FullScreenAuxiliary
-        let _: () = msg_send![w, setCollectionBehavior: overlay_space_behavior()];
-        // NSStatusWindowLevel = 25, same band as menu extras — survives Space swipes.
-        let _: () = msg_send![w, setLevel: 25i64];
+        // Collection behavior is owned by present_overlay. Setting it here on
+        // every follow tick puts the window back on the ordinary desktop.
+        // NSScreenSaverWindowLevel. Popup level 101 is still covered by the
+        // front app, and Tauri's always-on-top level (3) stays on the desktop
+        // where the window was created.
+        let _: () = msg_send![w, setLevel: OVERLAY_WINDOW_LEVEL];
         let _: () = msg_send![w, orderFrontRegardless];
+        let _: () = msg_send![w, setLevel: OVERLAY_WINDOW_LEVEL];
     }
 
-    /// CanJoinAllSpaces (1) | Transient (8) | Stationary (0x10) | IgnoresCycle (0x40)
-    /// | FullScreenAuxiliary (0x100). Do not mix with MoveToActiveSpace.
+    /// NSScreenSaverWindowLevel. High enough to stay above normal app windows
+    /// on every desktop, which is the level Wispr uses for its visible bar.
+    const OVERLAY_WINDOW_LEVEL: i64 = 1000;
+
+    /// Display the overlay was last presented on, as a key from its origin.
+    static LAST_DISPLAY: std::sync::atomic::AtomicI64 =
+        std::sync::atomic::AtomicI64::new(i64::MIN);
+
+    fn order_overlay(window: &objc2::runtime::AnyObject) {
+        use objc2::msg_send;
+        unsafe {
+            let _: () = msg_send![window, setLevel: OVERLAY_WINDOW_LEVEL];
+            let _: () = msg_send![window, orderFrontRegardless];
+            let _: () = msg_send![window, setLevel: OVERLAY_WINDOW_LEVEL];
+        }
+    }
+
+    /// CanJoinAllSpaces | IgnoresCycle | FullScreenAuxiliary | CanJoinAllApplications.
+    ///
+    /// Stationary is omitted: on this Mac it pinned the bar to the desktop
+    /// where DictFlow opened, so the frame could sit on screen 2 while the
+    /// window stayed off the desktop the user was looking at.
+    /// Transient is omitted because it hides the bar whenever DictFlow is not
+    /// the front app.
     pub(crate) const fn overlay_space_behavior() -> u64 {
-        0x1 | 0x8 | 0x10 | 0x40 | 0x100
+        0x1 | 0x40 | 0x100 | (1 << 18)
     }
 
-    pub fn spawn_overlay_space_follow(app: &tauri::AppHandle) {
-        // Re-apply after Spaces exist; CanJoinAllSpaces is already set on the
-        // overlay window. A second pass catches launch-time race with Mission
-        // Control assigning the window to the first Space only.
-        let app = app.clone();
-        tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            crate::tray::apply_overlay_visibility(&app);
-        });
+    pub fn cursor_point_impl() -> Option<(i32, i32)> {
+        mouse_point()
+    }
+
+    pub fn display_at_impl(x: i32, y: i32) -> Option<super::DisplayRect> {
+        super::display_containing(x, y, &active_displays())
+    }
+
+    fn active_displays() -> Vec<super::DisplayRect> {
+        use objc2_foundation::CGRect;
+
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+            fn CGDisplayBounds(display: u32) -> CGRect;
+        }
+        unsafe {
+            let mut ids = [0u32; 16];
+            let mut count = 0u32;
+            if CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut count) != 0 {
+                return Vec::new();
+            }
+            (0..count as usize)
+                .filter_map(|index| {
+                    let bounds = CGDisplayBounds(ids[index]);
+                    let width = bounds.size.width.round() as i32;
+                    let height = bounds.size.height.round() as i32;
+                    if width <= 0 || height <= 0 {
+                        return None;
+                    }
+                    Some(super::DisplayRect {
+                        x: bounds.origin.x.round() as i32,
+                        y: bounds.origin.y.round() as i32,
+                        width,
+                        height,
+                        scale: 1.0,
+                    })
+                })
+                .collect()
+        }
+    }
+
+    pub fn present_overlay_impl(win: &tauri::WebviewWindow, x: i32, y: i32, w: i32, h: i32) {
+        let Ok(ptr) = win.ns_window() else {
+            return;
+        };
+        if ptr.is_null() || w <= 0 || h <= 0 {
+            return;
+        }
+        use objc2::msg_send;
+        use objc2::runtime::AnyObject;
+        use objc2_foundation::{CGPoint, CGRect, CGSize};
+
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGMainDisplayID() -> u32;
+            fn CGDisplayBounds(display: u32) -> CGRect;
+        }
+
+        unsafe {
+            let window = &*(ptr as *const AnyObject);
+            let primary = CGDisplayBounds(CGMainDisplayID());
+            let origin_y = primary.size.height - f64::from(y) - f64::from(h);
+            let rect = CGRect::new(
+                CGPoint::new(f64::from(x), origin_y),
+                CGSize::new(f64::from(w), f64::from(h)),
+            );
+            let current: CGRect = msg_send![window, frame];
+            let moved = (current.origin.x - rect.origin.x).abs() > 1.5
+                || (current.origin.y - rect.origin.y).abs() > 1.5
+                || (current.size.width - rect.size.width).abs() > 1.5
+                || (current.size.height - rect.size.height).abs() > 1.5;
+            let _: () = msg_send![window, setHidesOnDeactivate: false];
+            let _: () = msg_send![window, setCanHide: false];
+            // A window carried to another display keeps the space membership it
+            // had on the old one. Taking it off screen and clearing the behavior
+            // first makes the window server rebuild that membership from the
+            // all-spaces flag on the new display.
+            let display_key = super::display_at(x + w / 2, y + h / 2)
+                .map(|d| i64::from(d.x) * 100_000 + i64::from(d.y))
+                .unwrap_or(0);
+            let previous = LAST_DISPLAY.swap(display_key, std::sync::atomic::Ordering::AcqRel);
+            if previous != display_key {
+                let _: () = msg_send![window, orderOut: std::ptr::null::<AnyObject>()];
+                let _: () = msg_send![window, setCollectionBehavior: 0u64];
+            }
+            if moved {
+                let _: () = msg_send![window, setFrame: rect display: objc2::runtime::Bool::NO];
+            }
+            let _: () = msg_send![window, setCollectionBehavior: overlay_space_behavior()];
+            order_overlay(window);
+            // CanJoinAllSpaces alone leaves the bar off the desktop or full-screen
+            // app that is showing on the other display. Adding the window to every
+            // desktop that is showing now puts it on top of whatever is open there.
+            let window_number: isize = msg_send![window, windowNumber];
+            if window_number > 0 {
+                // Asking the window server where the window lives makes it settle
+                // the window's pending move before the join below is applied.
+                let _active: bool = msg_send![window, isOnActiveSpace];
+                join_showing_spaces(window_number);
+                order_overlay(window);
+            }
+        }
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFNumberCreate(
+            allocator: *const std::ffi::c_void,
+            kind: isize,
+            value: *const std::ffi::c_void,
+        ) -> *const std::ffi::c_void;
+        fn CFArrayCreate(
+            allocator: *const std::ffi::c_void,
+            values: *const *const std::ffi::c_void,
+            count: isize,
+            callbacks: *const std::ffi::c_void,
+        ) -> *const std::ffi::c_void;
+        fn CFRelease(cf: *const std::ffi::c_void);        static kCFTypeArrayCallBacks: CFArrayCallBacks;
+    }
+
+    #[repr(C)]
+    struct CFArrayCallBacks {
+        version: isize,
+        retain: *const std::ffi::c_void,
+        release: *const std::ffi::c_void,
+        copy_description: *const std::ffi::c_void,
+        equal: *const std::ffi::c_void,
+    }
+
+    struct SpaceFns {
+        conn: unsafe extern "C" fn() -> i32,
+        copy: unsafe extern "C" fn(i32, i32) -> *const std::ffi::c_void,
+        add: unsafe extern "C" fn(i32, *const std::ffi::c_void, *const std::ffi::c_void),
+    }
+
+    /// Private SkyLight calls. A missing symbol turns the join into a no-op.
+    fn space_fns() -> Option<&'static SpaceFns> {
+        use std::ffi::{c_void, CString};
+        use std::sync::OnceLock;
+
+        fn load() -> Option<SpaceFns> {
+            let path = CString::new(
+                "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",
+            )
+            .ok()?;
+            let lib = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_LAZY) };
+            if lib.is_null() {
+                return None;
+            }
+            unsafe fn raw(lib: *mut c_void, name: &str) -> Option<*mut c_void> {
+                let c = CString::new(name).ok()?;
+                let ptr = libc::dlsym(lib, c.as_ptr());
+                if ptr.is_null() { None } else { Some(ptr) }
+            }
+            unsafe {
+                Some(SpaceFns {
+                    conn: std::mem::transmute(raw(lib, "CGSMainConnectionID")?),
+                    copy: std::mem::transmute(raw(lib, "CGSCopySpaces")?),
+                    add: std::mem::transmute(raw(lib, "CGSAddWindowsToSpaces")?),
+                })
+            }
+        }
+
+        static FNS: OnceLock<Option<SpaceFns>> = OnceLock::new();
+        FNS.get_or_init(load).as_ref()
+    }
+
+    /// Put one window on every desktop and full-screen space that is showing now.
+    fn join_showing_spaces(window_number: isize) {
+        let Some(fns) = space_fns() else {
+            return;
+        };
+        unsafe {
+            let cid = (fns.conn)();
+            // Mask 5 is the spaces on screen now, one entry per display.
+            let spaces = (fns.copy)(cid, 5);
+            if spaces.is_null() {
+                return;
+            }
+            let id = window_number as i32;
+            // kCFNumberSInt32Type = 3
+            let number = CFNumberCreate(
+                std::ptr::null(),
+                3isize,
+                &id as *const i32 as *const std::ffi::c_void,
+            );
+            if !number.is_null() {
+                let values = [number];
+                let windows = CFArrayCreate(
+                    std::ptr::null(),
+                    values.as_ptr(),
+                    1,
+                    &kCFTypeArrayCallBacks as *const CFArrayCallBacks as *const std::ffi::c_void,
+                );
+                if !windows.is_null() {
+                    (fns.add)(cid, windows, spaces);
+                    CFRelease(windows);
+                }
+                CFRelease(number);
+            }
+            CFRelease(spaces);
+        }
+    }
+
+    pub fn is_character_palette_impl(handle: FocusHandle) -> bool {
+        if handle <= 0 {
+            return false;
+        }
+        use objc2_app_kit::NSRunningApplication;
+        let Some(app) = (unsafe {
+            NSRunningApplication::runningApplicationWithProcessIdentifier(handle as libc::pid_t)
+        }) else {
+            return false;
+        };
+        let Some(bundle) = (unsafe { app.bundleIdentifier() }) else {
+            return false;
+        };
+        palette_bundle(&bundle.to_string())
+    }
+
+    pub fn dismiss_character_palette_impl() {
+        use objc2_app_kit::NSRunningApplication;
+        use objc2_foundation::NSString;
+
+        let id = NSString::from_str("com.apple.CharacterPaletteIM");
+        let apps = unsafe { NSRunningApplication::runningApplicationsWithBundleIdentifier(&id) };
+        for index in 0..apps.count() {
+            let app = unsafe { apps.objectAtIndex(index) };
+            let _ = unsafe { app.hide() };
+        }
+    }
+
+    fn palette_bundle(bundle: &str) -> bool {
+        bundle == "com.apple.CharacterPaletteIM" || bundle.contains("CharacterPalette")
+    }
+
+    pub fn emoji_panel_on_screen_impl() -> bool {
+        use std::ffi::c_void;
+
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGWindowListCopyWindowInfo(option: u32, relative: u32) -> *const c_void;
+        }
+        #[link(name = "CoreFoundation", kind = "framework")]
+        extern "C" {
+            fn CFArrayGetCount(array: *const c_void) -> isize;
+            fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+            fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+            fn CFStringCreateWithCString(
+                alloc: *const c_void,
+                c_str: *const i8,
+                encoding: u32,
+            ) -> *const c_void;
+            fn CFStringGetCString(
+                string: *const c_void,
+                buffer: *mut i8,
+                buffer_size: isize,
+                encoding: u32,
+            ) -> u8;
+            fn CFGetTypeID(cf: *const c_void) -> usize;
+            fn CFStringGetTypeID() -> usize;
+            fn CFRelease(cf: *const c_void);
+        }
+
+        fn cf_string(bytes: &[u8]) -> *const c_void {
+            unsafe { CFStringCreateWithCString(std::ptr::null(), bytes.as_ptr().cast(), 0x0800_0100) }
+        }
+
+        fn copy_string(value: *const c_void) -> String {
+            if value.is_null() || unsafe { CFGetTypeID(value) } != unsafe { CFStringGetTypeID() } {
+                return String::new();
+            }
+            let mut buffer = [0i8; 256];
+            let ok = unsafe {
+                CFStringGetCString(value, buffer.as_mut_ptr(), buffer.len() as isize, 0x0800_0100)
+            };
+            if ok == 0 {
+                return String::new();
+            }
+            unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        }
+
+        unsafe {
+            let list = CGWindowListCopyWindowInfo(1, 0);
+            if list.is_null() {
+                return false;
+            }
+            let owner_key = cf_string(b"kCGWindowOwnerName\0");
+            let name_key = cf_string(b"kCGWindowName\0");
+            let mut found = false;
+            for index in 0..CFArrayGetCount(list) {
+                let item = CFArrayGetValueAtIndex(list, index);
+                if item.is_null() {
+                    continue;
+                }
+                let owner = copy_string(CFDictionaryGetValue(item, owner_key));
+                let name = copy_string(CFDictionaryGetValue(item, name_key));
+                let label = format!("{owner} {name}").to_ascii_lowercase();
+                if label.contains("characterpalette")
+                    || label.contains("character palette")
+                    || label.contains("emoji")
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if !owner_key.is_null() {
+                CFRelease(owner_key);
+            }
+            if !name_key.is_null() {
+                CFRelease(name_key);
+            }
+            CFRelease(list);
+            found
+        }
     }
 
     pub fn restore_impl(target: FocusHandle) -> bool {
@@ -508,6 +1072,9 @@ mod platform {
 
     pub fn is_live_impl(_h: FocusHandle) -> bool { false }
     pub fn foreground_impl() -> Option<FocusHandle> { None }
+    pub fn cursor_point_impl() -> Option<(i32, i32)> { None }
+    pub fn display_at_impl(_x: i32, _y: i32) -> Option<super::DisplayRect> { None }
+    pub fn present_overlay_impl(_win: &tauri::WebviewWindow, _x: i32, _y: i32, _w: i32, _h: i32) {}
     pub fn our_handles_impl(_app: &tauri::AppHandle) -> Vec<FocusHandle> { vec![] }
     pub fn make_non_activating_impl(_win: &tauri::WebviewWindow) {}
     pub fn set_ignore_impl(_win: &tauri::WebviewWindow, _ignore: bool) -> bool { true }
@@ -552,6 +1119,7 @@ mod tests {
 
     #[test]
     fn paste_falls_back_to_last_app_after_overlay_click() {
+        assert!(!is_character_palette(0));
         assert_eq!(pick_paste_target(Some(OVERLAY), Some(EDITOR), OURS), Some(EDITOR));
         assert_eq!(pick_paste_target(Some(MAIN), Some(EDITOR), OURS), Some(EDITOR));
     }
@@ -568,7 +1136,23 @@ mod tests {
         let bits = platform::overlay_space_behavior();
         assert_eq!(bits & 0x1, 0x1, "CanJoinAllSpaces");
         assert_eq!(bits & 0x100, 0x100, "FullScreenAuxiliary");
+        assert_eq!(bits & (1 << 18), 1 << 18, "CanJoinAllApplications");
+        assert_eq!(bits & 0x8, 0, "Transient hides the bar when DictFlow is in the background");
+        assert_eq!(bits & 0x10, 0, "Stationary pins the bar to the desktop where it opened");
         assert_eq!(bits & 0x2, 0, "must not set MoveToActiveSpace");
+    }
+
+    #[test]
+    fn pointer_on_the_upper_display_selects_that_display() {
+        let displays = [
+            DisplayRect { x: 0, y: 0, width: 1470, height: 956, scale: 1.0 },
+            DisplayRect { x: -586, y: -1440, width: 2560, height: 1440, scale: 1.0 },
+        ];
+        let upper = display_containing(-100, -100, &displays).expect("upper screen");
+        assert_eq!(upper.y, -1440);
+        let main = display_containing(1101, 176, &displays).expect("main screen");
+        assert_eq!(main.y, 0);
+        assert!(display_containing(4000, 4000, &displays).is_none());
     }
 
     #[cfg(target_os = "windows")]

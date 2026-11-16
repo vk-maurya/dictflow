@@ -2,15 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Overlay window is sized for the expanded recording HUD. The pill morphs
-/// inside it (SpeakType MiniRecorder: idle 58x24, recording ~250x44).
-pub const PILL_W: i32 = 268;
-pub const PILL_H: i32 = 56;
-/// Visible idle-pill footprint (58x24) — must match `src/overlay.css`. Used
-/// as the hover gate's (`hover.rs`) boot default until the overlay webview
-/// reports the live pillar rect (`src/overlay.ts` owns the other phases).
-pub const PILL_IDLE_W: i32 = 58;
-pub const PILL_IDLE_H: i32 = 24;
+/// Overlay window fits the recording bar at 70% of its previous length.
+/// Thickness stays a slim strip. Idle size must match `src/overlay.css`.
+pub const PILL_W: i32 = 157;
+pub const PILL_H: i32 = 24;
+/// Visible idle-pill footprint. The hover gate uses this until the overlay
+/// webview reports the live pill rect.
+pub const PILL_IDLE_W: i32 = 48;
+pub const PILL_IDLE_H: i32 = 11;
 pub const MARGIN: i32 = 16;
 /// Logical pixels above the screen bottom so the pill clears the Windows
 /// taskbar (~40) and the macOS Dock (~68–80) on Retina displays.
@@ -166,6 +165,50 @@ pub fn nearest_edge(cx: i32, cy: i32, screen_w: i32, screen_h: i32) -> DockEdge 
     }
 }
 
+/// Map one axis of a saved center onto a screen of a different size.
+/// A center near an edge keeps its distance from that edge, so a pill parked
+/// on the right side stays on the right side. Any other center keeps its
+/// fraction of the screen, so the middle stays the middle.
+pub fn map_axis(center: i32, saved_len: i32, len: i32) -> i32 {
+    if saved_len <= 0 || len <= 0 || saved_len == len {
+        return center;
+    }
+    let near_start = center;
+    let near_end = saved_len - center;
+    if near_start <= EDGE_SNAP {
+        return near_start;
+    }
+    if near_end <= EDGE_SNAP {
+        return len - near_end;
+    }
+    ((i64::from(center) * i64::from(len)) / i64::from(saved_len)) as i32
+}
+
+/// Within this many pixels of an edge a placed pill counts as docked there.
+pub const EDGE_SNAP: i32 = 64;
+
+/// Like [`place_free`], for a center saved on a screen of `saved_w` x `saved_h`.
+/// A saved size of zero means the position was never tied to a screen size.
+pub fn place_free_scaled(
+    cx: i32,
+    cy: i32,
+    saved_w: i32,
+    saved_h: i32,
+    screen_w: i32,
+    screen_h: i32,
+    w: i32,
+    h: i32,
+) -> (i32, i32) {
+    place_free(
+        map_axis(cx, saved_w, screen_w),
+        map_axis(cy, saved_h, screen_h),
+        screen_w,
+        screen_h,
+        w,
+        h,
+    )
+}
+
 /// Place a window so its center stays at `(cx, cy)`, kept on the screen.
 pub fn place_free(cx: i32, cy: i32, screen_w: i32, screen_h: i32, w: i32, h: i32) -> (i32, i32) {
     let max_x = (screen_w - w - MARGIN).max(MARGIN);
@@ -268,8 +311,8 @@ mod tests {
 
     #[test]
     fn window_fits_speaktype_recording_pill() {
-        const { assert!(PILL_W >= 250); }
-        const { assert!(PILL_H >= 44); }
+        const { assert!(PILL_W >= 146); }
+        const { assert!(PILL_H >= 20); }
     }
 
     #[test]
@@ -291,5 +334,33 @@ mod tests {
         assert!(is_vertical(DockEdge::Left));
         assert_eq!(orientation_size(DockEdge::Left), (PILL_H, PILL_W));
         assert_eq!(orientation_size(DockEdge::Top), (PILL_W, PILL_H));
+    }
+
+    #[test]
+    fn a_pill_on_the_right_edge_stays_on_the_right_edge() {
+        // Saved on a 1470 wide screen, 28px from the right edge.
+        let cx = 1470 - 28;
+        let (w, h) = orientation_size(DockEdge::Right);
+        let (x, _) = place_free_scaled(cx, 400, 1470, 956, 2560, 1440, w, h);
+        let gap = 2560 - (x + w);
+        assert!(gap <= 40, "stayed {gap}px from the right edge");
+    }
+
+    #[test]
+    fn a_pill_in_the_middle_stays_in_the_middle() {
+        let (w, h) = orientation_size(DockEdge::Bottom);
+        let (x, _) = place_free_scaled(735, 800, 1470, 956, 2560, 1440, w, h);
+        assert_eq!(x + w / 2, 1280);
+    }
+
+    #[test]
+    fn a_pill_on_the_left_edge_keeps_its_left_gap() {
+        assert_eq!(map_axis(28, 1470, 2560), 28);
+    }
+
+    #[test]
+    fn an_unsized_position_is_used_as_saved() {
+        assert_eq!(map_axis(500, 0, 2560), 500);
+        assert_eq!(map_axis(500, 1470, 1470), 500);
     }
 }
