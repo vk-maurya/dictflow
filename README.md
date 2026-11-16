@@ -9,14 +9,15 @@ Nothing leaves your PC unless you turn on an optional online model.
 
 ![DictFlow](assets/screenshot.png)
 
-**Latest:** [v0.3.1](https://github.com/vk-maurya/dictflow/releases/tag/v0.3.1)
+**Latest:** [v0.3.2](https://github.com/vk-maurya/dictflow/releases/tag/v0.3.2)
 
 ## Download
 
 | File | Use this when |
 |---|---|
-| [DictFlow_0.3.1_x64-setup.exe](https://github.com/vk-maurya/dictflow/releases/download/v0.3.1/DictFlow_0.3.1_x64-setup.exe) | Windows installer (recommended). Start Menu, current-user install, uninstall. |
-| [DictFlow_0.3.1_aarch64.dmg](https://github.com/vk-maurya/dictflow/releases/download/v0.3.1/DictFlow_0.3.1_aarch64.dmg) | macOS (Apple Silicon) disk image. |
+| [DictFlow_0.3.2_x64-setup.exe](https://github.com/vk-maurya/dictflow/releases/download/v0.3.2/DictFlow_0.3.2_x64-setup.exe) | Windows installer (recommended). Start Menu, current-user install, uninstall. |
+| [DictFlow_0.3.2_x64_en-US.msi](https://github.com/vk-maurya/dictflow/releases/download/v0.3.2/DictFlow_0.3.2_x64_en-US.msi) | Windows MSI, for managed or silent installs. |
+| [DictFlow_0.3.2_aarch64.dmg](https://github.com/vk-maurya/dictflow/releases/download/v0.3.2/DictFlow_0.3.2_aarch64.dmg) | macOS (Apple Silicon) disk image. |
 
 [All releases](https://github.com/vk-maurya/dictflow/releases)
 
@@ -52,7 +53,14 @@ Confirm the mic in **Setup** if a take is silent.
   optional LLM polish pass. API keys stay in Windows Credential Manager.
 - **Talk key** — hold or toggle; cancel with Esc or another key while held.
 - **Cleanup** — dictionary snippets, spoken punctuation, filler-word cleanup,
-  smart trailing punctuation.
+  smart trailing punctuation. With the cleanup model on, S1-mini runs fully
+  on-device: punctuation, capitalization, fillers, and list structure.
+- **Spoken numbers and symbols** — comma-separated number lists become digits
+  ("one, two, three, four" → "1, 2, 3, 4"), and "at the rate" becomes `@`,
+  so "ABC at the rate gmail.com" dictates as "ABC@gmail.com".
+- **Refine selection** — select text anywhere, press **Alt+1**, and it is
+  rephrased by the cleanup model and pasted back in place. Also re-dictate
+  the last take with **Shift+Alt+Z** (paste) and **Shift+Alt+X** (copy).
 - **App** — Dashboard, Dictate, History (with playback), Dictionary,
   Insights, AI Models, Setup, Settings. Tray icon, auto-start, update check.
 
