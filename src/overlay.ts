@@ -33,6 +33,7 @@ const HIT_SIZE: Record<Phase, { w: number; h: number }> = {
   idle: { w: 58, h: 24 },
   recording: { w: 250, h: 44 },
   transcribing: { w: 168, h: 44 },
+  refining: { w: 168, h: 44 },
 };
 
 type Press = {

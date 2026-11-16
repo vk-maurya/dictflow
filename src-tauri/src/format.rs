@@ -67,6 +67,15 @@ fn replacement_for(phrase: &str) -> String {
         .unwrap_or_else(|| phrase.to_owned())
 }
 
+/// True when `phrase` is a spoken-command phrase from the table (`question
+/// mark`, `at sign`, …). Used by the dictionary command-fix pass.
+pub fn is_spoken_command(phrase: &str) -> bool {
+    let key = phrase.split_whitespace().collect::<Vec<_>>().join(" ");
+    COMMANDS
+        .iter()
+        .any(|(p, _)| p.eq_ignore_ascii_case(&key))
+}
+
 /// Replace spoken punctuation / newline phrases. Longest phrases win
 /// because they are listed first in the alternation? Rust regex is
 /// left-to-right, so we list longer phrases first in COMMANDS.

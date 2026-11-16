@@ -9,9 +9,12 @@ use std::sync::mpsc;
 
 use anyhow::Context;
 
+use crate::clean;
 use crate::devices;
+use crate::email;
 use crate::format;
 use crate::models::{self, EngineKind};
+use crate::numbers;
 use crate::polish;
 use crate::s1_runtime::S1Runtime;
 use crate::settings::Settings;
@@ -299,6 +302,30 @@ pub(crate) struct TranscriptResult {
     pub cleanup_note: Option<String>,
 }
 
+/// P0 rules passes that the S1 pipeline doesn't cover, run before it:
+/// dictionary command fixes (an entry whose replacement is a spoken command is
+/// expanded so the command pass can act on it) → spoken punctuation/lists →
+/// spoken numbers → digits → English email compose. Returns the processed text
+/// plus whether an email layout short-circuited the rest of the pipeline.
+pub(crate) fn rules_preprocess(
+    raw_text: &str,
+    language: &str,
+    dictionary: &[text::DictionaryEntry],
+) -> (String, bool) {
+    let (cmd_fixed, _) = text::apply_command_fixes(raw_text, dictionary);
+    // Numbers run before the command pass, matching the P0 order: otherwise
+    // the spoken-command table would substitute the bare word "percent" with
+    // "%" first and `fifty percent` could never become `50%`.
+    let with_numbers = numbers::apply_spoken_numbers(&cmd_fixed);
+    let formatted = format::apply_offline_format(&with_numbers);
+    if language == "en" || language == "auto" {
+        if let Some(mail) = email::compose_email(&formatted) {
+            return (mail, true);
+        }
+    }
+    (formatted, false)
+}
+
 pub(crate) fn polish_preset<'a>(cleanup: &str, preset: &'a str, custom: &str) -> &'a str {
     if preset == "custom" && !custom.trim().is_empty() {
         return "custom";
@@ -373,8 +400,20 @@ pub(crate) fn run_transcription(
     };
     let raw_text = raw.trim().to_owned();
 
-    // App-specific spoken commands run before either cleanup path.
-    let formatted = format::apply_offline_format(&raw_text);
+    // P0 rules passes that the S1 pipeline doesn't cover run before it:
+    // dictionary command fixes → spoken punctuation/lists → spoken numbers →
+    // English email compose (which short-circuits everything below).
+    let (pre, is_email) = rules_preprocess(&raw_text, &input.language, &input.dictionary);
+    if is_email {
+        return Ok(TranscriptResult {
+            text: pre,
+            raw_text,
+            duration_secs,
+            dict_hits: 0,
+            cleanup_note: None,
+        });
+    }
+
     let want_llm = if input.polish.llm_backend == "s1_mini" {
         input.polish.llm_enabled
     } else {
@@ -386,7 +425,7 @@ pub(crate) fn run_transcription(
             &input.polish.audio_backend,
             &input.model_id,
             &input.language,
-            &formatted,
+            &pre,
         );
     let mut cleanup_note = None;
     let normalized = if wants_s1 {
@@ -400,7 +439,7 @@ pub(crate) fn run_transcription(
                     &input.polish.s1_styling,
                     &input.polish.s1_structure,
                     &input.polish.s1_context,
-                    &formatted,
+                    &pre,
                 )
             }) {
             Ok(text) => Some(text),
@@ -419,17 +458,21 @@ pub(crate) fn run_transcription(
     // Dictionary is intentionally after S1 so user-defined names win.
     let mut dictionary = input.dictionary.clone();
     let (mut out, dict_hits) =
-        text::apply_dictionary(normalized.as_deref().unwrap_or(&formatted), &mut dictionary);
+        text::apply_dictionary(normalized.as_deref().unwrap_or(&pre), &mut dictionary);
     if dict_hits > 0 {
         text::sort_dictionary(&mut dictionary);
         let _ = text::save_dictionary(&input.data_dir, &dictionary);
     }
-    // S1 already handles fillers and punctuation. Rules remain the fallback.
+    // S1 already handles fillers and punctuation. Rules remain the fallback,
+    // including the conversational repair cues from clean.rs ("actually",
+    // "I mean", "no sorry").
     if normalized.is_none() {
         match input.cleanup.as_str() {
-            "light" | "medium" => out = text::remove_fillers(&out),
-            "full" | "high" => out = text::tidy_punctuation(&text::remove_fillers(&out)),
+            "light" | "medium" | "full" | "high" => out = clean::clean(&out, &input.language),
             _ => {}
+        }
+        if matches!(input.cleanup.as_str(), "full" | "high") {
+            out = text::tidy_punctuation(&out);
         }
     }
     out = text::smart_trailing_punctuation(&out);
@@ -474,6 +517,53 @@ pub(crate) fn run_transcription(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preprocess_spoken_numbers_become_digits() {
+        let (out, is_email) = rules_preprocess("four point five stars", "en", &[]);
+        assert_eq!(out, "4.5 stars");
+        assert!(!is_email);
+
+        let (out, _) = rules_preprocess("two hundred fifty dollars", "en", &[]);
+        assert_eq!(out, "250 dollars");
+
+        let (out, _) = rules_preprocess("save fifty percent", "en", &[]);
+        assert_eq!(out, "save 50%");
+
+        let (out, _) = rules_preprocess("one lakh twenty thousand", "en", &[]);
+        assert_eq!(out, "1,20,000");
+    }
+
+    #[test]
+    fn preprocess_email_short_circuits_and_is_language_gated() {
+        let (out, is_email) = rules_preprocess(
+            "draft an email to Sarah telling her that I will be late tomorrow, cheers, Sarah",
+            "en",
+            &[],
+        );
+        assert!(is_email);
+        assert_eq!(
+            out,
+            "Hi Sarah,\n\nI will be late tomorrow.\n\nCheers,\nSarah"
+        );
+
+        // Non-English never builds an email layout.
+        let (_, is_email) = rules_preprocess(
+            "write an email to Sarah saying hi, best regards, Sarah",
+            "de",
+            &[],
+        );
+        assert!(!is_email);
+    }
+
+    #[test]
+    fn preprocess_dictionary_command_fixes_expand_first() {
+        // A dictionary entry whose replacement is a spoken command is expanded
+        // first, so the command pass turns it into punctuation.
+        let d = vec![text::DictionaryEntry::new("1", "kocia mark", "question mark")];
+        let (out, _) = rules_preprocess("are you there kocia mark", "en", &d);
+        assert_eq!(out, "are you there?");
+    }
 
     #[test]
     fn s1_language_gate_handles_forced_and_detected_sources() {
