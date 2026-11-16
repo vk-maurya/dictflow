@@ -1,8 +1,8 @@
-//! macOS talk keys via a **session** CGEventTap (SpeakType-style).
+//! macOS talk keys via a session CGEventTap on the main run loop.
 //!
-//! SpeakType uses `kCGSessionEventTap` on the **main** run loop plus
-//! Accessibility — not a HID tap (which needs Input Monitoring). Windows
-//! still polls GetAsyncKeyState in [`super::windows`].
+//! The Globe key's "Show Emoji & Symbols" action is a system setting, decided
+//! before this tap. While Fn is the talk key we set that action to Do Nothing
+//! and put the previous value back on quit. Windows still polls GetAsyncKeyState.
 
 use crate::hotkey::TalkEdge;
 use crate::paste;
@@ -21,7 +21,6 @@ const VK_LEFT_OPT: i64 = 58;
 const VK_RIGHT_OPT: i64 = 61;
 const VK_F9: i64 = 0x65;
 const VK_ESC: i64 = 53;
-const VK_F19: i64 = 0x50;
 
 const FN_MASK: u64 = 0x0080_0000;
 const CTRL_MASK: u64 = 0x0004_0000;
@@ -55,6 +54,11 @@ pub fn set_fn_mode(key: &str) {
     if let Some(m) = MODE.get() {
         m.store(mode_value(key), Ordering::Relaxed);
     }
+    sync_globe_action(key);
+}
+
+pub fn restore_globe_action() {
+    restore_globe();
 }
 
 fn mode_value(key: &str) -> u8 {
@@ -106,13 +110,6 @@ extern "C" {
     fn CGEventGetFlags(event: CGEventRef) -> u64;
     fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
     fn CGEventTapEnable(tap: CFMachPortRef, enable: u8);
-    fn CGEventSourceCreate(state_id: u32) -> *mut std::ffi::c_void;
-    fn CGEventCreateKeyboardEvent(
-        source: *mut std::ffi::c_void,
-        virtual_key: u16,
-        key_down: bool,
-    ) -> CGEventRef;
-    fn CGEventPost(tap: u32, event: CGEventRef);
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -129,6 +126,44 @@ extern "C" {
     );
     fn CFRunLoopGetMain() -> *mut std::ffi::c_void;
     fn CFRelease(cf: *const std::ffi::c_void);
+    fn CFStringCreateWithCString(
+        alloc: *const std::ffi::c_void,
+        c_str: *const i8,
+        encoding: u32,
+    ) -> *const std::ffi::c_void;
+    fn CFNumberCreate(
+        alloc: *const std::ffi::c_void,
+        the_type: isize,
+        value_ptr: *const std::ffi::c_void,
+    ) -> *const std::ffi::c_void;
+    fn CFNumberGetValue(
+        number: *const std::ffi::c_void,
+        the_type: isize,
+        value_ptr: *mut std::ffi::c_void,
+    ) -> bool;
+    fn CFGetTypeID(cf: *const std::ffi::c_void) -> usize;
+    fn CFNumberGetTypeID() -> usize;
+    fn CFPreferencesCopyValue(
+        key: *const std::ffi::c_void,
+        application_id: *const std::ffi::c_void,
+        user_name: *const std::ffi::c_void,
+        host_name: *const std::ffi::c_void,
+    ) -> *const std::ffi::c_void;
+    fn CFPreferencesSetValue(
+        key: *const std::ffi::c_void,
+        value: *const std::ffi::c_void,
+        application_id: *const std::ffi::c_void,
+        user_name: *const std::ffi::c_void,
+        host_name: *const std::ffi::c_void,
+    );
+    fn CFPreferencesSynchronize(
+        application_id: *const std::ffi::c_void,
+        user_name: *const std::ffi::c_void,
+        host_name: *const std::ffi::c_void,
+    ) -> u8;
+    static kCFPreferencesAnyApplication: *const std::ffi::c_void;
+    static kCFPreferencesCurrentUser: *const std::ffi::c_void;
+    static kCFPreferencesAnyHost: *const std::ffi::c_void;
     static kCFRunLoopCommonModes: *const std::ffi::c_void;
 }
 
@@ -176,56 +211,124 @@ fn is_talk_keycode(key: &str, keycode: i64) -> bool {
     talk_keys(key).is_some_and(|codes| codes.contains(&keycode))
 }
 
-fn frontmost_is_terminal() -> bool {
-    use objc2_app_kit::NSWorkspace;
-
-    let workspace = unsafe { NSWorkspace::sharedWorkspace() };
-    let Some(app) = (unsafe { workspace.frontmostApplication() }) else {
-        return false;
-    };
-    let Some(bid) = (unsafe { app.bundleIdentifier() }) else {
-        return false;
-    };
-    matches!(
-        bid.to_string().as_str(),
-        "com.apple.Terminal"
-            | "com.googlecode.iterm2"
-            | "com.mitchellh.ghostty"
-            | "io.alacritty"
-            | "org.alacritty"
-            | "net.kovidgoyal.kitty"
-            | "com.github.wez.wezterm"
-            | "dev.warp.Warp-Stable"
-            | "dev.warp.Warp"
-            | "co.zeit.hyper"
-            | "org.tabby"
-            | "com.microsoft.VSCode"
-            | "com.vscodium"
-            | "com.todesktop.230313mzl4w4u92"
-    )
+fn swallow_fn_event(key: &str, keycode: i64) -> bool {
+    matches!(key, "Fn" | "FnCtrl") && keycode == VK_FN
 }
 
-/// SpeakType: inject F19 so Globe/Fn does not open the emoji picker.
-fn suppress_emoji_picker() {
-    if frontmost_is_terminal() {
+fn fn_owns_globe(key: &str) -> bool {
+    matches!(key, "Fn" | "FnCtrl")
+}
+
+/// Previous `AppleFnUsageType`. `None` inside means the key was absent.
+struct GlobeSaved {
+    value: Option<i32>,
+}
+
+static GLOBE_SAVED: Mutex<Option<GlobeSaved>> = Mutex::new(None);
+
+const FN_USAGE_DO_NOTHING: i32 = 0;
+const CF_NUMBER_SINT32: isize = 3;
+const CF_STRING_UTF8: u32 = 0x0800_0100;
+
+fn sync_globe_action(key: &str) {
+    if fn_owns_globe(key) {
+        claim_globe();
+    } else {
+        restore_globe();
+    }
+}
+
+fn claim_globe() {
+    let mut saved = GLOBE_SAVED.lock().unwrap_or_else(|e| e.into_inner());
+    if saved.is_some() {
         return;
     }
+    *saved = Some(GlobeSaved {
+        value: read_fn_usage(),
+    });
+    drop(saved);
+    if write_fn_usage(Some(FN_USAGE_DO_NOTHING)) {
+        log::info!("globe key action set to Do Nothing while Fn is the talk key");
+    }
+}
+
+fn restore_globe() {
+    let previous = {
+        let mut saved = GLOBE_SAVED.lock().unwrap_or_else(|e| e.into_inner());
+        saved.take()
+    };
+    let Some(previous) = previous else {
+        return;
+    };
+    if write_fn_usage(previous.value) {
+        log::info!("restored globe key action");
+    }
+}
+
+fn fn_usage_key() -> *const std::ffi::c_void {
     unsafe {
-        let src = CGEventSourceCreate(1); // kCGEventSourceStateHIDSystemState
-        if src.is_null() {
-            return;
+        CFStringCreateWithCString(
+            std::ptr::null(),
+            b"AppleFnUsageType\0".as_ptr().cast(),
+            CF_STRING_UTF8,
+        )
+    }
+}
+
+fn read_fn_usage() -> Option<i32> {
+    unsafe {
+        let key = fn_usage_key();
+        if key.is_null() {
+            return None;
         }
-        let down = CGEventCreateKeyboardEvent(src, VK_F19 as u16, true);
-        let up = CGEventCreateKeyboardEvent(src, VK_F19 as u16, false);
-        if !down.is_null() {
-            CGEventPost(0, down);
-            CFRelease(down);
+        let value = CFPreferencesCopyValue(
+            key,
+            kCFPreferencesAnyApplication,
+            kCFPreferencesCurrentUser,
+            kCFPreferencesAnyHost,
+        );
+        CFRelease(key);
+        if value.is_null() || CFGetTypeID(value) != CFNumberGetTypeID() {
+            if !value.is_null() {
+                CFRelease(value);
+            }
+            return None;
         }
-        if !up.is_null() {
-            CGEventPost(0, up);
-            CFRelease(up);
+        let mut n: i32 = 0;
+        let ok = CFNumberGetValue(value, CF_NUMBER_SINT32, &mut n as *mut i32 as *mut _);
+        CFRelease(value);
+        ok.then_some(n)
+    }
+}
+
+fn write_fn_usage(value: Option<i32>) -> bool {
+    unsafe {
+        let key = fn_usage_key();
+        if key.is_null() {
+            return false;
         }
-        CFRelease(src);
+        let number = if let Some(n) = value {
+            CFNumberCreate(std::ptr::null(), CF_NUMBER_SINT32, &n as *const i32 as *const _)
+        } else {
+            std::ptr::null()
+        };
+        CFPreferencesSetValue(
+            key,
+            number,
+            kCFPreferencesAnyApplication,
+            kCFPreferencesCurrentUser,
+            kCFPreferencesAnyHost,
+        );
+        let ok = CFPreferencesSynchronize(
+            kCFPreferencesAnyApplication,
+            kCFPreferencesCurrentUser,
+            kCFPreferencesAnyHost,
+        );
+        if !number.is_null() {
+            CFRelease(number);
+        }
+        CFRelease(key);
+        ok != 0
     }
 }
 
@@ -245,10 +348,6 @@ fn emit_edge(edge: TalkEdge) {
     if matches!(edge, TalkEdge::Pressed) {
         if let Some(app) = APP.get() {
             paste::remember_paste_target(app);
-        }
-        let fn_mode = MODE.get().map(|m| m.load(Ordering::Relaxed)).unwrap_or(0);
-        if fn_mode != 0 {
-            suppress_emoji_picker();
         }
     }
     if let Some(tx) = TX.get() {
@@ -295,10 +394,6 @@ unsafe extern "C" fn on_event(
         .unwrap_or(false);
 
     if etype == KEY_DOWN {
-        // SpeakType: ignore synthetic F19 or it cancels the take it just started.
-        if keycode == VK_F19 {
-            return event;
-        }
         if keycode == VK_ESC && recording {
             emit_edge(TalkEdge::Escape);
             return event;
@@ -336,13 +431,11 @@ unsafe extern "C" fn on_event(
     let Some(down) = talk_pressed(&key, flags, keycode) else {
         return event;
     };
-    let mut swallow = false;
     WAS_DOWN.with(|was| {
         if down == was.get() {
             return;
         }
         was.set(down);
-        swallow = matches!(key.as_str(), "Fn" | "FnCtrl") && keycode == VK_FN;
         emit_edge(if down {
             TalkEdge::Pressed
         } else {
@@ -350,8 +443,9 @@ unsafe extern "C" fn on_event(
         });
     });
 
-    // SpeakType: consume Fn flagsChanged so terminals do not print CSI garbage.
-    if swallow {
+    // Every Globe/Fn flagsChanged, including repeats. One leaked repeat is
+    // enough for macOS to open Emoji & Symbols.
+    if swallow_fn_event(&key, keycode) {
         std::ptr::null_mut()
     } else {
         event
@@ -365,7 +459,7 @@ unsafe fn attach_tap() {
     }
     // flagsChanged | keyDown | keyUp (F9 / Esc / combo-cancel, same as Windows).
     let mask = (1u64 << FLAGS_CHANGED) | (1u64 << KEY_DOWN) | (1u64 << KEY_UP);
-    // kCGSessionEventTap = 1 (Accessibility). HID (0) needs Input Monitoring.
+    // kCGSessionEventTap = 1 (Accessibility).
     let tap = CGEventTapCreate(1, 0, 0, mask, on_event, std::ptr::null_mut());
     if tap.is_null() {
         log::warn!("mac session tap failed — grant Accessibility, then Enable again");
@@ -374,7 +468,6 @@ unsafe fn attach_tap() {
     }
     TAP_PORT.store(tap, Ordering::SeqCst);
     let src = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
-    // SpeakType attaches the tap to the main run loop, not a worker thread.
     CFRunLoopAddSource(CFRunLoopGetMain(), src, kCFRunLoopCommonModes);
     CGEventTapEnable(tap, 1);
     LIVE.store(true, Ordering::SeqCst);
@@ -383,11 +476,13 @@ unsafe fn attach_tap() {
 }
 
 pub fn ensure(app: tauri::AppHandle, tx: tokio::sync::mpsc::UnboundedSender<TalkEdge>) {
-    let initial_mode = app
+    let hotkey = app
         .state::<Mutex<AppState>>()
         .lock()
-        .map(|s| mode_value(&s.settings.hotkey_key))
-        .unwrap_or(0);
+        .map(|s| s.settings.hotkey_key.clone())
+        .unwrap_or_default();
+    sync_globe_action(&hotkey);
+    let initial_mode = mode_value(&hotkey);
     let _ = APP.set(app.clone());
     let _ = TX.set(tx);
     let _ = MODE.set(Arc::new(AtomicU8::new(initial_mode)));
@@ -430,5 +525,16 @@ mod tests {
         assert_eq!(talk_pressed("LeftCtrl", CTRL_MASK, VK_RIGHT_CTRL), None);
         assert_eq!(talk_pressed("Fn", FN_MASK, VK_FN), Some(true));
         assert_eq!(talk_pressed("Fn", FN_MASK, VK_LEFT_CTRL), None);
+    }
+
+    #[test]
+    fn fn_events_are_swallowed_and_globe_is_owned_by_fn() {
+        assert!(swallow_fn_event("Fn", VK_FN));
+        assert!(swallow_fn_event("FnCtrl", VK_FN));
+        assert!(!swallow_fn_event("LeftCtrl", VK_FN));
+        assert!(!swallow_fn_event("Fn", VK_LEFT_CTRL));
+        assert!(fn_owns_globe("Fn"));
+        assert!(fn_owns_globe("FnCtrl"));
+        assert!(!fn_owns_globe("RightCtrl"));
     }
 }

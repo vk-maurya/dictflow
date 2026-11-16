@@ -80,10 +80,21 @@ pub(crate) struct Settings {
     pub overlay_edge: String,
     #[serde(default = "default_overlay_offset")]
     pub overlay_offset: i32,
+    /// When true, the pill stays where it was dropped instead of parking on an edge.
+    #[serde(default)]
+    pub overlay_free: bool,
+    /// Screen-local center of a freely placed pill, in logical pixels.
+    #[serde(default)]
+    pub overlay_x: i32,
+    #[serde(default)]
+    pub overlay_y: i32,
     #[serde(default = "shortcuts::default_paste_last")]
     pub paste_last_key: String,
     #[serde(default = "shortcuts::default_copy_last")]
     pub copy_last_key: String,
+    /// Global shortcut that rewrites the current selection. "Off" disables it.
+    #[serde(default = "shortcuts::default_refine_selection")]
+    pub refine_selection_key: String,
     /// Missing field on old settings.json → already onboarded. Fresh Default → false.
     #[serde(default = "default_true")]
     pub onboarded: bool,
@@ -112,6 +123,14 @@ pub(crate) struct Settings {
     pub llm_custom_prompt: String,
     #[serde(default)]
     pub llm_enabled: bool,
+    /// S1-mini's trained control line. These are intentionally separate from
+    /// generic LLM presets because arbitrary prompts degrade this model.
+    #[serde(default = "default_s1_styling")]
+    pub s1_styling: String,
+    #[serde(default = "default_s1_structure")]
+    pub s1_structure: String,
+    #[serde(default = "default_s1_context")]
+    pub s1_context: String,
 }
 
 fn default_cleanup() -> String {
@@ -151,6 +170,15 @@ fn default_llm_timeout() -> u64 {
 fn default_llm_preset() -> String {
     "clean".to_owned()
 }
+fn default_s1_styling() -> String {
+    "semi-formal".to_owned()
+}
+fn default_s1_structure() -> String {
+    "prose".to_owned()
+}
+fn default_s1_context() -> String {
+    "general".to_owned()
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -166,8 +194,12 @@ impl Default for Settings {
             overlay_enabled: true,
             overlay_edge: default_overlay_edge(),
             overlay_offset: default_overlay_offset(),
+            overlay_free: false,
+            overlay_x: 0,
+            overlay_y: 0,
             paste_last_key: shortcuts::default_paste_last(),
             copy_last_key: shortcuts::default_copy_last(),
+            refine_selection_key: shortcuts::default_refine_selection(),
             onboarded: false,
             session_cap: false,
             audio_backend: default_audio_backend(),
@@ -181,6 +213,9 @@ impl Default for Settings {
             llm_preset: default_llm_preset(),
             llm_custom_prompt: String::new(),
             llm_enabled: false,
+            s1_styling: default_s1_styling(),
+            s1_structure: default_s1_structure(),
+            s1_context: default_s1_context(),
         }
     }
 }
@@ -222,6 +257,8 @@ pub(crate) struct Status {
     pub version: String,
     pub recommended_model: String,
     pub transcribing: bool,
+    /// True while a selection refine is waiting on the cleanup model.
+    pub refining: bool,
     /// "local" or "online" — which STT source dictation actually uses.
     pub speech_source: String,
     /// Catalog id, or the API model name when the audio backend is online.
@@ -333,6 +370,7 @@ mod tests {
         assert!(!Settings::default().onboarded);
         assert_eq!(Settings::default().paste_last_key, "Shift+Alt+Z");
         assert_eq!(Settings::default().copy_last_key, "Shift+Alt+X");
+        assert_eq!(Settings::default().refine_selection_key, "Alt+1");
         assert!(!Settings::default().session_cap);
         assert!(Settings::default().overlay_enabled);
         assert_eq!(Settings::default().hotkey_key, default_talk_key());
@@ -375,12 +413,17 @@ mod tests {
         let s: Settings = serde_json::from_str(json).expect("legacy settings");
         assert!(s.onboarded, "missing onboarded must default true");
         assert_eq!(s.paste_last_key, "Shift+Alt+Z");
+        assert_eq!(s.refine_selection_key, "Alt+1");
         assert!(s.overlay_enabled);
         assert_eq!(s.overlay_edge, "bottom");
+        assert!(!s.overlay_free);
         assert!(s.audio_device.is_none());
         assert_eq!(s.audio_backend, "local");
         assert_eq!(s.llm_backend, "off");
         assert!(!s.llm_enabled);
+        assert_eq!(s.s1_styling, "semi-formal");
+        assert_eq!(s.s1_structure, "prose");
+        assert_eq!(s.s1_context, "general");
     }
 
     #[test]

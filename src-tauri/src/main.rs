@@ -1,4 +1,7 @@
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 // DictFlow — offline voice dictation (Wispr Flow-style, 100% local).
 // Stack: Tauri v2 + Rust backend + whisper.cpp sidecar (Whisper)
@@ -25,6 +28,8 @@ mod paste;
 mod perm;
 mod polish;
 mod prompts;
+mod refine;
+mod s1_runtime;
 mod session;
 mod settings;
 mod shortcuts;
@@ -32,6 +37,7 @@ mod state;
 mod stats;
 mod sys;
 mod text;
+mod text_models;
 mod tray;
 
 use std::collections::HashMap;
@@ -47,9 +53,7 @@ use crate::dictation::{cancel_dictation, toggle_recording, transcribe_file};
 use crate::models::EngineKind;
 use crate::perm::{get_permissions, request_permission};
 use crate::state::AppState;
-use crate::sys::{
-    open_accessibility_settings, open_input_monitoring_settings, open_mic_settings,
-};
+use crate::sys::{open_accessibility_settings, open_input_monitoring_settings, open_mic_settings};
 
 pub fn run() {
     #[cfg(target_os = "macos")]
@@ -89,7 +93,8 @@ pub fn run() {
                     if event.state != ShortcutState::Pressed {
                         return;
                     }
-                    let expected = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::Space);
+                    let expected =
+                        Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::Space);
                     if *shortcut == expected {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
@@ -101,7 +106,7 @@ pub fn run() {
                         });
                         return;
                     }
-                    let (paste, copy) = {
+                    let (paste, copy, refine) = {
                         let st = app.state::<Mutex<AppState>>();
                         let Ok(s) = st.lock() else {
                             return;
@@ -112,7 +117,14 @@ pub fn run() {
                         let copy = shortcuts::parse_shortcut(&s.settings.copy_last_key)
                             .ok()
                             .and_then(|sp| crate::hotkey::spec_to_shortcut(&sp).ok());
-                        (paste, copy)
+                        let refine = if shortcuts::is_refine_off(&s.settings.refine_selection_key) {
+                            None
+                        } else {
+                            shortcuts::parse_shortcut(&s.settings.refine_selection_key)
+                                .ok()
+                                .and_then(|sp| crate::hotkey::spec_to_shortcut(&sp).ok())
+                        };
+                        (paste, copy, refine)
                     };
                     if paste.as_ref() == Some(shortcut) {
                         let app = app.clone();
@@ -132,6 +144,8 @@ pub fn run() {
                                 Err(e) => log::error!("copy-last: {e}"),
                             }
                         });
+                    } else if refine.as_ref() == Some(shortcut) {
+                        crate::refine::start(app.clone());
                     }
                 })
                 .build(),
@@ -156,8 +170,11 @@ pub fn run() {
                 stats: crate::stats::UsageStats::default(),
                 downloading: HashMap::new(),
                 utility_shortcuts: Vec::new(),
+                refine_busy: std::sync::atomic::AtomicBool::new(false),
+                refining: false,
                 data_dir,
                 transcriber,
+                s1_runtime: crate::s1_runtime::S1Runtime::new(),
                 paste_target: None,
             };
             st.load_settings();
@@ -204,11 +221,19 @@ pub fn run() {
                 while let Some(edge) = hk_rx.recv().await {
                     match edge {
                         crate::hotkey::TalkEdge::Pressed => {
-                            let (mode, recording) = {
+                            let (mode, recording, transcribing) = {
                                 let s: State<'_, Mutex<AppState>> = hk_app.state();
                                 let guard = s.lock().unwrap();
-                                (guard.settings.recording_mode.clone(), guard.recording)
+                                (
+                                    guard.settings.recording_mode.clone(),
+                                    guard.recording,
+                                    guard.transcribing,
+                                )
                             };
+                            if transcribing {
+                                log::info!("hotkey ignored while transcription is in progress");
+                                continue;
+                            }
                             match mode.as_str() {
                                 "toggle" => {
                                     if recording {
@@ -225,9 +250,15 @@ pub fn run() {
                                             Ok(choice) => {
                                                 guard.hotkey_owned = true;
                                                 drop(guard);
-                                                crate::dictation::emit_device_fallback(&hk_app, preferred.as_deref(), &choice);
+                                                crate::dictation::emit_device_fallback(
+                                                    &hk_app,
+                                                    preferred.as_deref(),
+                                                    &choice,
+                                                );
                                                 let _ = hk_app.emit("dictflow://recording", true);
-                                                crate::dictation::spawn_record_ticker(hk_app.clone());
+                                                crate::dictation::spawn_record_ticker(
+                                                    hk_app.clone(),
+                                                );
                                             }
                                             Err(e) => log::error!("hotkey record failed: {e:#}"),
                                         }
@@ -238,13 +269,17 @@ pub fn run() {
                                         // Any press stops continuous recording.
                                         let st: State<'_, Mutex<AppState>> = hk_app.state();
                                         match crate::dictation::stop_transcribe(&hk_app, st).await {
-                                            Ok(msg) => log::info!("dictation (double-tap stop): {msg}"),
+                                            Ok(msg) => {
+                                                log::info!("dictation (double-tap stop): {msg}")
+                                            }
                                             Err(e) => log::error!("dictation error: {e}"),
                                         }
                                         last_tap_end = None;
                                     } else {
                                         let is_double = last_tap_end
-                                            .map(|t| t.elapsed() < std::time::Duration::from_millis(500))
+                                            .map(|t| {
+                                                t.elapsed() < std::time::Duration::from_millis(500)
+                                            })
                                             .unwrap_or(false);
                                         if is_double {
                                             // Second tap within 500 ms → start continuous dictation.
@@ -256,11 +291,20 @@ pub fn run() {
                                                 Ok(choice) => {
                                                     guard.hotkey_owned = true;
                                                     drop(guard);
-                                                    crate::dictation::emit_device_fallback(&hk_app, preferred.as_deref(), &choice);
-                                                    let _ = hk_app.emit("dictflow://recording", true);
-                                                    crate::dictation::spawn_record_ticker(hk_app.clone());
+                                                    crate::dictation::emit_device_fallback(
+                                                        &hk_app,
+                                                        preferred.as_deref(),
+                                                        &choice,
+                                                    );
+                                                    let _ =
+                                                        hk_app.emit("dictflow://recording", true);
+                                                    crate::dictation::spawn_record_ticker(
+                                                        hk_app.clone(),
+                                                    );
                                                 }
-                                                Err(e) => log::error!("hotkey record failed: {e:#}"),
+                                                Err(e) => {
+                                                    log::error!("hotkey record failed: {e:#}")
+                                                }
                                             }
                                         }
                                         // else: first tap — wait for possible second tap (handled in Released).
@@ -276,9 +320,15 @@ pub fn run() {
                                             Ok(choice) => {
                                                 guard.hotkey_owned = true;
                                                 drop(guard);
-                                                crate::dictation::emit_device_fallback(&hk_app, preferred.as_deref(), &choice);
+                                                crate::dictation::emit_device_fallback(
+                                                    &hk_app,
+                                                    preferred.as_deref(),
+                                                    &choice,
+                                                );
                                                 let _ = hk_app.emit("dictflow://recording", true);
-                                                crate::dictation::spawn_record_ticker(hk_app.clone());
+                                                crate::dictation::spawn_record_ticker(
+                                                    hk_app.clone(),
+                                                );
                                             }
                                             Err(e) => log::error!("hotkey record failed: {e:#}"),
                                         }
@@ -366,8 +416,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             get_models,
+            get_text_model,
             select_model,
             download_model,
+            download_text_model,
             cancel_download,
             get_history,
             get_stats,
@@ -399,6 +451,7 @@ pub fn run() {
             copy_chip_open,
             transcribe_file,
             delete_model,
+            delete_text_model,
             get_audio_devices,
             test_microphone,
             open_mic_settings,
@@ -413,8 +466,24 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building DictFlow")
         .run(|app, event| {
+            if let tauri::RunEvent::Exit = &event {
+                crate::hotkey::restore_globe_action();
+            }
+            if matches!(
+                &event,
+                tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. }
+            ) {
+                let runtime = app
+                    .state::<Mutex<AppState>>()
+                    .lock()
+                    .ok()
+                    .map(|state| state.s1_runtime.clone());
+                if let Some(runtime) = runtime {
+                    runtime.shutdown();
+                }
+            }
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { .. } = event {
+            if let tauri::RunEvent::Reopen { .. } = &event {
                 crate::tray::show_main_window(app);
             }
             #[cfg(not(target_os = "macos"))]
