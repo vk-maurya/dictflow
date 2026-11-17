@@ -375,6 +375,25 @@ pub fn resample_linear(samples: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32
         .collect()
 }
 
+/// Encode mono f32 samples as an in-memory 16-bit PCM WAV (for upload APIs).
+pub fn wav_bytes_mono_16k(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut cursor = std::io::Cursor::new(Vec::with_capacity(44 + samples.len() * 2));
+    {
+        let mut writer = hound::WavWriter::new(&mut cursor, spec).context("start wav in memory")?;
+        for s in samples {
+            writer.write_sample((s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
+        }
+        writer.finalize()?;
+    }
+    Ok(cursor.into_inner())
+}
+
 /// Write mono f32 samples as 16-bit PCM WAV.
 pub fn write_wav_mono_16k(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
     let spec = hound::WavSpec {
@@ -471,5 +490,35 @@ mod tests {
         assert_eq!(resample_linear(&s, 16_000, 16_000), s);
         let down = resample_linear(&vec![0.0; 48_000], 48_000, 16_000);
         assert_eq!(down.len(), 16_000);
+    }
+
+    #[test]
+    fn wav_bytes_round_trip() {
+        let samples: Vec<f32> = (0..1_600)
+            .map(|i| ((i as f32) * 0.05).sin() * 0.5)
+            .collect();
+        let bytes = wav_bytes_mono_16k(&samples, 16_000).unwrap();
+        assert_eq!(&bytes[0..4], b"RIFF");
+        let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes)).unwrap();
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, 16_000);
+        let back: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|s| s.unwrap() as f32 / i16::MAX as f32)
+            .collect();
+        assert_eq!(back.len(), samples.len());
+        for (a, b) in samples.iter().zip(&back) {
+            assert!((a - b).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn wav_bytes_clamps_and_handles_empty() {
+        let bytes = wav_bytes_mono_16k(&[2.0, -2.0], 16_000).unwrap();
+        let mut reader = hound::WavReader::new(std::io::Cursor::new(bytes)).unwrap();
+        let v: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap()).collect();
+        assert_eq!(v, vec![i16::MAX, -i16::MAX]);
+        assert!(wav_bytes_mono_16k(&[], 16_000).is_ok());
     }
 }

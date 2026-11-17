@@ -26,3 +26,15 @@ locally.
 
 The runtime is not included in the DictFlow source repository or installer. It
 is downloaded only as part of S1-mini installation.
+
+## Silero VAD
+
+DictFlow bundles the **Silero VAD** voice-activity model (`silero_vad.onnx`) and
+runs it through sherpa-onnx to find pauses while you dictate. It is used only
+locally; no audio leaves the device because of it.
+
+- Project: https://github.com/snakers4/silero-vad
+- Copyright: Silero Team
+- License: MIT
+- File: `src-tauri/resources/silero_vad.onnx` (643,854 bytes, SHA-256 verified at
+  load time; a mismatch falls back to the built-in energy detector)

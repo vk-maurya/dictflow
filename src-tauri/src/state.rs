@@ -10,6 +10,7 @@ use crate::engine::Transcriber;
 use crate::focus;
 use crate::models;
 use crate::s1_runtime::S1Runtime;
+use crate::segment_jobs::SegmentSession;
 use crate::settings::{
     default_overlay_edge, default_overlay_offset, normalize_talk_key, HistoryItem, NewHistory,
     Settings, HISTORY_LIMIT,
@@ -25,6 +26,10 @@ pub(crate) struct ActiveRecording {
     pub done: Arc<AtomicBool>,
     pub started_at: std::time::Instant,
     pub stream_error: Arc<AtomicBool>,
+    /// Pause segmentation + background transcription for this take. Installed
+    /// by the segmenter task shortly after recording starts, so short takes
+    /// (and mic tests) never pay for it. `None` means the whole-WAV path.
+    pub segments: Option<SegmentSession>,
 }
 
 pub(crate) struct AppState {
