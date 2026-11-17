@@ -108,6 +108,7 @@ pub fn save_secrets(data_dir: &Path, secrets: &Secrets) -> Result<()> {
     }
 }
 
+#[cfg(target_os = "macos")] // macOS keeps secrets in a file (no keyring service)
 fn load_file_secrets(data_dir: &Path) -> Secrets {
     std::fs::read(secrets_path(data_dir))
         .ok()
@@ -115,6 +116,7 @@ fn load_file_secrets(data_dir: &Path) -> Secrets {
         .unwrap_or_default()
 }
 
+#[cfg(target_os = "macos")] // macOS keeps secrets in a file (no keyring service)
 fn save_file_secrets(data_dir: &Path, secrets: &Secrets) -> Result<()> {
     if let Some(parent) = secrets_path(data_dir).parent() {
         std::fs::create_dir_all(parent)?;
@@ -446,6 +448,7 @@ fn openrouter_model_chain(configured: &str) -> Vec<String> {
     models
 }
 
+#[allow(clippy::too_many_arguments)] // request fields straight from settings
 fn polish_openai(
     base: &str,
     key: &str,
@@ -497,6 +500,7 @@ fn polish_openai(
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("cleanup models returned empty text")))
 }
 
+#[allow(clippy::too_many_arguments)] // request fields straight from settings
 fn polish_openai_once(
     base: &str,
     key: &str,
@@ -509,7 +513,7 @@ fn polish_openai_once(
 ) -> Result<String> {
     let url = join_url(base, "chat/completions");
     let attempt_timeout = if openrouter {
-        timeout_ms.min(20_000).max(1_000)
+        timeout_ms.clamp(1_000, 20_000)
     } else {
         timeout_ms
     };

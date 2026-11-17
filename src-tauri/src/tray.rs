@@ -353,7 +353,7 @@ fn prepare_overlay_window(win: &tauri::WebviewWindow) {
     // Use the bit-only toggle (not tauri's) — tao's full restyle would strip
     // the chrome/layered patches `make_non_activating` just applied.
     crate::hover::invalidate();
-    focus::set_ignore_cursor_events(&win, false);
+    focus::set_ignore_cursor_events(win, false);
     let _ = win.set_always_on_top(true);
     let _ = win.set_visible_on_all_workspaces(true);
     let _ = win.set_shadow(false);

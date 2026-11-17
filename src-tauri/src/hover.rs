@@ -145,7 +145,7 @@ fn tick(app: &tauri::AppHandle, counter: &mut u32) {
         // pill, so no click-through toggling happens here. Just re-assert
         // style + region every ~2s in case a tao restyle or a DPI change
         // (dragged across monitors) left the pill wrong.
-        if *counter % RESYNC_EVERY == 0 {
+        if (*counter).is_multiple_of(RESYNC_EVERY) {
             if crate::focus::assert_overlay_style(&win) {
                 log::debug!("overlay window style drifted; re-patched");
             }
@@ -195,6 +195,7 @@ fn hovering(win: &tauri::WebviewWindow) -> bool {
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "windows")]
 #[cfg_attr(target_os = "windows", allow(dead_code))]
+#[allow(clippy::upper_case_acronyms)] // mirror the Win32 struct names
 mod platform {
     use tauri::WebviewWindow;
     use std::ffi::c_void;
@@ -221,7 +222,7 @@ mod platform {
 
     /// Cursor position relative to the overlay window, in logical pixels.
     pub(crate) fn cursor_rel_logical(win: &WebviewWindow) -> Option<(f64, f64)> {
-        let hwnd = win.hwnd().ok()?.0 as *mut c_void;
+        let hwnd = win.hwnd().ok()?.0;
         unsafe {
             let mut cur = POINT { x: 0, y: 0 };
             let mut rect = RECT {
@@ -233,7 +234,7 @@ mod platform {
             if GetCursorPos(&mut cur) == 0 || GetWindowRect(hwnd, &mut rect) == 0 {
                 return None;
             }
-            let scale = win.scale_factor().ok()? as f64;
+            let scale = win.scale_factor().ok()?;
             let rel_x = f64::from(cur.x - rect.left) / scale;
             let rel_y = f64::from(cur.y - rect.top) / scale;
             Some((rel_x, rel_y))
