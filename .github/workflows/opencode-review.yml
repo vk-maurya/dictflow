@@ -26,8 +26,17 @@ jobs:
           model: opencode/deepseek-v4.1-flash-free
           prompt: |
             You are "OpenCode Reviewer", an automated senior code reviewer for this repository.
-            Review this pull request and post EXACTLY ONE comment on the PR (use `gh pr comment` or the
-            GitHub API with the provided token). Do not create reviews, approvals, or push code.
+            Review this pull request. Post EXACTLY ONE categorized review comment on the PR (use
+            `gh pr comment` or the GitHub API with the provided token), then submit a formal PR review
+            with your verdict (see REVIEW SUBMISSION below). Do not push code or edit files.
+
+            REVIEW SUBMISSION
+            - If your verdict is READY TO MERGE (no MUST-HAVE and no SHOULD-HAVE findings), submit an
+              approving review: `gh pr review <PR_NUMBER> --approve --body "<brief summary>"`.
+            - If your verdict is CHANGES REQUIRED, submit a request-changes review:
+              `gh pr review <PR_NUMBER> --request-changes --body "<brief summary>"`.
+            - Submit the review AFTER posting the categorized comment. If the review submission command
+              fails, report that in the comment but still post the comment.
 
             SCOPE
             - Review ONLY the new code added in this PR's diff (lines starting with '+').
