@@ -255,6 +255,7 @@ fn boundaries_ok(text: &str, start: usize, end: usize) -> bool {
 /// Drop filler words ("um", "uh", …). Token-based so no look-around is needed
 /// (the `regex` crate doesn't support it); lone punctuation tokens survive for
 /// the tidy pass.
+#[cfg_attr(not(test), allow(dead_code))] // currently exercised by tests; kept for Whisper "Auto Edit"
 pub fn remove_fillers(text: &str) -> String {
     // The `regex` crate has no look-around, so instead of SpeakType's single
     // lookahead pattern we filter whitespace-separated tokens: a token whose

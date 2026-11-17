@@ -44,6 +44,7 @@ pub fn display_at(x: i32, y: i32) -> Option<DisplayRect> {
     platform::display_at_impl(x, y)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn display_containing(x: i32, y: i32, displays: &[DisplayRect]) -> Option<DisplayRect> {
     displays.iter().copied().find(|d| {
         d.width > 0
@@ -94,11 +95,13 @@ pub fn is_character_palette(handle: FocusHandle) -> bool {
 }
 
 /// Hide the macOS emoji panel. No-op on Windows.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn dismiss_character_palette() {
     #[cfg(target_os = "macos")]
     platform::dismiss_character_palette_impl();
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn emoji_panel_on_screen() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -501,7 +504,7 @@ mod platform {
         let Some(handle) = hwnd_of_impl(win) else { return false; };
         let hwnd = to_ptr(handle);
         let Ok(scale) = win.scale_factor() else { return false; };
-        let s = scale as f64;
+        let s = scale;
         // Small logical halo so the CSS border/box-shadow is not shaved off.
         const HALO: f64 = 2.0;
         let rx = ((x as f64 - HALO) * s).round() as i32;

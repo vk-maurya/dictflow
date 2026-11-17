@@ -189,6 +189,7 @@ pub const EDGE_SNAP: i32 = 64;
 
 /// Like [`place_free`], for a center saved on a screen of `saved_w` x `saved_h`.
 /// A saved size of zero means the position was never tied to a screen size.
+#[allow(clippy::too_many_arguments)] // placement needs the full saved pose
 pub fn place_free_scaled(
     cx: i32,
     cy: i32,

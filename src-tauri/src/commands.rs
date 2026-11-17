@@ -1217,6 +1217,7 @@ pub(crate) fn set_overlay_drag(active: bool) {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // mirrors the overlay pose fields the UI sends
 pub(crate) fn set_overlay_pose(
     app: tauri::AppHandle,
     state: State<'_, Mutex<AppState>>,
