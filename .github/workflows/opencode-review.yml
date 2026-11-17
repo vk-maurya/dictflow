@@ -17,10 +17,10 @@ jobs:
       - name: Run OpenCode review
         uses: anomalyco/opencode/github@latest
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          model: openrouter/particle-ai/particle-1:free
+          model: opencode/deepseek-v4.1-flash-free
           use_github_token: true
           prompt: |
             Review this pull request as a senior code reviewer:
