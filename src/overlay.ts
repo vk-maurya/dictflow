@@ -1,8 +1,6 @@
 import "./overlay.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { currentMonitor, getCurrentWindow } from "@tauri-apps/api/window";
-import { LogicalPosition } from "@tauri-apps/api/dpi";
 
 type Phase = "idle" | "recording" | "transcribing" | "refining";
 
@@ -19,7 +17,6 @@ interface LevelPayload {
   elapsed?: number;
 }
 
-const win = getCurrentWindow();
 const BAR_COUNT = 40;
 const BAR_W = 2.5;
 const BAR_GAP = 2;
@@ -30,18 +27,15 @@ const DRAG_PX = 12;
 /// Must match `src/overlay.css` phase footprints. The pill is centered in the
 /// overlay window, so the backend gate knows where the pill sits on screen.
 const HIT_SIZE: Record<Phase, { w: number; h: number }> = {
-  idle: { w: 58, h: 24 },
-  recording: { w: 250, h: 44 },
-  transcribing: { w: 168, h: 44 },
-  refining: { w: 168, h: 44 },
+  idle: { w: 48, h: 11 },
+  recording: { w: 146, h: 20 },
+  transcribing: { w: 148, h: 20 },
+  refining: { w: 148, h: 20 },
 };
 
 type Press = {
   sx: number;
   sy: number;
-  originX: number;
-  originY: number;
-  ready: boolean;
 };
 
 let phase: Phase = "idle";
@@ -51,22 +45,10 @@ let dragged = false;
 let toggling = false;
 let raf = 0;
 let placing = false;
-let pending: { x: number; y: number } | null = null;
+let pending: { dx: number; dy: number } | null = null;
 
 const pill = () => document.getElementById("pill");
 const canvas = () => document.getElementById("wave") as HTMLCanvasElement | null;
-const timeEl = () => document.getElementById("time");
-
-function formatTime(secs: number): string {
-  const s = Math.max(0, Math.floor(secs));
-  const m = Math.floor(s / 60);
-  return `${m}:${(s % 60).toString().padStart(2, "0")}`;
-}
-
-function setTime(secs: number): void {
-  const el = timeEl();
-  if (el) el.textContent = formatTime(secs);
-}
 
 function setPhase(next: Phase): void {
   if (phase === next) return;
@@ -81,7 +63,6 @@ function setPhase(next: Phase): void {
   }
   if (next === "recording") {
     bins.fill(0);
-    setTime(0);
     if (!raf) raf = requestAnimationFrame(tick);
     return;
   }
@@ -138,7 +119,6 @@ function applyLevel(p: LevelPayload): void {
     bins.shift();
     bins.push(v);
   }
-  if (typeof p.elapsed === "number") setTime(p.elapsed);
 }
 
 function roundBar(
@@ -182,16 +162,21 @@ function drawWave(): void {
   const presence = Math.min(1, peak / PRESENCE_FULL);
 
   const n = gated.length;
-  const total = n * BAR_W + (n - 1) * BAR_GAP;
+  const natural = n * BAR_W + (n - 1) * BAR_GAP;
   const vertical = pill()?.classList.contains("vertical") ?? false;
-  ctx.fillStyle = "rgba(255, 255, 255, 0.9)";
+  const room = vertical ? h : w;
+  const fit = natural > room && natural > 0 ? room / natural : 1;
+  const bar = BAR_W * fit;
+  const gap = BAR_GAP * fit;
+  const total = n * bar + (n - 1) * gap;
+  ctx.fillStyle = "rgba(232, 227, 214, 0.92)";
   if (vertical) {
     let y = (h - total) / 2;
     for (let i = 0; i < n; i++) {
       const norm = Math.min(1, gated[i] / recentPeak) * presence;
       const bw = Math.max(MIN_BAR, norm * w);
-      roundBar(ctx, (w - bw) / 2, y, bw, BAR_W);
-      y += BAR_W + BAR_GAP;
+      roundBar(ctx, (w - bw) / 2, y, bw, bar);
+      y += bar + gap;
     }
     return;
   }
@@ -199,8 +184,8 @@ function drawWave(): void {
   for (let i = 0; i < n; i++) {
     const norm = Math.min(1, gated[i] / recentPeak) * presence;
     const bh = Math.max(MIN_BAR, norm * h);
-    roundBar(ctx, x, (h - bh) / 2, BAR_W, bh);
-    x += BAR_W + BAR_GAP;
+    roundBar(ctx, x, (h - bh) / 2, bar, bh);
+    x += bar + gap;
   }
 }
 
@@ -231,21 +216,8 @@ function resetPress(): void {
   pending = null;
 }
 
-async function captureOrigin(): Promise<void> {
-  try {
-    const pos = await win.outerPosition();
-    const scale = await win.scaleFactor();
-    if (!press) return;
-    press.originX = pos.x / scale;
-    press.originY = pos.y / scale;
-    press.ready = true;
-  } catch {
-    /* origin is best-effort; drag is skipped until it lands */
-  }
-}
-
-function queuePlace(x: number, y: number): void {
-  pending = { x, y };
+function queueMove(dx: number, dy: number): void {
+  pending = { dx, dy };
   if (placing) return;
   placing = true;
   void (async () => {
@@ -253,7 +225,7 @@ function queuePlace(x: number, y: number): void {
       const next = pending;
       pending = null;
       try {
-        await win.setPosition(new LogicalPosition(next.x, next.y));
+        await invoke("move_overlay_by", { dx: next.dx, dy: next.dy });
       } catch {
         break;
       }
@@ -270,40 +242,11 @@ function onPointerMove(e: PointerEvent): void {
     if (Math.hypot(dx, dy) < DRAG_PX) return;
     dragged = true;
   }
-  if (!press.ready) return;
-  queuePlace(press.originX + dx, press.originY + dy);
+  queueMove(dx, dy);
 }
 
 function applyEdge(edge: string): void {
   pill()?.classList.toggle("vertical", edge === "left" || edge === "right");
-}
-
-async function saveFreePosition(): Promise<void> {
-  try {
-    const pos = await win.outerPosition();
-    const mon = await currentMonitor();
-    if (!mon) return;
-    const scale = mon.scaleFactor || 1;
-    const screenW = Math.round(mon.size.width / scale);
-    const screenH = Math.round(mon.size.height / scale);
-    const x = Math.round(
-      (pos.x - mon.position.x) / scale + document.documentElement.clientWidth / 2,
-    );
-    const y = Math.round(
-      (pos.y - mon.position.y) / scale + document.documentElement.clientHeight / 2,
-    );
-    await invoke("set_overlay_pose", {
-      edge: "bottom",
-      offset: 0,
-      free: true,
-      x,
-      y,
-      screenW,
-      screenH,
-    });
-  } catch {
-    /* pose is best-effort */
-  }
 }
 
 async function boot(): Promise<void> {
@@ -319,12 +262,12 @@ async function boot(): Promise<void> {
     host.addEventListener("pointerdown", (e) => {
       if (e.button !== 0) return;
       e.preventDefault();
-      press = { sx: e.screenX, sy: e.screenY, originX: 0, originY: 0, ready: false };
+      press = { sx: e.screenX, sy: e.screenY };
       dragged = false;
+      void invoke("begin_overlay_move");
       host.setPointerCapture(e.pointerId);
       // Keep the backend hover gate from flipping to pass-through mid-drag.
       void invoke("set_overlay_drag", { active: true }).catch(() => undefined);
-      void captureOrigin();
     });
     host.addEventListener("pointermove", onPointerMove);
     const onRelease = (e: PointerEvent) => {
@@ -338,19 +281,11 @@ async function boot(): Promise<void> {
       const wasDrag = dragged;
       const hadPress = press !== null;
       resetPress();
-      if (wasDrag) {
-        void saveFreePosition().finally(() =>
-          invoke("set_overlay_drag", { active: false }).catch(() => undefined),
-        );
-        return;
-      }
-      if (hadPress) {
-        void toggleFromOverlay().finally(() =>
-          invoke("set_overlay_drag", { active: false }).catch(() => undefined),
-        );
-        return;
-      }
-      void invoke("set_overlay_drag", { active: false }).catch(() => undefined);
+      void (async () => {
+        await invoke("end_overlay_move", { moved: wasDrag }).catch(() => undefined);
+        await invoke("set_overlay_drag", { active: false }).catch(() => undefined);
+        if (!wasDrag && hadPress) await toggleFromOverlay();
+      })();
     };
     host.addEventListener("pointerup", onRelease);
     host.addEventListener("pointercancel", onRelease);
@@ -359,6 +294,12 @@ async function boot(): Promise<void> {
   await listen<string>("dictflow://overlay-edge", (e) => applyEdge(e.payload));
   const saved = await invoke<{ overlay_edge?: string }>("get_settings").catch(() => null);
   if (saved?.overlay_edge) applyEdge(saved.overlay_edge);
+
+  // The pointer is tracked natively: a window that is not active gets no
+  // hover events from the webview, so Rust says when the pointer is on the pill.
+  await listen<boolean>("dictflow://overlay-hover", (e) => {
+    pill()?.classList.toggle("hovering", e.payload);
+  });
 
   await listen<boolean>("dictflow://recording", (e) => {
     if (e.payload) setPhase("recording");

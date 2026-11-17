@@ -6,11 +6,18 @@
     <title>DictFlow Overlay</title>
   </head>
   <body>
-    <div id="pill" class="idle" title="Click to start or stop dictation">
+    <div id="pill" class="idle">
       <div class="idle-mark" aria-hidden="true"><span></span></div>
+      <div class="hover-hint" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="9" y="2" width="6" height="12" rx="3"></rect>
+          <path d="M5 11a7 7 0 0 0 14 0"></path>
+          <path d="M12 18v4"></path>
+        </svg>
+        <span>Click to start</span>
+      </div>
       <span class="dot" id="dot" aria-hidden="true"></span>
       <canvas id="wave"></canvas>
-      <span class="time" id="time">0:00</span>
       <span class="status" id="status">Transcribing...</span>
     </div>
     <script type="module" src="/src/overlay.ts"></script>

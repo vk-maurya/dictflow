@@ -37,7 +37,7 @@ use crate::state::AppState;
 use crate::stats::UsageStats;
 use crate::text;
 use crate::text_models;
-use crate::tray::apply_overlay_visibility;
+use crate::tray::{apply_overlay_visibility, begin_overlay_drag, drag_overlay_by, end_overlay_drag};
 
 #[tauri::command]
 pub(crate) fn get_status(state: State<'_, Mutex<AppState>>) -> Status {
@@ -1240,12 +1240,49 @@ pub(crate) fn set_overlay_pose(
     if free {
         s.settings.overlay_x = x;
         s.settings.overlay_y = y;
+        s.settings.overlay_screen_w = screen_w;
+        s.settings.overlay_screen_h = screen_h;
     }
     s.save_settings();
     let out = s.settings.clone();
     drop(s);
     apply_overlay_visibility(&app);
     Ok(out)
+}
+
+#[tauri::command]
+pub(crate) fn begin_overlay_move() {
+    begin_overlay_drag();
+}
+
+#[tauri::command]
+pub(crate) fn move_overlay_by(app: tauri::AppHandle, dx: f64, dy: f64) {
+    drag_overlay_by(&app, dx, dy);
+}
+
+/// Finish a drag. A drag that moved saves the drop as the new place, and that
+/// place is used on every display.
+#[tauri::command]
+pub(crate) fn end_overlay_move(
+    app: tauri::AppHandle,
+    state: State<'_, Mutex<AppState>>,
+    moved: bool,
+) -> Result<(), String> {
+    let Some(pose) = end_overlay_drag(moved) else {
+        return Ok(());
+    };
+    set_overlay_pose(
+        app,
+        state,
+        "bottom".to_owned(),
+        0,
+        true,
+        pose.center_x,
+        pose.center_y,
+        pose.screen_w,
+        pose.screen_h,
+    )
+    .map(|_| ())
 }
 
 #[tauri::command]

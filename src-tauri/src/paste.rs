@@ -21,7 +21,7 @@ pub(crate) fn remember_paste_target(app: &tauri::AppHandle) {
     let Some(fg) = focus::foreground_handle() else {
         return;
     };
-    if !focus::should_remember(fg, &ours) {
+    if !focus::should_remember(fg, &ours) || focus::is_character_palette(fg) {
         return;
     }
     if let Ok(mut s) = app.state::<Mutex<AppState>>().lock() {
@@ -232,6 +232,31 @@ mod macos {
         }
     }
 
+    fn post_escape() -> Result<(), String> {
+        unsafe {
+            let src = CGEventSourceCreate(1);
+            if src.is_null() {
+                return Err("CGEventSourceCreate failed".into());
+            }
+            let ev = CGEventCreateKeyboardEvent(src, 0x35, true);
+            if ev.is_null() {
+                CFRelease(src);
+                return Err("escape down failed".into());
+            }
+            CGEventPost(0, ev);
+            CFRelease(ev);
+            let ev = CGEventCreateKeyboardEvent(src, 0x35, false);
+            if ev.is_null() {
+                CFRelease(src);
+                return Err("escape up failed".into());
+            }
+            CGEventPost(0, ev);
+            CFRelease(ev);
+            CFRelease(src);
+            Ok(())
+        }
+    }
+
     fn on_main(app: &tauri::AppHandle, op: impl FnOnce() -> Result<(), String> + Send + 'static) -> anyhow::Result<()> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(0);
         let _ = app.run_on_main_thread(move || {
@@ -263,12 +288,21 @@ mod macos {
 
         let pasted = text.to_owned();
         if let Err(err) = on_main(app, move || {
+            focus::dismiss_character_palette();
+            if focus::emoji_panel_on_screen()
+                || focus::foreground_handle().is_some_and(focus::is_character_palette)
+            {
+                let _ = post_escape();
+                std::thread::sleep(Duration::from_millis(80));
+                focus::dismiss_character_palette();
+            }
             if let Some(h) = target {
                 if focus::is_live(h) && focus::foreground_handle() != Some(h) {
                     focus::restore_on_main_thread(h);
                     std::thread::sleep(Duration::from_millis(180));
                 }
             }
+            focus::dismiss_character_palette();
             post_cmd_key(VK_V)
         }) {
             if let Some(snapshot) = &restore {

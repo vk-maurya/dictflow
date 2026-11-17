@@ -166,6 +166,8 @@ fn install_dev_app_bundle(exe: &std::path::Path) -> Result<std::path::PathBuf, S
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>DictFlow needs microphone access to capture your voice for offline dictation.</string>
+	<key>NSInputMonitoringUsageDescription</key>
+	<string>DictFlow needs Input Monitoring so the Fn / Globe key starts dictation and does not open the emoji panel.</string>
 </dict>
 </plist>
 "#

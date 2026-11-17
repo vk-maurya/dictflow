@@ -88,6 +88,12 @@ pub(crate) struct Settings {
     pub overlay_x: i32,
     #[serde(default)]
     pub overlay_y: i32,
+    /// Logical size of the screen the pill was placed on. Lets the same place
+    /// map onto a screen of another size. Zero means use the center as saved.
+    #[serde(default)]
+    pub overlay_screen_w: i32,
+    #[serde(default)]
+    pub overlay_screen_h: i32,
     #[serde(default = "shortcuts::default_paste_last")]
     pub paste_last_key: String,
     #[serde(default = "shortcuts::default_copy_last")]
@@ -197,6 +203,8 @@ impl Default for Settings {
             overlay_free: false,
             overlay_x: 0,
             overlay_y: 0,
+            overlay_screen_w: 0,
+            overlay_screen_h: 0,
             paste_last_key: shortcuts::default_paste_last(),
             copy_last_key: shortcuts::default_copy_last(),
             refine_selection_key: shortcuts::default_refine_selection(),

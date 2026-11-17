@@ -1,5 +1,6 @@
 //! Platform talk keys: Windows polls `GetAsyncKeyState`; macOS uses a
-//! session CGEventTap (SpeakType-style, Accessibility — not HID / Input Monitoring).
+//! CGEventTap. Input Monitoring upgrades that tap so Fn is swallowed before
+//! the emoji panel. Accessibility remains the fallback.
 //!
 //! Utility shortcuts (paste-last / copy-last / refine-selection) are registered
 //! through the shared Tauri global-shortcut plugin on both OSes.
