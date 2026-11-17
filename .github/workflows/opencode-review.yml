@@ -1,0 +1,31 @@
+name: opencode-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run OpenCode review
+        uses: anomalyco/opencode/github@latest
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          model: openrouter/particle-ai/particle-1:free
+          use_github_token: true
+          prompt: |
+            Review this pull request as a senior code reviewer:
+            - Check for code quality issues
+            - Look for potential bugs and edge cases
+            - Flag security concerns
+            - Suggest improvements, but keep feedback concise and actionable
+            - Do not approve or request changes; only leave comments
